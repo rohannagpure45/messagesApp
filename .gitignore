@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Secrets / local env — NEVER commit
+.env
+.env.*
+*.env
+.sawa/
+sawa-env
+
+# OpenClaw / device state
+.openclaw/
+
+# OS
+.DS_Store
+Thumbs.db
