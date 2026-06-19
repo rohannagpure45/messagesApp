@@ -1,0 +1,22 @@
+{
+  "name": "sawagc",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Sawa prediction-market discovery bot on Photon Spectrum (iMessage + terminal). Read-only by construction.",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "spectrum-ts": "^4.2.0"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "@types/node": "^22",
+    "tsx": "^4",
+    "vitest": "^4"
+  }
+}

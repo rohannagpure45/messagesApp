@@ -17,9 +17,17 @@ venv/
 *.env
 .sawa/
 sawa-env
+# ...but DO commit the env template (variable names only, never values)
+!.env.example
 
 # OpenClaw / device state
 .openclaw/
+
+# Node / TypeScript
+node_modules/
+dist/
+*.tsbuildinfo
+.vitest/
 
 # OS
 .DS_Store
