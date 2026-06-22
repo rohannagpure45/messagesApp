@@ -1,8 +1,8 @@
 /** Environment → typed config for the read path. Loaded once at startup. */
 
 export interface Config {
-  supabaseUrl: string;
-  supabaseKey: string;
+  /** Base URL of the Sawa web app, e.g. `https://sawapredictions.com`. Reads hit `${apiBaseUrl}/api/predictions*`. */
+  apiBaseUrl: string;
   /** Optional template like `https://.../market/{id}` used to build tappable links. */
   marketUrlTemplate?: string;
 }
@@ -16,13 +16,10 @@ export class ConfigError extends Error {
 }
 
 export function getConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  const supabaseUrl = env.SAWA_SUPABASE_URL;
-  const supabaseKey = env.SAWA_SUPABASE_KEY;
-  if (!supabaseUrl) throw new ConfigError("SAWA_SUPABASE_URL is not set");
-  if (!supabaseKey) throw new ConfigError("SAWA_SUPABASE_KEY is not set");
+  const apiBaseUrl = env.SAWA_API_BASE_URL;
+  if (!apiBaseUrl) throw new ConfigError("SAWA_API_BASE_URL is not set");
   return {
-    supabaseUrl: supabaseUrl.replace(/\/+$/, ""),
-    supabaseKey,
+    apiBaseUrl: apiBaseUrl.replace(/\/+$/, ""),
     marketUrlTemplate: env.SAWA_MARKET_URL_TEMPLATE,
   };
 }

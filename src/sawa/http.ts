@@ -15,7 +15,7 @@ export class UpstreamError extends Error {
 
 export async function getJson<T>(
   url: string | URL,
-  headers: Record<string, string>,
+  headers: Record<string, string> = {},
   timeoutMs = 10_000,
 ): Promise<T> {
   const controller = new AbortController();

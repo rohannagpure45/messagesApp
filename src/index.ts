@@ -67,7 +67,7 @@ const app = hasPhoton
 const recent = new RecentBuffer(20);
 
 function needsConfig(): string {
-  return "Sawa reads aren't configured (set SAWA_SUPABASE_URL and SAWA_SUPABASE_KEY).";
+  return "Sawa reads aren't configured (set SAWA_API_BASE_URL).";
 }
 
 for await (const [space, message] of app.messages) {

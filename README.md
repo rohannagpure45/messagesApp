@@ -20,10 +20,12 @@ writes, no real money.
 
 ## Invariants
 
-- **Read-only by construction.** The read path issues only HTTP `GET`; there is no
-  POST/PUT/PATCH/DELETE codepath. `tests/read-only.test.ts` enforces this statically.
-- **No PII to chat.** Queries use a hard-coded column allowlist and the public-feed filter
-  (`isPrivate=false`, `isHidden=false`, `resolved=false`). The `User` table and its
+- **Discovery reads are GET-only.** `src/sawa/read.ts` issues only HTTP `GET`, through the
+  `getJson` helper; there is no POST/PUT/PATCH/DELETE codepath and it holds no DB credentials.
+  `tests/read-only.test.ts` enforces this statically.
+- **No PII to chat.** Reads hit the Sawa app's **public** `GET /api/predictions*` endpoints,
+  which enforce the public-feed guard (`isPrivate=false`, `isHidden=false`) server-side;
+  `resolved` markets are filtered out client-side. The `User` table and its
   `email`/`phone`/`password`/`googleId` are never read or surfaced.
 - **Virtual framing.** All amounts are "Sawa coins" with a no-cash-value disclaimer.
 
@@ -38,8 +40,9 @@ npm run dev                 # terminal TUI (no Photon creds needed)
 `.env` is loaded at startup by `src/env.ts` — `tsx` and `node` do **not** auto-load it, so the
 app calls `process.loadEnvFile()` itself (fail-soft when absent). Set `PROJECT_ID` /
 `PROJECT_SECRET` (from the [Photon dashboard](https://app.photon.codes)) to enable the iMessage
-provider; without them the bot runs terminal-only. `SAWA_SUPABASE_URL` / `SAWA_SUPABASE_KEY`
-enable the read commands.
+provider; without them the bot runs terminal-only. `SAWA_API_BASE_URL` (e.g.
+`https://sawapredictions.com`) enables the read commands — the bot reads the app's public GET
+endpoints, so no database key is needed.
 
 ```sh
 npm run typecheck           # tsc
@@ -56,7 +59,7 @@ src/
   sawa/
     config.ts       env → typed Config
     http.ts         GET-only fetch helper (typed errors)
-    read.ts         PostgREST reads: listMarkets, getMarket, latest odds
+    read.ts         app-API reads: listMarkets, getMarket, getTrending (Option C)
     format.ts       chat-friendly rendering
     createStub.ts   /create stub (zero I/O)
     suggest.ts      rolling message buffer + /suggest payload
@@ -68,9 +71,10 @@ docs/
 
 ## Data model
 
-The bot reads the live Sawa Postgres/Supabase database. Its full schema — tables, columns,
-relationships, and the public-feed read contract — is mapped in
-[`docs/DATABASE_MAP.md`](docs/DATABASE_MAP.md).
+The bot reads live Sawa markets over the web app's **public** `GET /api/predictions*` endpoints
+(no DB access — "Option C", see [`docs/BETTING_BOT_PLAN.md`](docs/BETTING_BOT_PLAN.md) §6). The
+underlying Sawa schema — tables, columns, relationships — is mapped in
+[`docs/DATABASE_MAP.md`](docs/DATABASE_MAP.md) for reference.
 
 ## Roadmap
 
