@@ -47,7 +47,9 @@ never committed — only env-var *names* (`SAWA_SUPABASE_URL`, `SAWA_SUPABASE_KE
    application-enforced vocabulary. See §6 for the observed value catalog (mined from live data).
 4. **No database functions, triggers, or column comments.** All business logic (odds, payouts, balance
    updates, `updatedAt` stamping, cascade side-effects beyond FK rules) lives in the app, not the DB.
-5. **IDs are `text` (cuid), not `uuid`** — despite `uuid-ossp` being installed. Do not assume UUID format.
+5. **IDs are `text`** — do not assume UUID format. ⚠️ Nuance: many existing **row values** are cuid-format
+   (legacy), but the **current `schema.prisma` generates `@default(uuid())`** on all 38 tables (new rows are
+   uuid-format). **New tables should use `@default(uuid())`** to match the live generator — not `cuid()`.
 6. **All timestamps are `timestamp without time zone`** (no TZ). `createdAt` defaults to `CURRENT_TIMESTAMP`;
    `updatedAt` has **no DB default** (Prisma `@updatedAt` sets it in app code) — inserts that bypass Prisma
    must set `updatedAt` explicitly or they fail (`NOT NULL`).
