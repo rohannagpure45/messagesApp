@@ -4,6 +4,8 @@ This is a [Spectrum](https://photon.codes/docs/spectrum-ts) app, pinned to `spec
 
 **Read the plan before building:** [`docs/BETTING_BOT_PLAN.md`](docs/BETTING_BOT_PLAN.md) (authoritative product/architecture plan) and [`docs/SPECTRUM_INTEGRATION.md`](docs/SPECTRUM_INTEGRATION.md) (identifiers, inbound events incl. reactions, analytics mapping). Live betting/creation goes through the Sawa web app's authenticated API with a per-user JWT (minted via the web app's `POST /api/bot/session`); analytics go through `POST /api/bot/events`.
 
+**Current status:** Phase 1 **SEARCH** is built (the default face — [`BUILD_PLAN.md`](docs/BUILD_PLAN.md) §4). A natural-language query ("sawa FIFA World Cup") returns matched markets from **Sawa** (`src/sawa/read.ts`, Option C), **Kalshi** and **Polymarket** (`src/pmxt/`, GET-only, fail-soft) as one Skyscanner card (`src/sawa/cards.ts`). Intent = regex-first gate + Gemini Flash-Lite (`src/sawa/intent.ts`); aggregation/ranking in `src/search.ts`; mention-gating + idempotency in `src/routing.ts`. Betting, market creation, and analytics are **not yet built** (later phases). pmxt verified live: text search is `?q=` (not `query`), venue filter is `?sourceExchange=kalshi|polymarket`.
+
 ## Working in this project
 
 - Run the app with `npm run start` (or `npm run dev` for watch + terminal-only).

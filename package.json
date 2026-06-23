@@ -11,12 +11,13 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "openai": "^4.104.0",
     "spectrum-ts": "^4.2.0"
   },
   "devDependencies": {
-    "typescript": "^5",
     "@types/node": "^22",
     "tsx": "^4",
+    "typescript": "^5",
     "vitest": "^4"
   }
 }
