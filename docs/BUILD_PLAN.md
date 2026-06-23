@@ -35,13 +35,16 @@
 - **pmxt API correction (verified live):** text search is **`?q=`** (NOT `?query=` — silently ignored),
   venue filter is **`?sourceExchange=kalshi|polymarket`** (NOT `?exchange=`), base is **`https://api.pmxt.dev`**
   (the old `.env.example` `pmxt.io` was wrong). Per-venue `q` search (not the cluster matcher) is the v1 path.
-- **⚠️ Part A deployment reality (verified 23-Jun):** the `/api/bot/*` endpoints are **NOT deployed to
-  production** — `POST https://sawapredictions.com/api/bot/{session,events,state}` → **404** (PR #26 is still
-  **OPEN**, unmerged). The **DB/RLS changes ARE live** (applied directly to Supabase: 3 bot tables + RLS
-  deny-all on 41 tables). The **public read path Search depends on is live** (`GET /api/predictions` → 200).
-  ⇒ **Search works today; the next phases (Create, betting, analytics) are BLOCKED until PR #26 is merged +
-  deployed and `BOT_SECRET`/`BOT_HASH_SECRET` are set in the Sawa-app deploy env.** Search is unaffected (it
-  uses only the public GET endpoints — Option C — and holds no bot/DB credentials).
+- **⚠️ Part A deployment reality (re-verified 23-Jun, late):** Sawa-app **PR #26 and #27 are now MERGED to
+  `main`** — but the `/api/bot/*` endpoints are **still NOT live on production**: `POST
+  https://sawapredictions.com/api/bot/{session,events,state}` → **404**. **Merged ≠ deployed.** The Vercel
+  production deploy hasn't happened because the repo owner **isn't a member of the Sawa Vercel org yet**, so
+  the merge to `main` hasn't been promoted to prod. The **DB/RLS changes ARE live** (applied directly to
+  Supabase: 3 bot tables + RLS deny-all on 41 tables). The **public read path Search depends on is live**
+  (`GET /api/predictions` → 200). ⇒ **Search works today; the next phases (Create, betting, analytics) are
+  BLOCKED until the merged code is DEPLOYED to Vercel** (gate on the owner's Vercel-org membership) **and
+  `BOT_SECRET`/`BOT_HASH_SECRET` are set in the Sawa-app deploy env.** Search is unaffected — it uses only the
+  public GET endpoints (Option C) and holds no bot/DB credentials.
 
 **What is NOT built yet (untouched / deferred) — and where it lives when we get to it:**
 
@@ -62,10 +65,11 @@ gated on the Sawa-app `/api/bot/*` deployment.
 
 ### Original ground truth (22-Jun)
 
-- **Part A (Sawa-app) — DB/RLS live, endpoints in an OPEN PR.** `/api/bot/{session,events,state}` + 3 Prisma
-  models + RLS deny-all on all 41 tables live in Supabase via PR #26 (**OPEN** — endpoints not yet deployed;
-  see the 23-Jun update above). The bot-helper **validator tests are PR #27** (`test/imessage-bot-helpers`,
-  also OPEN, based on #26) — merge both; #27 locks `guard`/`hash`/`vocab`/`identity` and adds **no** endpoints.
+- **Part A (Sawa-app) — DB/RLS live, endpoints MERGED but not deployed.** `/api/bot/{session,events,state}` +
+  3 Prisma models + RLS deny-all on all 41 tables. PR #26 (endpoints) and PR #27 (bot-helper tests) are now
+  **MERGED to `main`**, but the code is **not yet on Vercel/prod** (`/api/bot/*` → 404; deploy gated on the
+  owner's Vercel-org membership — see the 23-Jun deployment-reality note above). #27 locks
+  `guard`/`hash`/`vocab`/`identity` and adds **no** endpoints.
 - **Read path is decided — Option C.** The bot reads Sawa through the app's **already-public** `GET
   /api/predictions`, `/api/predictions/[id]`, `/api/predictions/[id]/odds`, `/api/predictions/trending`
   (no JWT, PII-safe). **No further Part A work is needed for Search.** (Plan §6 / §2.14.)

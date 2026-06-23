@@ -110,6 +110,17 @@ Polymarket, each with a price / payout and an `[open](…)` link, then the discl
 ## 4. What you **cannot** test yet
 
 Betting, market **creation**, and **analytics** are not built — and even when built they need the Sawa-app
-`/api/bot/*` endpoints, which are **coded in PR #26 but not deployed** (`POST /api/bot/*` → 404 on prod today).
-Merge + deploy Sawa-app PR #26/#27 (with `BOT_SECRET` / `BOT_HASH_SECRET` set) before those phases. See
+`/api/bot/*` endpoints, which are **MERGED (PR #26 + #27) but not yet deployed to Vercel** (`POST /api/bot/*`
+→ 404 on prod today; the deploy is gated on the repo owner's Sawa Vercel-org membership). Deploy the merged
+`main` to Vercel (with `BOT_SECRET` / `BOT_HASH_SECRET` set) before those phases. See
 [`BUILD_PLAN.md`](BUILD_PLAN.md) §0.
+
+## 5. Troubleshooting note — "Delivered" but no reply (the multi-instance trap)
+
+If iMessage shows **Delivered** but the bot never replies, the #1 cause is **more than one bot instance
+running at once** — duplicates fight over the Photon line and Photon delivers your text to only one of them,
+so replies vanish. The bot now has a **single-instance lock**: a second `bun start` exits with
+`✋ Another sawa instance is already running` instead of dueling. If you still get no reply with exactly one
+instance and the log shows no `⟵ event` when you text, the inbound isn't reaching the SDK at all — run the
+isolation echo (`npx tsx imessage-echo.ts`, alone); if even that logs nothing on a text, it's Photon-side
+inbound delivery (take it to Photon support), not this bot.

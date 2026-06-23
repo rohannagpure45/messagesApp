@@ -6,13 +6,14 @@
 > (cross-venue enrichment), [`DATABASE_MAP.md`](DATABASE_MAP.md) (live Sawa schema). Grounded in
 > first-hand investigation of the real Sawa web app (`../Sawa-app`) and `spectrum-ts@^4.2.0` types.
 >
-> **Status (2026-06-23):** **Part A DB/RLS is live; the `/api/bot/*` endpoints are coded but NOT yet
-> deployed.** Sawa-app PR #26 (`feat/imessage-bot-api-and-rls`) is still **OPEN** — its DB changes (3 Prisma
-> models + RLS deny-all on 41 tables) were applied **directly to Supabase** and are live, but the API routes
-> ship only when the PR is merged + deployed: verified 23-Jun, `POST https://sawapredictions.com/api/bot/*`
-> → **404**. §7 documents the contract Part B must conform to once those endpoints are live. PR #27 (vitest
-> harness + 56 bot-helper tests, based on #26) is also **OPEN** — merge both, then deploy with `BOT_SECRET` /
-> `BOT_HASH_SECRET` set, before Create/betting/analytics.
+> **Status (2026-06-23):** **Part A DB/RLS is live; the `/api/bot/*` endpoints are MERGED but NOT yet
+> deployed.** Sawa-app PR #26 (`feat/imessage-bot-api-and-rls`) and PR #27 (vitest harness + 56 bot-helper
+> tests) are now **MERGED to `main`**. The DB changes (3 Prisma models + RLS deny-all on 41 tables) were
+> applied **directly to Supabase** and are live. But **merged ≠ deployed**: the API routes are **not on
+> Vercel/prod** — verified 23-Jun, `POST https://sawapredictions.com/api/bot/*` → **404**. The deploy is
+> gated on the **repo owner's Sawa Vercel-org membership** (pending), so `main` hasn't been promoted to prod.
+> §7 documents the contract Part B must conform to once those endpoints are deployed. Deploy to Vercel with
+> `BOT_SECRET` / `BOT_HASH_SECRET` set before Create/betting/analytics.
 >
 > **Part B status:** **Phase 1 SEARCH is built** (messagesApp PR #2) and works **today** because it depends
 > only on the public `GET /api/predictions*` read path (Option C, §6 — live, 200), holding **no** bot/DB

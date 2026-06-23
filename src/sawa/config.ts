@@ -43,7 +43,7 @@ export interface IntentConfig {
 
 const DEFAULT_BOT_NAME = "sawa";
 const DEFAULT_PMXT_BASE_URL = "https://api.pmxt.dev";
-const DEFAULT_INTENT_MODEL = "gemini-2.5-flash-lite";
+const DEFAULT_INTENT_MODEL = "gemini-3.1-flash-lite";
 const DEFAULT_INTENT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/";
 
 /** Thrown when a required environment variable is missing. */

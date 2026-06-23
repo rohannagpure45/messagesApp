@@ -112,10 +112,11 @@ face. **Untouched / deferred:** betting/stake, analytics, reaction/poll handling
 and the reply-driven Suggest scraper.
 
 > **⚠️ Blocked dependency:** Create, betting, and analytics all call the Sawa-app `/api/bot/*` endpoints
-> (per-user JWT + analytics). Those are coded in **Sawa-app PR #26 (OPEN)** but **not yet deployed** —
-> `POST /api/bot/*` returns **404** on production today. Search is unaffected (it uses only the public
-> `GET /api/predictions*` read path). Merge + deploy #26/#27 (with `BOT_SECRET`/`BOT_HASH_SECRET` set) before
-> starting those phases. See [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md) §0.
+> (per-user JWT + analytics). Those are **MERGED** (Sawa-app PR #26 + #27 on `main`) but **not yet deployed to
+> Vercel** — `POST /api/bot/*` returns **404** on production today (the deploy is gated on the repo owner's
+> Sawa Vercel-org membership). Search is unaffected (it uses only the public `GET /api/predictions*` read
+> path). Deploy the merged `main` to Vercel (with `BOT_SECRET`/`BOT_HASH_SECRET` set) before starting those
+> phases. See [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md) §0.
 
 **More surfaces:** `spectrum-ts` also ships **Slack**, **Telegram**, and **WhatsApp Business** providers — add
 one by importing it in `src/index.ts` and listing it in `providers`.

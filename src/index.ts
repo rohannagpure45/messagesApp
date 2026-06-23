@@ -11,6 +11,7 @@
  */
 import "./env"; // MUST be first: loads ./.env into process.env before anything reads it.
 
+import net from "node:net";
 import { Spectrum, text, markdown, richlink } from "spectrum-ts";
 import { imessage } from "spectrum-ts/providers/imessage";
 import { terminal } from "spectrum-ts/providers/terminal";
@@ -33,6 +34,29 @@ import { parseIntent } from "./sawa/intent";
 import { runSearch } from "./search";
 import { renderSearch } from "./sawa/cards";
 import { shouldHandle, SeenSet } from "./routing";
+
+// Single-instance lock (a localhost mutex, NOT a network server). Two bot processes on one Photon
+// project duel over the iMessage subscription — Photon delivers each text to only one of them, so
+// replies silently vanish. A second instance hits EADDRINUSE and exits loudly. SAWA_NO_LOCK=1 bypasses.
+if (process.env.SAWA_NO_LOCK !== "1") {
+  const LOCK_PORT = Number(process.env.SAWA_LOCK_PORT) || 47615;
+  await new Promise<void>((resolve) => {
+    const lock = net.createServer();
+    lock.unref();
+    lock.once("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "EADDRINUSE") {
+        console.error(
+          `[sawa] ✋ Another sawa instance is already running (lock :${LOCK_PORT}). Refusing to start a second —\n` +
+            `       duplicate instances fight over the Photon line, so iMessage replies vanish.\n` +
+            `       Stop the other first:  pkill -f 'src/index.ts'   (or set SAWA_NO_LOCK=1 to override)`,
+        );
+        process.exit(1);
+      }
+      resolve(); // any other lock error → don't block startup
+    });
+    lock.listen(LOCK_PORT, "127.0.0.1", () => resolve());
+  });
+}
 
 const DISCLAIMER = "Virtual Sawa coins — entertainment only, no cash value.";
 
@@ -75,13 +99,23 @@ const TERMINAL_COMMANDS = [
 ];
 
 const hasPhoton = Boolean(process.env.PROJECT_ID && process.env.PROJECT_SECRET);
-if (!hasPhoton) {
-  console.warn("[sawa] PROJECT_ID/PROJECT_SECRET unset → iMessage disabled, running terminal-only.");
+console.warn(
+  hasPhoton
+    ? "[sawa] iMessage: ENABLED — connecting to the Photon line. Text it, then watch for '⟵ inbound' below."
+    : "[sawa] iMessage: DISABLED — PROJECT_ID and/or PROJECT_SECRET missing from .env → terminal-only. " +
+        "(These are the Photon keys, separate from PMXT/SAWA — paste both from the dashboard, then restart.)",
+);
+
+// Headless mode (SAWA_HEADLESS=1) drops the terminal TUI so iMessage runs alone and console logs
+// flow straight to stdout/stderr — used to capture clean connection logs when debugging the line.
+const headless = (process.env.SAWA_HEADLESS === "1" || process.env.SAWA_HEADLESS === "true") && hasPhoton;
+if (headless) {
+  console.warn("[sawa] headless mode — terminal TUI off, iMessage only (clean logs for debugging).");
 }
 
 const providers = [
   ...(hasPhoton ? [imessage.config()] : []),
-  terminal.config({ commands: TERMINAL_COMMANDS }),
+  ...(headless ? [] : [terminal.config({ commands: TERMINAL_COMMANDS })]),
 ];
 
 const app = hasPhoton
@@ -177,7 +211,15 @@ async function handleNatural(space: Space, body: string): Promise<void> {
   );
 }
 
+console.warn(
+  hasPhoton
+    ? "[sawa] listening — text the Photon line NOW; expect '⟵ inbound [iMessage/dm]' within a few seconds."
+    : "[sawa] listening on terminal only.",
+);
+
 for await (const [space, message] of app.messages) {
+  // Logged for EVERY event before any filtering — the definitive "did Photon deliver anything" probe.
+  console.warn(`[sawa] ⟵ event [${message.platform}] type=${message.content.type}`);
   if (message.content.type !== "text") continue; // v1: text only (poll/reaction land later)
 
   const body = message.content.text.trim();
@@ -186,8 +228,12 @@ for await (const [space, message] of app.messages) {
   const isSlash = body.startsWith("/");
   const isGroup = isGroupSpace(space, message);
 
+  // Operational visibility: prove inbound delivery per platform (esp. for debugging the iMessage line).
+  console.warn(`[sawa] ⟵ inbound [${message.platform}/${isGroup ? "group" : "dm"}] "${body.slice(0, 40)}"`);
+
   if (!shouldHandle({ isGroup, isSlash, body, botName })) {
     // Bystander chatter in a group — feed the buffer (for future reply-driven suggestions), no reply.
+    console.warn(`[sawa] ⊘ ignored — not addressed (in a group, lead with "${botName} …" or @${botName}).`);
     recent.push(senderId, body);
     continue;
   }
