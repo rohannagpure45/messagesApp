@@ -126,17 +126,23 @@ If iMessage shows **Delivered** but the bot never replies:
 2. **If exactly one instance is running, connected, and `listening`, yet the log shows NO `⟵ event` when you
    text → inbound is not reaching the SDK at all.** Confirmed 23-Jun: this persists across **spectrum-ts
    4.2.0 AND 5.2.0**, with the socket ESTABLISHED to Photon's prod cluster (`*.elb.us-west-1.amazonaws.com`).
-   That rules out our code, the SDK, creds, webhooks, and duplicates — the failure is **Photon-side inbound
-   delivery / the network**, not this bot. In order of what to try:
-   - **Switch networks** (e.g. a phone hotspot) and restart the bot. Corporate/VPN/proxy networks frequently
-     complete the TLS handshake but **break the long-lived server-push stream** that carries inbound — which
-     looks exactly like "connected but nothing arrives." This is the fastest thing to rule out.
-   - **Re-check the dashboard:** your phone is on the **Users** page, the line is active, and **no webhook**
-     is configured (a webhook diverts inbound away from the local stream).
-   - **Sanity-check the platform:** scaffold a stock echo with `bun create spectrum-project@latest` and text
-     it on the same account+network. If even that gets nothing, it's the Photon account/line/network — open a
-     **Photon support** ticket (project `sawagc`, free shared-pool line, connects fine but receives no
-     inbound). If the stock echo *does* work, capture the diff vs this repo.
+   This rules out our code, the SDK, creds, webhooks, and duplicates. **A 100s connection-stability watch
+   then ruled out the network too:** the socket to Photon's prod ELB stayed **stable across minutes with
+   ZERO reconnect/error churn** in the verbose 5.x logs — a network/proxy breaking the stream would show
+   reconnect churn, and there was none. So this is a **healthy, stable connection that simply receives no
+   inbound → Photon is not routing your texts to the connected client.** That is a **Photon account/line
+   issue.** In order:
+   - **Dashboard / account (primary):** confirm your phone is on the **Users** page and **still mapped** to
+     the line (shared-pool assignments can rotate/expire — try removing and re-adding your phone), the line
+     is **active**, the **iMessage platform is enabled** (Platforms page), and **no webhook** is configured.
+     If the dashboard shows an inbound-message log, check whether your texts even appear there.
+   - **Stock-echo control:** scaffold a fresh `bun create spectrum-project@latest` echo and text it on the
+     same account. If even *that* receives nothing, it's conclusively the Photon account/line → **open a
+     Photon support ticket** (project `sawagc`, free shared-pool line `+1 628 264-7704`: "client maintains a
+     stable connection to your prod cluster but receives zero inbound; tested on spectrum-ts 4.2.0 and
+     5.2.0"). If the stock echo *does* work, capture the diff vs this repo and we'll chase it.
+   - **(Low likelihood now)** a phone hotspot, only because it's a 30-second test — but the stable, churn-free
+     connection makes a network cause unlikely.
 
-   The repo also ships `imessage-echo.ts` (a 15-line isolation echo that shares the lock) — run it alone to
+   The repo ships `imessage-echo.ts` (a 15-line isolation echo that shares the lock) — run it alone to
    reproduce with the smallest possible surface.
