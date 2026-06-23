@@ -16,11 +16,56 @@
 
 ---
 
-## 0. Where we are (ground truth, 22-Jun) — read before planning
+## 0. Where we are (ground truth) — read before planning
 
-- **Part A (Sawa-app) is shipped.** `/api/bot/{session,events,state}` + 3 Prisma models + RLS deny-all on all
-  41 tables (PR #26). The bot-helper **validator tests are PR #27** (`test/imessage-bot-helpers`) — merge it;
-  it locks `guard`/`hash`/`vocab`/`identity`. PR #27 adds **no** endpoints.
+### Update — 23-Jun (Phase 1 SEARCH built)
+
+- **Phase 1 SEARCH is code-complete** (messagesApp PR #2 → `sawa-spectrum-bot`, branch
+  `feat/imessage-search-skyscanner`). A NL query ("sawa FIFA World Cup") returns matched markets from
+  **Sawa** (virtual coins) + **Kalshi** + **Polymarket** (real money), Skyscanner-style — one line/market
+  with price, implied payout, and a link. `typecheck` clean, **69 tests** green, **verified live** against
+  the Sawa public API + pmxt (Kalshi+Polymarket) + Gemini Flash-Lite. Files: `src/sawa/intent.ts`
+  (regex-first gate + Gemini), `src/pmxt/*` (GET-only, per-venue, fail-soft), `src/search.ts` (aggregator +
+  favorite-but-not-near-lock ranking), `src/sawa/cards.ts` (the card), `src/index.ts`+`src/routing.ts`
+  (mention-gating, idempotency).
+- **Remaining for Search to be fully DONE** (per the Definition of DONE): (a) **live iMessage dogfood** in a
+  real test group (needs `PROJECT_ID`/`PROJECT_SECRET`; this is also the Phase-0 §3.2 connection gate, still
+  unproven), (b) **merge** PR #2, (c) **demo recorded** + feedback logged. Code + live-API behavior are
+  proven; the channel itself is not yet proven.
+- **pmxt API correction (verified live):** text search is **`?q=`** (NOT `?query=` — silently ignored),
+  venue filter is **`?sourceExchange=kalshi|polymarket`** (NOT `?exchange=`), base is **`https://api.pmxt.dev`**
+  (the old `.env.example` `pmxt.io` was wrong). Per-venue `q` search (not the cluster matcher) is the v1 path.
+- **⚠️ Part A deployment reality (verified 23-Jun):** the `/api/bot/*` endpoints are **NOT deployed to
+  production** — `POST https://sawapredictions.com/api/bot/{session,events,state}` → **404** (PR #26 is still
+  **OPEN**, unmerged). The **DB/RLS changes ARE live** (applied directly to Supabase: 3 bot tables + RLS
+  deny-all on 41 tables). The **public read path Search depends on is live** (`GET /api/predictions` → 200).
+  ⇒ **Search works today; the next phases (Create, betting, analytics) are BLOCKED until PR #26 is merged +
+  deployed and `BOT_SECRET`/`BOT_HASH_SECRET` are set in the Sawa-app deploy env.** Search is unaffected (it
+  uses only the public GET endpoints — Option C — and holds no bot/DB credentials).
+
+**What is NOT built yet (untouched / deferred) — and where it lives when we get to it:**
+
+| Capability | Status | Depends on | Plan ref |
+|---|---|---|---|
+| **CREATE** (NL → market on Sawa, creator-as-resolver) | **Untouched** — next up (Phase 2, the second YC face) | PR #26 merged+deployed (`POST /api/bot/session` JWT + `POST /api/predictions`); `BOT_SECRET` in deploy env | §5 |
+| **Betting / stake** ("100 on Brazil") | **Untouched** (out of the search milestone) | same as Create (user JWT via `/api/bot/session`) + live `maxBetAmount`/consent | BETTING_BOT_PLAN §3 |
+| **Analytics** (`odds_lookup`/`command`/… → `POST /api/bot/events`) | **Untouched** — deliberately deferred; this PR uses **no** master credential | `/api/bot/events` deployed; `SAWA_BOT_SECRET` in the bot env | §7, SPECTRUM_INTEGRATION §6 |
+| **Reactions / polls inbound** (tap-to-confirm, engagement) | **Untouched** (router handles `text` only today) | — (Spectrum events already available) | SPECTRUM_INTEGRATION §3 |
+| **Portfolio / balance / leaderboard / resolve** | **Untouched** (v1.1+) | user JWT + reads | BETTING_BOT_PLAN §3 |
+| **SUGGEST / scraper** (reply-driven topical surfacing) | **Untouched** — parked to Wk5 (`src/sawa/suggest.ts` stays a stub) | — | §6 Phase 6 |
+| **Rendered image cards / price charts** | **Untouched** (v1.1+) | an image renderer + pmxt `fetch_ohlcv` | BETTING_BOT_PLAN §4 |
+| **Other channels** (WhatsApp/Telegram) | **Untouched** (post-launch) | a Spectrum provider import | §6 Phase 4 |
+
+The **only** thing the SEARCH build touched is the read/enrichment/presentation path. It writes nothing, holds
+no master credential, and reads only public endpoints. Every money/analytics surface above is net-new work
+gated on the Sawa-app `/api/bot/*` deployment.
+
+### Original ground truth (22-Jun)
+
+- **Part A (Sawa-app) — DB/RLS live, endpoints in an OPEN PR.** `/api/bot/{session,events,state}` + 3 Prisma
+  models + RLS deny-all on all 41 tables live in Supabase via PR #26 (**OPEN** — endpoints not yet deployed;
+  see the 23-Jun update above). The bot-helper **validator tests are PR #27** (`test/imessage-bot-helpers`,
+  also OPEN, based on #26) — merge both; #27 locks `guard`/`hash`/`vocab`/`identity` and adds **no** endpoints.
 - **Read path is decided — Option C.** The bot reads Sawa through the app's **already-public** `GET
   /api/predictions`, `/api/predictions/[id]`, `/api/predictions/[id]/odds`, `/api/predictions/trending`
   (no JWT, PII-safe). **No further Part A work is needed for Search.** (Plan §6 / §2.14.)
@@ -156,8 +201,11 @@ with **price and payout per source**, Skyscanner-style — **one compact line ea
   analytics via `POST /api/bot/events` (RAW handle/spaceId, server hashes — SPECTRUM_INTEGRATION §6); deploy;
   **record the demo; log feedback.**
 
-**DONE checklist (Fri 26-Jun):** ☐ merged to main ☐ live in the test group ☐ "FIFA World Cup" returns
-Sawa+Kalshi+Polymarket lines with price+link ☐ empty/broad handled ☐ demo recorded ☐ feedback logged.
+**DONE checklist (Fri 26-Jun):** ☑ "FIFA World Cup" returns Sawa+Kalshi+Polymarket lines with
+price+payout+link ☑ empty/broad handled ☑ intent (regex gate + Gemini) ☑ typecheck + 69 tests green
+☑ verified live against the real APIs · **☐ merged to main** (PR #2 open) · **☐ live in a real iMessage test
+group** (needs Photon creds — also the §3.2 connection gate) · ☐ demo recorded · ☐ feedback logged. **Status:
+code-complete; not yet channel-proven or merged.**
 
 ---
 

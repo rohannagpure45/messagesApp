@@ -6,14 +6,19 @@
 > (cross-venue enrichment), [`DATABASE_MAP.md`](DATABASE_MAP.md) (live Sawa schema). Grounded in
 > first-hand investigation of the real Sawa web app (`../Sawa-app`) and `spectrum-ts@^4.2.0` types.
 >
-> **Status (2026-06-22):** **Part A is SHIPPED** in `../Sawa-app` (branch `feat/imessage-bot-api-and-rls`,
-> PR #26): the `/api/bot/*` endpoints, 3 Prisma models, and DB-wide RLS are live. §7 now documents the
-> **shipped contract** Part B must conform to (re-verified against the repo on this date), not work to be
-> done. Part B (this repo) is the remaining build — sequenced in [`BUILD_PLAN.md`](BUILD_PLAN.md): **YC
-> milestone = SEARCH (ship Fri 26-Jun) + CREATE (ship Fri 03-Jul)**; Suggest deferred to Wk5. Read path
-> **RESOLVED = Option C** (read via the app's public `GET /api/predictions*`; §6). Of Part A's two
-> Part-B-relevant side effects: the master-credential risk (§10.1) stands; the anon read path is retired by
-> Option C. (Sawa-app PR #27 = the validator tests — merge it.)
+> **Status (2026-06-23):** **Part A DB/RLS is live; the `/api/bot/*` endpoints are coded but NOT yet
+> deployed.** Sawa-app PR #26 (`feat/imessage-bot-api-and-rls`) is still **OPEN** — its DB changes (3 Prisma
+> models + RLS deny-all on 41 tables) were applied **directly to Supabase** and are live, but the API routes
+> ship only when the PR is merged + deployed: verified 23-Jun, `POST https://sawapredictions.com/api/bot/*`
+> → **404**. §7 documents the contract Part B must conform to once those endpoints are live. PR #27 (vitest
+> harness + 56 bot-helper tests, based on #26) is also **OPEN** — merge both, then deploy with `BOT_SECRET` /
+> `BOT_HASH_SECRET` set, before Create/betting/analytics.
+>
+> **Part B status:** **Phase 1 SEARCH is built** (messagesApp PR #2) and works **today** because it depends
+> only on the public `GET /api/predictions*` read path (Option C, §6 — live, 200), holding **no** bot/DB
+> credentials. CREATE (Fri 03-Jul YC milestone), betting, and analytics are the remaining build and are
+> **blocked on the `/api/bot/*` deployment above**. Suggest deferred to Wk5. The master-credential risk
+> (§10.1) stands and applies only to those future phases — SEARCH never touches `SAWA_BOT_SECRET`.
 
 ---
 
@@ -340,7 +345,14 @@ disclaimer on every coin/market message.
    degrade gracefully. 13. group interjection cooldown keyed on `spaceId`.
 
 ## 11. Build order & verification
-**Order:** (1) ~~Part A endpoints + models + RLS~~ **DONE (PR #26).** Remaining Part A: **verify OG tags**
+> **Progress (23-Jun):** **SEARCH is built** — steps (2 reads/Option C), (4 presentation), and (8 pmxt
+> enrichment) below are DONE for the discovery path (messagesApp PR #2): `read.ts` (Option C), `src/pmxt/*`,
+> `src/search.ts`, `src/sawa/cards.ts`, `src/sawa/intent.ts`, mention-gated router. Steps (3 betting),
+> (5 create), (6 portfolio), (7 analytics) are **untouched** and gated on the `/api/bot/*` deployment.
+
+**Order:** (1) ~~Part A models + RLS~~ **DB/RLS DONE (live in Supabase).** Endpoints coded in PR #26 but
+**OPEN/not deployed** (`/api/bot/*` → 404) — **merge + deploy #26/#27 before steps 3/5/7.** Remaining Part A:
+**verify OG tags** (+ optional `/session` rate-limit). (2) Bot config/http/`api.ts` (conform to §7) + **`read.ts` → app public
 (+ optional `/session` rate-limit). (2) Bot config/http/`api.ts` (conform to §7) + **`read.ts` → app public
 GET endpoints (§6 Option C)** + session cache + **identity probe**. (3) NL betting (quote→confirm→execute) on existing markets — core loop. (4) **Presentation
 layer** (rich cards) applied to discovery/odds/bet. (5) NL market creation. (6) portfolio/balance/leaderboard

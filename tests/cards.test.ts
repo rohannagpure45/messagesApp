@@ -68,9 +68,10 @@ describe("searchBody", () => {
     expect(body.toLowerCase()).toContain("no cash value");
   });
 
-  it("shows odds TBD for a Sawa market with an empty pool", () => {
+  it("shows 'no pool yet' for a Sawa market with an empty pool (brand-safe, no 'odds' wording)", () => {
     const body = searchBody(results({ sawa: [sawa({ top: { label: "Yes", oddsPct: null } })] }));
-    expect(body).toContain("Yes · odds TBD");
+    expect(body).toContain("Yes · no pool yet");
+    expect(body).not.toMatch(/\bodds\b/i);
   });
 
   it("adds a 'narrow your search' note only when truncated", () => {

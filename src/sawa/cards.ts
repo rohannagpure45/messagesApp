@@ -39,11 +39,11 @@ export function formatPrice(price: number): PriceDisplay {
   return { text: pct > 0 ? "<1¢" : "—" };
 }
 
-/** The headline outcome chunk for a Sawa row, e.g. "Brazil 22%" or "Yes · odds TBD". */
+/** The headline outcome chunk for a Sawa row, e.g. "Brazil 22%" or "Yes · no pool yet". */
 function sawaOutcome(r: VenueResult): string {
-  if (!r.top) return "odds TBD";
+  if (!r.top) return "no pool yet";
   const { label, oddsPct } = r.top;
-  return oddsPct == null ? `${label} · odds TBD` : `${label} ${Math.round(oddsPct)}%`;
+  return oddsPct == null ? `${label} · no pool yet` : `${label} ${Math.round(oddsPct)}%`;
 }
 
 /** The headline outcome chunk for a real-money row, e.g. "Karen Bass 65¢ (1.5×)". */

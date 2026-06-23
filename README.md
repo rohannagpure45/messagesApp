@@ -98,10 +98,24 @@ tests/              vitest: search / pmxt / intent / cards / routing / read / fo
 docs/               BETTING_BOT_PLAN · BUILD_PLAN · SPECTRUM_INTEGRATION · PMXT_INTEGRATION · DATABASE_MAP
 ```
 
-## Roadmap
+## Status & roadmap
 
-- **CREATE** — "sawa make a market on X" → a created Sawa market (the next YC-milestone flow).
-- The money half (betting via the app's authenticated API) and analytics — later phases; the bot
-  never writes the live DB directly.
-- More surfaces: `spectrum-ts` also ships **Slack**, **Telegram**, and **WhatsApp Business** providers
-  — add one by importing it in `src/index.ts` and listing it in `providers`.
+**Done (this PR):** Phase 1 **SEARCH** — cross-venue discovery, code-complete and verified live against the
+Sawa public API + pmxt + Gemini. Reads/enrichment/presentation only; no writes, no master credential.
+
+**Remaining for Search to be fully shipped:** a **live iMessage dogfood** in a real test group (needs Photon
+`PROJECT_ID`/`PROJECT_SECRET` — see [`docs/IMESSAGE_TESTING.md`](docs/IMESSAGE_TESTING.md)), then merge + a
+recorded demo.
+
+**Next — CREATE** ("sawa make a market on X" → a Sawa market, creator-as-resolver) is the second YC-milestone
+face. **Untouched / deferred:** betting/stake, analytics, reaction/poll handling, portfolio·balance·resolve,
+and the reply-driven Suggest scraper.
+
+> **⚠️ Blocked dependency:** Create, betting, and analytics all call the Sawa-app `/api/bot/*` endpoints
+> (per-user JWT + analytics). Those are coded in **Sawa-app PR #26 (OPEN)** but **not yet deployed** —
+> `POST /api/bot/*` returns **404** on production today. Search is unaffected (it uses only the public
+> `GET /api/predictions*` read path). Merge + deploy #26/#27 (with `BOT_SECRET`/`BOT_HASH_SECRET` set) before
+> starting those phases. See [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md) §0.
+
+**More surfaces:** `spectrum-ts` also ships **Slack**, **Telegram**, and **WhatsApp Business** providers — add
+one by importing it in `src/index.ts` and listing it in `providers`.
