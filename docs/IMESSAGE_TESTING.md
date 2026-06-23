@@ -132,15 +132,21 @@ If iMessage shows **Delivered** but the bot never replies:
    reconnect churn, and there was none. So this is a **healthy, stable connection that simply receives no
    inbound → Photon is not routing your texts to the connected client.** That is a **Photon account/line
    issue.** In order:
-   - **Dashboard / account (primary):** confirm your phone is on the **Users** page and **still mapped** to
-     the line (shared-pool assignments can rotate/expire — try removing and re-adding your phone), the line
-     is **active**, the **iMessage platform is enabled** (Platforms page), and **no webhook** is configured.
-     If the dashboard shows an inbound-message log, check whether your texts even appear there.
+   - **Dashboard / re-provision the line (primary).** Photon's own integration troubleshooting maps the
+     exact symptom "connected but no inbound" to a **line-provisioning** problem ("Spectrum is enabled but no
+     line has been provisioned — re-run setup or check the dashboard"). So: confirm a line is actually
+     **provisioned + active**, your phone is on **Users** and **still mapped** to it (shared-pool assignments
+     can rotate — **remove and re-add your phone**, or re-provision the line), the **iMessage platform is
+     enabled** (Platforms page), and **no webhook** is set. If the dashboard shows an inbound log, check
+     whether your texts appear there at all. (Inbound is confirmed to flow over the SDK's `app.messages`
+     **gRPC stream** — which the bot consumes correctly — so this is purely a Photon-side routing/provisioning
+     matter.)
    - **Stock-echo control:** scaffold a fresh `bun create spectrum-project@latest` echo and text it on the
-     same account. If even *that* receives nothing, it's conclusively the Photon account/line → **open a
-     Photon support ticket** (project `sawagc`, free shared-pool line `+1 628 264-7704`: "client maintains a
-     stable connection to your prod cluster but receives zero inbound; tested on spectrum-ts 4.2.0 and
-     5.2.0"). If the stock echo *does* work, capture the diff vs this repo and we'll chase it.
+     same account. If even *that* receives nothing, it's conclusively the Photon account/line → **email
+     Photon support (ryan@photon.codes)**: "project `sawagc`, free shared-pool line `+1 628 264-7704`: the
+     SDK client maintains a stable connection to your prod cluster but receives zero inbound over the
+     `app.messages` gRPC stream; tested on spectrum-ts 4.2.0 and 5.2.0, single instance, no webhook, phone
+     added to Users." If the stock echo *does* work, capture the diff vs this repo and we'll chase it.
    - **(Low likelihood now)** a phone hotspot, only because it's a 30-second test — but the stable, churn-free
      connection makes a network cause unlikely.
 
