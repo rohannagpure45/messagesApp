@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "openai": "^4.104.0",
-    "spectrum-ts": "^4.2.0"
+    "spectrum-ts": "^5.2.0"
   },
   "devDependencies": {
     "@types/node": "^22",

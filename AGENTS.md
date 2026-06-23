@@ -1,6 +1,6 @@
 # sawagc — agent instructions
 
-This is a [Spectrum](https://photon.codes/docs/spectrum-ts) app, pinned to `spectrum-ts@^4.2.0`. The entry point is `src/index.ts`, which loads `.env` (via `src/env.ts`), configures the providers (iMessage + terminal), and runs a **live, conversational Sawa prediction-market agent** (Folk-style "trade from the chat"): natural-language odds lookup, on-the-fly market creation, and per-user betting with real Sawa coins, plus reaction/poll-driven engagement and analytics.
+This is a [Spectrum](https://photon.codes/docs/spectrum-ts) app, on `spectrum-ts@^5.2.0` (upgraded from 4.2.0 while debugging iMessage delivery). The entry point is `src/index.ts`, which loads `.env` (via `src/env.ts`), configures the providers (iMessage + terminal), and runs a **live, conversational Sawa prediction-market agent** (Folk-style "trade from the chat"): natural-language odds lookup, on-the-fly market creation, and per-user betting with real Sawa coins, plus reaction/poll-driven engagement and analytics.
 
 **Read the plan before building:** [`docs/BETTING_BOT_PLAN.md`](docs/BETTING_BOT_PLAN.md) (authoritative product/architecture plan) and [`docs/SPECTRUM_INTEGRATION.md`](docs/SPECTRUM_INTEGRATION.md) (identifiers, inbound events incl. reactions, analytics mapping). Live betting/creation goes through the Sawa web app's authenticated API with a per-user JWT (minted via the web app's `POST /api/bot/session`); analytics go through `POST /api/bot/events`.
 
