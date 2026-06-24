@@ -54,8 +54,10 @@ export function tokenize(s: string): string[] {
  * Relevance of a market `title` to a search `query`: the share of the query's content tokens that
  * appear in the title. Matching is TOKEN-BOUNDARY (whole title tokens), not substring — so the
  * short token "us" in "2026 US election" does NOT spuriously match "business". A query token of
- * length ≥ 5 may also match a title token by shared prefix (handles plurals/inflections like
- * "election"/"elections"). Identical scoring across venues keeps the merged ranking fair.
+ * length ≥ 5 may also match a title token by shared prefix (handles inflections like
+ * "election"/"elections", "mayor"/"mayoral"). This is a fuzzy heuristic — it can over-match a longer
+ * different word (e.g. "india"→"indiana"), an accepted precision trade-off for catching inflections.
+ * Identical scoring across venues keeps the merged ranking fair.
  */
 export function scoreRelevance(title: string, query: string): number {
   const q = tokenize(query);

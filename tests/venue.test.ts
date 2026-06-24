@@ -22,6 +22,7 @@ describe("scoreRelevance (token-boundary, not substring)", () => {
   it("matches inflections/plurals only for longer tokens via shared prefix", () => {
     expect(scoreRelevance("US elections 2026 results", "election")).toBe(1); // election ~ elections
     expect(scoreRelevance("bitcoins to the moon", "bitcoin")).toBe(1);
+    expect(scoreRelevance("Los Angeles Mayoral race", "mayor")).toBe(1); // mayor ~ mayoral
   });
 
   it("returns 0 for an empty query", () => {

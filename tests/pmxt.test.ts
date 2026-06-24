@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { searchVenue, searchExternal, __setClock, __clearCache } from "../src/pmxt/discover";
+import { searchVenue, searchExternal, expandQueries, __setClock, __clearCache } from "../src/pmxt/discover";
 import type { PmxtConfig } from "../src/sawa/config";
 
 const cfg: PmxtConfig = { apiKey: "test-key", baseUrl: "https://api.pmxt.dev", builderMode: false };
@@ -110,7 +110,27 @@ describe("searchVenue", () => {
   });
 });
 
-describe("searchExternal (fail-soft)", () => {
+describe("expandQueries (multi-entity list splitting)", () => {
+  it("keeps the full query AND splits list separators into entities", () => {
+    // The full query stays (genuine phrases still match), plus each list-entity is searched on its own.
+    expect(expandQueries("Switzerland, India")).toEqual(["Switzerland, India", "Switzerland", "India"]);
+    expect(expandQueries("Trump & Biden")).toEqual(["Trump & Biden", "Trump", "Biden"]);
+    expect(expandQueries("BTC / ETH")).toEqual(["BTC / ETH", "BTC", "ETH"]);
+    expect(expandQueries("cap and trade")).toEqual(["cap and trade", "cap", "trade"]);
+  });
+
+  it("leaves single-entity / phrase queries unchanged (spaces and 'vs' are NOT separators)", () => {
+    expect(expandQueries("world cup")).toEqual(["world cup"]);
+    expect(expandQueries("FIFA World Cup")).toEqual(["FIFA World Cup"]);
+    expect(expandQueries("Switzerland vs Canada")).toEqual(["Switzerland vs Canada"]);
+  });
+
+  it("caps the number of sub-queries to bound pmxt calls/credits", () => {
+    expect(expandQueries("a1, b2, c3, d4, e5").length).toBeLessThanOrEqual(4);
+  });
+});
+
+describe("searchExternal (fail-soft + multi-entity merge)", () => {
   it("returns the venue that succeeds even when the other errors (e.g. 429)", async () => {
     stub((url) =>
       url.includes("sourceExchange=kalshi")
@@ -121,5 +141,28 @@ describe("searchExternal (fail-soft)", () => {
     expect(out.kalshi).toEqual([]); // 429 → degraded to empty, no throw
     expect(out.polymarket).toHaveLength(1);
     expect(out.polymarket[0]!.venue).toBe("polymarket");
+  });
+
+  it("searches each list-entity and merges results per venue (the 'Switzerland, India' bug)", async () => {
+    // Mirror real pmxt: the comma phrase matches nothing; each single entity returns one market.
+    stub((url) => {
+      const q = decodeURIComponent(new URL(url).searchParams.get("q") ?? "");
+      const venue = url.includes("sourceExchange=kalshi") ? "kalshi" : "polymarket";
+      if (q.includes(",")) return res(resp([])); // multi-entity phrase → no match (as observed live)
+      return res(resp([market({ sourceExchange: venue, title: `${venue} ${q}`, url: `https://x/${venue}/${q}` })]));
+    });
+    const out = await searchExternal(cfg, "Switzerland, India", 20);
+    expect(out.kalshi.map((r) => r.title).sort()).toEqual(["kalshi India", "kalshi Switzerland"]);
+    expect(out.polymarket.map((r) => r.title).sort()).toEqual(["polymarket India", "polymarket Switzerland"]);
+  });
+
+  it("de-dupes a market returned by more than one sub-query", async () => {
+    stub((url) => {
+      const venue = url.includes("sourceExchange=kalshi") ? "kalshi" : "polymarket";
+      return res(resp([market({ sourceExchange: venue, title: "Same Market", url: "https://x/same" })]));
+    });
+    const out = await searchExternal(cfg, "Switzerland, India", 20); // 3 sub-queries, identical market each
+    expect(out.kalshi).toHaveLength(1);
+    expect(out.polymarket).toHaveLength(1);
   });
 });
