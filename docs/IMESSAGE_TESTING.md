@@ -130,6 +130,16 @@ Betting, market **creation**, and **analytics** are not built — and even when 
 
 ## 5. Troubleshooting note — "Delivered" but no reply (the multi-instance trap)
 
+> **✅ RESOLVED for `sawagc` (23-Jun) — it was a dead Photon line, not the code.** With Full Disk Access
+> granted, reading the user's own `~/Library/Messages/chat.db` proved the shared-pool line **+16282647704** is
+> a valid registered iMessage handle (`service=iMessage`) but moves **no iMessage in either direction**: the
+> line has delivered the user **0 messages ever** (`is_from_me=0` count = 0), and a bot-initiated send
+> (`SAWA_HELLO_TO`) returned SDK **`✅ sent` yet never landed** in the live DB. Inbound shows "Delivered" but
+> never reaches the SDK. ⇒ **de-registered / mis-provisioned shared-pool line → Photon-side fix** (rotate the
+> line or move to a dedicated Business line). The full evidence + ready-to-send report is in
+> [`PHOTON_SUPPORT.md`](PHOTON_SUPPORT.md). The steps below remain the correct *first-pass* triage for the
+> generic symptom before you reach that conclusion.
+
 If iMessage shows **Delivered** but the bot never replies:
 
 1. **First suspect — more than one bot instance running** (duplicates fight over the Photon line; Photon
