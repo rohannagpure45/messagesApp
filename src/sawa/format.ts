@@ -16,7 +16,7 @@ function deadlineSuffix(iso?: string): string {
 /** One-market detail block. */
 export function formatMarket(m: Market): string {
   const odds = m.outcomes.map((o) => `${o.label} ${pct(o.oddsPct)}`).join("  ·  ");
-  return `📊 ${m.title}${deadlineSuffix(m.deadline)}\n${odds || "(no odds yet)"}`;
+  return `${m.title}${deadlineSuffix(m.deadline)}\n${odds || "(no odds yet)"}`;
 }
 
 /** Numbered list of markets with a disclaimer footer. */

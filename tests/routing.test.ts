@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mentionsBot, shouldHandle, SeenSet } from "../src/routing";
+import { mentionsBot, shouldHandle, SeenSet, normalizeHandle } from "../src/routing";
 
 describe("mentionsBot", () => {
   it("matches when the bot is hailed at the start or via @mention", () => {
@@ -13,6 +13,21 @@ describe("mentionsBot", () => {
   it("does not match bystander chatter that merely names the bot mid-sentence", () => {
     expect(mentionsBot("I told my friend about sawa yesterday", "sawa")).toBe(false);
     expect(mentionsBot("where is the nearest cafe", "sawa")).toBe(false);
+  });
+});
+
+describe("normalizeHandle", () => {
+  it("reduces phone formats to digits with a preserved leading +", () => {
+    expect(normalizeHandle("+1 (555) 123-4567")).toBe("+15551234567");
+    expect(normalizeHandle("(555) 123-4567")).toBe("5551234567");
+    expect(normalizeHandle("  +1-555-123-4567 ")).toBe("+15551234567");
+  });
+  it("lowercases email-style Apple IDs so case drift doesn't fork identity", () => {
+    expect(normalizeHandle("User@iCloud.com")).toBe("user@icloud.com");
+  });
+  it("passes through non-phone, non-email tokens", () => {
+    expect(normalizeHandle("unknown")).toBe("unknown");
+    expect(normalizeHandle("")).toBe("");
   });
 });
 

@@ -23,6 +23,24 @@ export function mentionsBot(body: string, botName: string): boolean {
   return atStart.test(body) || atMention.test(body);
 }
 
+/**
+ * Canonicalize a sender handle so the same human is keyed consistently regardless of how the
+ * platform spells them. iMessage delivers a user as either a phone number (in any of several
+ * formats) or an email-style Apple ID, and a project's Photon allowlist may hold one form while
+ * Apple sends another — the "different text vs numbers" drift. Emails are lowercased; phones are
+ * reduced to digits with a preserved leading "+". This removes formatting drift ("(555) 123-4567"
+ * vs "+15551234567") for our own per-user keying/logging; it does NOT reconcile a phone with an
+ * email for the same person (only the platform can do that).
+ */
+export function normalizeHandle(id: string): string {
+  const s = id.trim();
+  if (!s) return s;
+  if (s.includes("@")) return s.toLowerCase(); // email-style Apple ID
+  const digits = s.replace(/\D/g, "");
+  if (!digits) return s.toLowerCase(); // no digits → not a phone (e.g. "unknown")
+  return s.startsWith("+") ? `+${digits}` : digits;
+}
+
 /** Decide whether to handle a message. Slash commands and DMs always pass; groups need a mention. */
 export function shouldHandle(args: {
   isGroup: boolean;

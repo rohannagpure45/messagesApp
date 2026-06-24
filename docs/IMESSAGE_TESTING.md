@@ -48,9 +48,11 @@ sawa bitcoin
 /help
 ```
 
-You should see the Skyscanner card: a lead line, one compact line per market grouped Sawa → Kalshi →
-Polymarket, each with a price / payout and an `[open](…)` link, then the disclaimer footer. This proves the
-**logic + live data** path; it does not prove iMessage rendering (Section 2).
+You should see the Skyscanner card: a bold **Markets for "…"** header, then a bold-headed section per
+venue (Sawa → Kalshi → Polymarket — each tagged *virtual coins* or *real money*), one compact line per
+market with a price / payout and an `[open](…)` link, then the legend + disclaimer footer. **No emoji** —
+hierarchy is bold headers + links. This proves the **logic + live data** path; it does not prove iMessage
+rendering (Section 2).
 
 ---
 
@@ -83,6 +85,25 @@ Polymarket, each with a price / payout and an `[open](…)` link, then the discl
    - **Group:** add the bot's number to a group. In a group it only answers when **hailed** — start the
      message with `sawa …` or include `@sawa`. Bystander chatter is ignored by design.
 
+   > **Groups need a dedicated (Business) line — confirmed by Photon's docs.** Per
+   > [docs.photon.codes](https://docs.photon.codes) (iMessage routing → Creating conversations):
+   > *"Shared mode cannot create group chats. Use a dedicated number, or `space.get(chatGuid)` for an
+   > existing group."* On the free/pro **shared pool** each end user is routed through a *different*
+   > number, so a group can't resolve to one coherent bot identity — the "both users on different
+   > numbers" symptom. Mention-gating, group detection, and `normalizeHandle()` (`src/routing.ts`) are
+   > already in code; dependable groups are a **line-model** upgrade, not a code change.
+   >
+   > **Tested 24-Jun — CONFIRMED: shared-pool groups don't route inbound.** Run 1 (group with
+   > `+1 628-264-7704` + a 2nd member) logged zero group `⟵ event` but was discarded for a boot-race (bot
+   > started the same minute). Run 2 was clean — bot listening 28 min — and a fresh group send still
+   > produced **zero** group inbound, while DMs to 628 in the same window routed fine. So a dedicated
+   > (Business) line is required for groups, as the docs (*"shared mode cannot create group chats"*) say.
+   > (Note: both DM *replies* failed on Photon's send side this session with transient
+   > `DEADLINE_EXCEEDED`/`ECONNRESET` — inbound OK, outbound flaky.) **Quotas:** 50 new conversations
+   > per line/day (caps `SAWA_HELLO_TO`
+   > outreach) and 5,000 messages per server/day. Identity helpers from the same page:
+   > `message.sender.service` (`iMessage`/`SMS`/`RCS`) and `.address` via narrowing.
+
 3. **Send these and check the reply:**
 
    | Send | Expect |
@@ -114,7 +135,7 @@ Polymarket, each with a price / payout and an `[open](…)` link, then the discl
 | `Sawa isn't configured yet` | `SAWA_API_BASE_URL` unset in `.env`. |
 | Only **Sawa** results, no Kalshi/Polymarket | `PMXT_API_KEY` unset, or pmxt 429/down (search is **fail-soft** → Sawa-only). pmxt limit is 60 req/min; results are cached 60s. |
 | Intent feels off on loose phrasing | `INTENT_LLM_API_KEY` unset → regex gate only. Explicit phrasings ("find X", "odds on X", "sawa X") still classify. |
-| `[open](url)` shows as literal text | iMessage may not render markdown link syntax — the rich-link cover card is the guaranteed-tappable element. **This is the one thing to confirm in a live chat**; if links aren't tappable, switch the card to raw URLs (a quick follow-up). |
+| `**bold**` / `[open](url)` shows as literal syntax | Only on **local mode** (SQLite), which has no styling. **Cloud** iMessage renders markdown as native styled text — bold + tappable links via UTF-16 formatting ranges (confirmed in `@spectrum-ts/core`). The bot runs cloud mode, so this shouldn't occur; the rich-link cover is still the guaranteed-tappable element. |
 | Photon auth error on boot | Verify `PROJECT_ID` / `PROJECT_SECRET` on the [dashboard](https://app.photon.codes). Without them the bot runs terminal-only. |
 | Duplicate replies | Shouldn't happen — replies dedupe on `message.id`. If seen, capture the id. |
 

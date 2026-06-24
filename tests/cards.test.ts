@@ -7,6 +7,8 @@ import {
   emptyReply,
   renderSearch,
 } from "../src/sawa/cards";
+// Note: the card has no emojis — hierarchy comes from bold section headers + links, which cloud
+// iMessage renders as native styled text. Assertions below target that plain, emoji-free output.
 import type { SearchResults } from "../src/search";
 import type { VenueResult } from "../src/venue";
 
@@ -52,19 +54,28 @@ describe("formatPrice", () => {
   });
 });
 
+describe("searchLead", () => {
+  it("is a bold header naming the query", () => {
+    expect(searchLead(results({ query: "world cup" }))).toBe('**Markets for "world cup"**');
+  });
+});
+
 describe("searchBody", () => {
   it("renders one compact line per market, price-first, with a tappable link", () => {
     const body = searchBody(results({ sawa: [sawa()], kalshi: [ext()] }));
-    expect(body).toContain("🪙 **Sawa** · Who will win the World Cup? · Brazil 59%");
+    expect(body).toContain("**Sawa** — virtual coins");
+    expect(body).toContain("Who will win the World Cup? — Brazil 59%");
     expect(body).toContain("[open](https://sawapredictions.com/predictions/abc)");
-    expect(body).toContain("📈 **Kalshi** · Who will win Los Angeles Mayoral Election? · Karen Bass 65¢ (1.5×)");
+    expect(body).toContain("**Kalshi** — real money");
+    expect(body).toContain("Who will win Los Angeles Mayoral Election? — Karen Bass 65¢ (1.5×)");
     expect(body).toContain("[open](https://kalshi.com/events/x)");
+    expect(body).not.toMatch(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u); // no emoji anywhere
   });
 
   it("distinguishes virtual coins from real-money venues and always carries the disclaimer", () => {
     const body = searchBody(results({ sawa: [sawa()], polymarket: [ext({ sourceLabel: "Polymarket", venue: "polymarket" })] }));
-    expect(body).toContain("🪙 Sawa = virtual coins");
-    expect(body).toContain("📈 Kalshi/Polymarket = real money");
+    expect(body).toContain("**Sawa** — virtual coins");
+    expect(body).toContain("**Polymarket** — real money");
     expect(body.toLowerCase()).toContain("no cash value");
   });
 
@@ -105,16 +116,16 @@ describe("renderSearch", () => {
   it("renders the empty state with a create tease + disclaimer when nothing matched", () => {
     const r = renderSearch(results({ empty: true, query: "nonexistent" }));
     expect(r.empty).toBe(true);
-    expect(r.lead).toContain("nonexistent");
-    expect(r.lead.toLowerCase()).toContain("coming soon");
-    expect(r.body).toBe("");
+    expect(r.body).toContain("nonexistent");
+    expect(r.body.toLowerCase()).toContain("coming soon");
+    expect(r.richlinkUrl).toBeUndefined();
   });
 
-  it("renders lead + body + richlink for a non-empty result", () => {
+  it("renders a single markdown card body + richlink cover for a non-empty result", () => {
     const r = renderSearch(results({ sawa: [sawa()], kalshi: [ext()] }));
     expect(r.empty).toBe(false);
-    expect(r.lead).toContain('"world cup"');
-    expect(r.body).toContain("**Sawa**");
+    expect(r.body).toContain('**Markets for "world cup"**');
+    expect(r.body).toContain("**Sawa** — virtual coins");
     expect(r.richlinkUrl).toBe("https://sawapredictions.com/predictions/abc");
   });
 });

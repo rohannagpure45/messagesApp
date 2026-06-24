@@ -33,7 +33,7 @@ import { RecentBuffer, suggestPayload } from "./sawa/suggest";
 import { parseIntent } from "./sawa/intent";
 import { runSearch } from "./search";
 import { renderSearch } from "./sawa/cards";
-import { shouldHandle, SeenSet } from "./routing";
+import { shouldHandle, SeenSet, normalizeHandle } from "./routing";
 
 // Single-instance lock (a localhost mutex, NOT a network server). Two bot processes on one Photon
 // project duel over the iMessage subscription — Photon delivers each text to only one of them, so
@@ -105,6 +105,15 @@ console.warn(
     : "[sawa] iMessage: DISABLED — PROJECT_ID and/or PROJECT_SECRET missing from .env → terminal-only. " +
         "(These are the Photon keys, separate from PMXT/SAWA — paste both from the dashboard, then restart.)",
 );
+if (hasPhoton) {
+  // Group-chat caveat (line model, not code): 1:1 DMs work on any line, but a GROUP needs one number
+  // every member sees — i.e. a dedicated (Business) line. On a shared pool each end user is routed
+  // through a *different* pool number, so group delivery is unreliable. See docs/IMESSAGE_TESTING.md.
+  console.warn(
+    "[sawa] note: 1:1 DMs work on any line; reliable GROUP chat needs a dedicated (Business) line " +
+      "(a shared pool routes each user via a different number).",
+  );
+}
 
 // Headless mode (SAWA_HEADLESS=1) drops the terminal TUI so iMessage runs alone and console logs
 // flow straight to stdout/stderr — used to capture clean connection logs when debugging the line.
@@ -147,13 +156,18 @@ function isGroupSpace(space: Space, message: Message): boolean {
 
 /** Run a cross-venue search and reply with the Skyscanner card (lead + body + richlink cover). */
 async function replySearch(space: Space, query: string): Promise<void> {
-  if (!config) return void (await space.send(needsConfig()));
+  if (!config) return void (await guard("config notice", () => space.send(needsConfig())));
   const results = await runSearch(query, { config, pmxt: pmxtConfig });
   const rendered = renderSearch(results);
-  await space.send(text(rendered.lead));
-  if (rendered.body) await space.send(markdown(rendered.body));
-  // One native cover card for the top Sawa market (read.ts only returns public markets — no OG leak).
-  if (rendered.richlinkUrl) await space.send(richlink(rendered.richlinkUrl));
+  // One markdown card bubble — cloud iMessage renders bold + links as native styled text — then a
+  // native cover card for the top Sawa market (read.ts only returns public markets — no OG leak).
+  // Sends are BEST-EFFORT: a flaky/lost-ack Photon send (a DEADLINE_EXCEEDED frequently still DELIVERS)
+  // must not bubble up and trigger the handler's "unreachable" apology after the card already went out.
+  await guard("card send", () => space.send(markdown(rendered.body)));
+  if (rendered.richlinkUrl) {
+    const coverUrl = rendered.richlinkUrl; // narrow once; the closure can't keep the property narrowed
+    await guard("cover send", () => space.send(richlink(coverUrl)));
+  }
 }
 
 /** Slash-command fallback (power users + the terminal TUI). */
@@ -187,7 +201,7 @@ async function handleSlash(space: Space, cmd: string, arg: string): Promise<void
       const markets = await listMarkets(config, { limit: 20 });
       const payload = suggestPayload(markets, recent.recent("terminal"));
       await space.send(
-        `💡 (demo) ${payload.guidance}\n` +
+        `(demo) ${payload.guidance}\n` +
           `Context: ${payload.messages.length} recent message(s); ${markets.length} open markets in snapshot.`,
       );
       return;
@@ -229,7 +243,7 @@ async function sendHello(handles: string[]): Promise<void> {
       const user = await im.user(handle);
       const dm = await im.space.create(user);
       await dm.send(
-        `👋 Sawa here. Reply with "${botName} FIFA World Cup" (or "${botName} <any topic>") and I'll find ` +
+        `Sawa here. Reply with "${botName} FIFA World Cup" (or "${botName} <any topic>") and I'll find ` +
           `markets across Sawa, Kalshi & Polymarket. ${DISCLAIMER}`,
       );
       console.warn(`[sawa] ✅ hello → ${handle}: sent. Reply IN THIS THREAD now; watch for '⟵ inbound'.`);
@@ -256,23 +270,42 @@ console.warn(
     : "[sawa] listening on terminal only.",
 );
 
+/**
+ * Run provider-talking work, swallowing + logging any error so a transient outbound failure (e.g. a
+ * Photon SetTyping / SendText `ECONNRESET` or `DEADLINE_EXCEEDED`) can never crash the long-running
+ * message loop. A single failed reply took the whole bot down once (24-Jun) — this prevents a repeat.
+ */
+async function guard(label: string, fn: () => Promise<unknown>): Promise<void> {
+  try {
+    await fn();
+  } catch (err) {
+    console.error(`[sawa] ${label} failed (continuing): ${(err as Error)?.message ?? String(err)}`);
+  }
+}
+
 for await (const [space, message] of app.messages) {
   // Logged for EVERY event before any filtering — the definitive "did Photon deliver anything" probe.
-  console.warn(`[sawa] ⟵ event [${message.platform}] type=${message.content.type}`);
+  console.warn(
+    `[sawa] ⟵ event [${message.platform}] type=${message.content.type} from=${normalizeHandle(message.sender?.id ?? "unknown")}`,
+  );
   if (message.content.type !== "text") continue; // v1: text only (poll/reaction land later)
 
   const body = message.content.text.trim();
   if (!body) continue;
-  const senderId = message.sender?.id ?? "unknown";
+  const senderId = normalizeHandle(message.sender?.id ?? "unknown");
   const isSlash = body.startsWith("/");
   const isGroup = isGroupSpace(space, message);
 
   // Operational visibility: prove inbound delivery per platform (esp. for debugging the iMessage line).
-  console.warn(`[sawa] ⟵ inbound [${message.platform}/${isGroup ? "group" : "dm"}] "${body.slice(0, 40)}"`);
+  console.warn(
+    `[sawa] ⟵ inbound [${message.platform}/${isGroup ? "group" : "dm"}] from=${senderId} "${body.slice(0, 40)}"`,
+  );
 
   if (!shouldHandle({ isGroup, isSlash, body, botName })) {
     // Bystander chatter in a group — feed the buffer (for future reply-driven suggestions), no reply.
-    console.warn(`[sawa] ⊘ ignored — not addressed (in a group, lead with "${botName} …" or @${botName}).`);
+    console.warn(
+      `[sawa] ⊘ ignored [${message.platform}/group] from=${senderId} — not addressed (lead with "${botName} …" or @${botName}).`,
+    );
     recent.push(senderId, body);
     continue;
   }
@@ -280,7 +313,11 @@ for await (const [space, message] of app.messages) {
   // Idempotency: at-least-once delivery → never act twice on the same message id.
   if (seen.seen(message.id)) continue;
 
-  await space.responding(async () => {
+  // Reply directly — deliberately NOT via `space.responding()`: its SetTyping call throws on Photon's
+  // flaky outbound and was aborting the whole reply before it ran (a typing indicator must never gate the
+  // answer). A transient provider error is logged and skipped, never crashing the loop; both the reply and
+  // the error-fallback send are guarded, and replySearch's sends are best-effort.
+  await guard("message handling", async () => {
     try {
       if (isSlash) {
         const parts = body.split(/\s+/);
@@ -292,7 +329,9 @@ for await (const [space, message] of app.messages) {
       }
     } catch (err) {
       console.error(`[sawa] handler failed:`, err);
-      await space.send("Sorry — Sawa is unreachable right now. Try again shortly.");
+      await guard("fallback send", () =>
+        space.send("Sorry — Sawa is unreachable right now. Try again shortly."),
+      );
     }
   });
 }

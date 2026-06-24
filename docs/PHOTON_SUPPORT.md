@@ -1,11 +1,12 @@
-# Photon support report — shared-pool line dead in BOTH directions (ready to send)
+# Photon support — line correspondence
 
 **Send to:** `ryan@photon.codes` (per the Spectrum docs support contact).
 
-**Status (verified 23-Jun against the user's own Messages database):** this is **conclusively a Photon-side
-line problem**, not the integration. The shared-pool line **+1 (628) 264-7704** moves **no iMessage in either
-direction** for this project, even though the SDK control connection is healthy and the line is a valid
-registered iMessage handle. Specifics proven below. Code/SDK/network/handle/binding are all disproven.
+> **CURRENT (24-Jun): the 23-Jun "dead line" issue is RESOLVED.** Shared-pool line **+1 (628) 264-7704**
+> now routes DMs both directions and the `sawagc` bot is live in 1:1 chats. The active ask is a **dedicated
+> Business line for GROUP chat** (groups don't route on the shared pool) — send the **24-Jun follow-up**
+> below. The 23-Jun "dead in both directions" report that follows is kept for history; its conclusion no
+> longer applies (the line now works for DMs).
 
 **Optional 60-second pre-check (cheap, do it but it likely won't change the diagnosis):** open
 **[debug.photon.codes](https://debug.photon.codes)** on the iPhone and confirm the handle it reports matches
@@ -13,6 +14,44 @@ the Users page. (We already have strong evidence the handle is fine — a bot-in
 with no "Target not allowed" — but this rules out the last user-side variable.)
 
 ---
+
+## 24-Jun follow-up — request a dedicated Business line for groups (SEND THIS)
+
+> **Subject:** Re: shared-pool line +1 628 264-7704 — resolved; requesting a dedicated Business line for groups
+>
+> Hi Ryan,
+>
+> Two things — an update and a follow-up ask.
+>
+> **Resolved:** the earlier "no iMessage in either direction" problem on shared-pool line **+1 (628)
+> 264-7704** has cleared. DMs now route both ways and my Spectrum bot (`sawagc`) is live in 1:1 chats
+> (natural-language prediction-market search across Sawa, Kalshi & Polymarket). Thanks for the help.
+>
+> **New ask — a dedicated (Business) line for group chat.** Groups don't work on the shared pool, which
+> matches your docs ("shared mode cannot create group chats"). I confirmed it live today:
+> - Built a group with my line **+1 (628) 264-7704** + one other member, with the bot listening 28 min.
+> - A fresh group message produced **zero inbound** to the SDK (I log every event before filtering), while
+>   DMs to the same line in the same window routed fine.
+> - So the shared pool can't present one coherent bot number to a group (each end user routes through a
+>   different pool number).
+>
+> Could you move `sawagc` to a **dedicated Business line** so group chats work? Happy to do whatever's
+> needed on my end.
+>
+> **One more data point (possibly related):** today I also saw intermittent **outbound** errors on the
+> line — `SendTextMessage DEADLINE_EXCEEDED` and `SetTyping ECONNRESET` ("[upstream] Service temporarily
+> unavailable, please retry"). The text usually still delivers (the ack just times out), but it's frequent
+> enough to flag. Known transient issue, or worth rotating the line as part of the Business move?
+>
+> Thanks!
+> — Rohan · project `sawagc`
+
+---
+
+## Historical (23-Jun — RESOLVED): "line dead in both directions" report
+
+_Kept for the evidence trail. The line now routes DMs both ways, so the "dead line" conclusion below no
+longer applies; the data remains useful context for the line's history._
 
 ## Copy-paste email
 
