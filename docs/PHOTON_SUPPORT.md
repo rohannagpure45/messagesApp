@@ -1,9 +1,17 @@
 # Photon support report — iMessage inbound not delivered (ready to send)
 
 **Send to:** `ryan@photon.codes` (per the Spectrum docs support contact).
-**Also try first:** on [app.photon.codes](https://app.photon.codes), **remove + re-add your phone** on the
+**Try FIRST (60 seconds, most likely fix — don't send this email until you've ruled it out):** open
+**[debug.photon.codes](https://debug.photon.codes)** on the test iPhone. The debug bot replies with the
+**exact handle Apple sends your iMessage from**. If that handle (often your **Apple-ID email**, or a
+differently-formatted number) is **not** the one on the Users page, that fully explains "Delivered but no
+inbound": Photon routes inbound by mapping `sender handle → registered user → your session`, so an
+unregistered sending handle is never associated with the project. Fix by adding that exact handle under
+**Users** (or set the iPhone's **Settings → Messages → Send & Receive → "Start new conversations from"** to
+your number), then retext.
+**Then try:** on [app.photon.codes](https://app.photon.codes), **remove + re-add your phone** on the
 Users page and **re-provision/re-assign the shared-pool line** — Photon's own troubleshooting maps the exact
-symptom below ("connected, no inbound") to line provisioning. If that fixes it, you don't need this.
+symptom below ("connected, no inbound") to line provisioning. If either fixes it, you don't need this email.
 
 ---
 
@@ -17,6 +25,9 @@ symptom below ("connected, no inbound") to line provisioning. If that fixes it, 
 > - **Project:** `sawagc` (Free plan, shared-pool line **+1 (628) 264-7704**).
 > - **My phone is added** on the Users page; texting the line shows **"Delivered"**, but the bot logs **no
 >   inbound event** at all (I log every event before any filtering).
+> - **Sending handle verified via [debug.photon.codes](https://debug.photon.codes):** the debug bot reports
+>   `<PASTE THE HANDLE IT REPORTS>`, which **matches** the handle on my Users page — so this is not a
+>   handle-mismatch (delete this line if it did NOT match, and fix the Users entry instead).
 > - **Connection is healthy and stable:** a persistent TLS socket to your prod cluster
 >   (`*.elb.us-west-1.amazonaws.com`), unchanged across several minutes with **zero reconnect/error churn** in
 >   the verbose SDK logs.
@@ -36,6 +47,7 @@ symptom below ("connected, no inbound") to line provisioning. If that fixes it, 
 
 | Check | Result |
 |---|---|
+| Sending handle (via debug.photon.codes) matches Users entry | ⬜ confirm before sending — most likely cause if it does NOT |
 | `iMessage: ENABLED` (PROJECT_ID + PROJECT_SECRET present) | ✅ |
 | Instances running | exactly 1 (single-instance lock on `127.0.0.1:47615`) |
 | Socket to Photon | ESTABLISHED, stable, `*.elb.us-west-1.amazonaws.com:443` |

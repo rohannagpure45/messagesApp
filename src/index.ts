@@ -211,6 +211,45 @@ async function handleNatural(space: Space, body: string): Promise<void> {
   );
 }
 
+// Startup outbound initiation (SAWA_HELLO_TO="+15551234567", or a comma-separated list of handles).
+// The bot messages the handle(s) FIRST. Rationale: on a Photon *shared pool*, the inbound→SDK route for a
+// given end user is established when the project initiates the conversation to that registered user — a user
+// who only ever cold-texts a pool line it was never addressed from may not be routed back to the stream
+// (fits "Delivered, no reply"). It also converts an opaque "no inbound" into a concrete OUTBOUND result in
+// our own logs: a thrown "Target not allowed for this project" pinpoints a handle/Users-allowlist mismatch
+// (verify the real sending handle at https://debug.photon.codes).
+async function sendHello(handles: string[]): Promise<void> {
+  if (!hasPhoton) {
+    console.warn("[sawa] SAWA_HELLO_TO is set but iMessage is DISABLED (no PROJECT_ID/PROJECT_SECRET) — skipping.");
+    return;
+  }
+  const im = imessage(app);
+  for (const handle of handles) {
+    try {
+      const user = await im.user(handle);
+      const dm = await im.space.create(user);
+      await dm.send(
+        `👋 Sawa here. Reply with "${botName} FIFA World Cup" (or "${botName} <any topic>") and I'll find ` +
+          `markets across Sawa, Kalshi & Polymarket. ${DISCLAIMER}`,
+      );
+      console.warn(`[sawa] ✅ hello → ${handle}: sent. Reply IN THIS THREAD now; watch for '⟵ inbound'.`);
+    } catch (err) {
+      console.error(
+        `[sawa] ❌ hello → ${handle}: FAILED — this IS the diagnostic. A "Target not allowed" error ⇒ this ` +
+          `handle isn't in your project's Users, or isn't the handle Apple sends you from (check ` +
+          `https://debug.photon.codes). Raw error:`,
+        err,
+      );
+    }
+  }
+}
+
+const helloTo = (process.env.SAWA_HELLO_TO ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+if (helloTo.length) await sendHello(helloTo);
+
 console.warn(
   hasPhoton
     ? "[sawa] listening — text the Photon line NOW; expect '⟵ inbound [iMessage/dm]' within a few seconds."

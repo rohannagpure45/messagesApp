@@ -64,8 +64,21 @@ Polymarket, each with a price / payout and an `[open](…)` link, then the discl
    connecting. (On the Photon **free/pro** plan each recipient is routed through a number from a shared pool;
    on **Business**, a single dedicated number — see `.agents/skills/spectrum/providers/imessage.md`.)
 
+   > **Recommended on a shared pool: let the bot text YOU first.** On the free/pro shared pool, the
+   > inbound→SDK route for an end user is established when the project *initiates* the conversation to that
+   > registered user. Cold-texting a pool number the bot never addressed you from may not route back (a
+   > common cause of "Delivered, no reply"). Set `SAWA_HELLO_TO` to your handle and the bot sends you a
+   > greeting on boot:
+   > ```sh
+   > SAWA_HELLO_TO="+1XXXXXXXXXX" npm run start
+   > ```
+   > Watch the boot log: `✅ hello → +1…: sent` means outbound + handle are good — **reply in that thread**
+   > and your inbound should now route (`⟵ inbound [iMessage/dm]`). `❌ hello … FAILED … Target not allowed`
+   > means the handle isn't in **Users** or isn't the one Apple sends you from → verify at
+   > [debug.photon.codes](https://debug.photon.codes). Comma-separate to greet several handles.
+
 2. **Start a conversation with the bot's number.** From the Photon dashboard, find the line/number your
-   project sends from (or send yourself a test message). Then in the Messages app:
+   project sends from (or use `SAWA_HELLO_TO` above to have the bot open the thread). Then in the Messages app:
    - **DM:** text the bot directly — it answers **every** message.
    - **Group:** add the bot's number to a group. In a group it only answers when **hailed** — start the
      message with `sawa …` or include `@sawa`. Bystander chatter is ignored by design.
@@ -132,7 +145,25 @@ If iMessage shows **Delivered** but the bot never replies:
    reconnect churn, and there was none. So this is a **healthy, stable connection that simply receives no
    inbound → Photon is not routing your texts to the connected client.** That is a **Photon account/line
    issue.** In order:
-   - **Dashboard / re-provision the line (primary).** Photon's own integration troubleshooting maps the
+   - **Make the bot text YOU first (`SAWA_HELLO_TO`) — fastest, and it self-diagnoses.** `SAWA_HELLO_TO="+1…"
+     npm run start` initiates the conversation from the project's line, which is how the shared-pool
+     inbound→SDK route gets established (cold-texting a never-addressed pool line can simply not route back).
+     Two outcomes, both useful: **`✅ hello … sent`** → reply in that thread; inbound should now flow
+     (`⟵ inbound`). **`❌ hello … FAILED` / "Target not allowed for this project"** → the handle isn't in
+     **Users** or isn't the one Apple sends from → do the debug.photon.codes check below, fix Users, retry.
+   - **Verify the actual SENDING HANDLE first ([debug.photon.codes](https://debug.photon.codes)) — most
+     likely cause, 60-second check.** On shared-pool, Photon routes inbound by mapping `inbound sender
+     handle → a registered user of the project → your SDK session`. If the handle Apple actually sends your
+     iMessage *from* (often your **Apple-ID email**, or a number formatted differently than the one you
+     added) is **not** on the Users page, Photon can't associate your text with the project and never routes
+     it to the stream — yet "Delivered" still shows (that's Apple's receipt for the bot's *outbound* to your
+     registered number) and the connection stays healthy. This matches the exact symptom. **Fix:** open
+     [debug.photon.codes](https://debug.photon.codes) on the test iPhone; the debug bot replies with the
+     exact handle Apple sends from. If it's an **email**, either add that email under **Users** *or* set
+     **Settings → Messages → Send & Receive → "Start new conversations from"** to your number; if it's a
+     differently-formatted **number**, add that exact string. Then retext. (If the reported handle already
+     matches Users exactly, move to the next step.)
+   - **Dashboard / re-provision the line (secondary).** Photon's own integration troubleshooting maps the
      exact symptom "connected but no inbound" to a **line-provisioning** problem ("Spectrum is enabled but no
      line has been provisioned — re-run setup or check the dashboard"). So: confirm a line is actually
      **provisioned + active**, your phone is on **Users** and **still mapped** to it (shared-pool assignments
