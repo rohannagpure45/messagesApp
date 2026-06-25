@@ -35,16 +35,16 @@ describe("formatMarket", () => {
 });
 
 describe("formatList", () => {
-  it("messages the empty state with disclaimer", () => {
+  it("messages the empty state with no disclaimer", () => {
     const out = formatList([]);
     expect(out).toContain("No open markets");
-    expect(out.toLowerCase()).toContain("no cash value");
+    expect(out.toLowerCase()).not.toContain("no cash value");
   });
 
-  it("numbers markets and includes the disclaimer", () => {
+  it("numbers markets without a disclaimer footer", () => {
     const out = formatList([market(), market({ id: "d2", title: "Second" })]);
     expect(out).toContain("1. Will it rain tomorrow?");
     expect(out).toContain("2. Second");
-    expect(out.toLowerCase()).toContain("no cash value");
+    expect(out.toLowerCase()).not.toContain("no cash value");
   });
 });

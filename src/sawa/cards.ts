@@ -1,21 +1,18 @@
 /**
- * Presentation layer for the SEARCH face — the "Skyscanner card."
+ * Presentation layer for the conversational SEARCH face.
  *
- * Pure string builders (like format.ts): the router wraps the output in Spectrum's `markdown()` so
- * this stays trivially unit-testable and platform-neutral. On cloud iMessage, markdown renders as
- * native styled text — **bold** and `[label](url)` links become real formatting via UTF-16 ranges —
- * so the card uses bold section headers + inline links for hierarchy instead of emoji. Follows the
- * BUILD_PLAN §2.1 UX principles: bubble-sized, one compact line per market, price-first, real-money
- * venues clearly distinguished from Sawa virtual coins, the disclaimer on every coin/market message.
+ * Pure string builders (like format.ts): the router wraps the output in Spectrum's `markdown()` (cloud
+ * iMessage) or plain `text()` (local/terminal). Each reply is ONE natural line — naming a single market,
+ * its favorite (+ a runner-up for two-sided markets) and the venue — folk-style, instead of the old
+ * wall of cross-venue rows. Links are NOT in the first reply; they come only when the user asks in a
+ * follow-up (`renderLink`), as a bare tappable URL that cloud iMessage previews natively.
+ *
+ * Note: replies carry NO virtual-coin disclaimer (removed by owner decision for a clean folk-style
+ * voice). The venue is named inline ("on Kalshi" / "on Sawa") and real-money venues read as real money
+ * (cents + return multiple), so the line is still unambiguous. Consent + virtual-coin framing is
+ * deferred to the future betting/money-action phase, not these discovery replies.
  */
-import type { SearchResults } from "../search";
-import type { VenueResult } from "../venue";
-
-export const DISCLAIMER = "Virtual Sawa coins — entertainment only, no cash value.";
-/** One concise legend: how to read a real-money price, plus the virtual-coin disclaimer. */
-const FOOTER =
-  "_Real-money prices are the cost of a $1 contract; ×N is the return if it hits. " +
-  "Sawa coins are virtual — entertainment only, no cash value._";
+import type { TopOutcome, Venue, VenueResult } from "../venue";
 
 const TITLE_MAX = 52;
 
@@ -23,6 +20,9 @@ function truncate(s: string, max = TITLE_MAX): string {
   const t = s.trim();
   return t.length <= max ? t : t.slice(0, max - 1).trimEnd() + "…";
 }
+
+/** Labels for the "No"/"Not" side of a binary market — a complement, never worth showing as a runner-up. */
+const NEGATIVE_LABEL = /^(no|not)\b/i;
 
 interface PriceDisplay {
   text: string;
@@ -40,61 +40,86 @@ export function formatPrice(price: number): PriceDisplay {
   return { text: pct > 0 ? "<1¢" : "—" };
 }
 
-/** The headline outcome chunk for a Sawa row, e.g. "Brazil 22%" or "Yes · no pool yet". */
-function sawaOutcome(r: VenueResult): string {
-  if (!r.top) return "no pool yet";
-  const { label, oddsPct } = r.top;
-  return oddsPct == null ? `${label} · no pool yet` : `${label} ${Math.round(oddsPct)}%`;
-}
-
-/** The headline outcome chunk for a real-money row, e.g. "Karen Bass 65¢ (1.5×)". */
-function externalOutcome(r: VenueResult): string {
-  if (!r.top || r.top.price == null) return "see venue";
-  const { text, multiple } = formatPrice(r.top.price);
-  return multiple ? `${r.top.label} ${text} (${multiple}×)` : `${r.top.label} ${text}`;
-}
-
-/** One compact line for a market: "Title — outcome  ·  open". Venue is carried by the section header. */
-function line(r: VenueResult): string {
-  const outcome = r.realMoney ? externalOutcome(r) : sawaOutcome(r);
-  const head = `${truncate(r.title)} — ${outcome}`;
-  return r.url ? `${head}  ·  [open](${r.url})` : head;
-}
-
-/** A venue block: a bold header naming the source + its money model, then its ranked rows. */
-function section(rows: VenueResult[]): string | null {
-  if (rows.length === 0) return null;
-  const label = rows[0]!.sourceLabel;
-  const kind = rows[0]!.realMoney ? "real money" : "virtual coins";
-  return `**${label}** — ${kind}\n${rows.map(line).join("\n")}`;
-}
-
-/** Short bold header — the answer framing up front, no preamble. */
-export function searchLead(results: SearchResults): string {
-  const q = results.query ? `"${results.query}"` : "that";
-  return `**Markets for ${q}**`;
+/** Format one outcome: real-money "<label> 65¢ (1.5×)" or Sawa "<label> 59%" / "<label> (no pool yet)". */
+function chunk(o: TopOutcome, realMoney: boolean, withMultiple = true): string {
+  if (realMoney) {
+    if (o.price == null) return o.label;
+    const { text, multiple } = formatPrice(o.price);
+    return withMultiple && multiple ? `${o.label} ${text} (${multiple}×)` : `${o.label} ${text}`;
+  }
+  return o.oddsPct == null ? `${o.label} (no pool yet)` : `${o.label} ${Math.round(o.oddsPct)}%`;
 }
 
 /**
- * The Skyscanner card as one markdown bubble: a bold header, then Sawa (our venue) → Kalshi →
- * Polymarket, each as a bold-headed section of ranked rows, closed by the legend + disclaimer.
- * Returns "" when empty (callers use `emptyReply` instead).
+ * The favorite (+ runner-up) chunk for the conversational line. Shows the runner-up folk-style for a
+ * genuine two-sided market ("Brazil 59%, Argentina 41%" / "Ronaldo 8¢, Messi 93¢") but suppresses it
+ * for a Yes/No binary (a "No"/"Not" side is just the complement) and when the runner-up has no value.
  */
-export function searchBody(results: SearchResults): string {
-  const sections = [section(results.sawa), section(results.kalshi), section(results.polymarket)].filter(
-    (s): s is string => s !== null,
-  );
-  if (sections.length === 0) return "";
-  const tail = results.truncated ? "\n_Showing top matches — narrow your search for more._" : "";
-  return `${searchLead(results)}\n\n${sections.join("\n\n")}${tail}\n\n${FOOTER}`;
+export function outcomeChunk(r: VenueResult): string {
+  if (!r.top) return r.realMoney ? "see venue" : "no pool yet";
+  const head = chunk(r.top, r.realMoney);
+  const ru = r.runnerUp;
+  const ruHasValue = ru && (r.realMoney ? ru.price != null && ru.price > 0 : ru.oddsPct != null);
+  const oneSided = !ru || NEGATIVE_LABEL.test(ru.label) || NEGATIVE_LABEL.test(r.top.label);
+  if (!ruHasValue || oneSided) return head;
+  return `${head}, ${chunk(ru, r.realMoney, false)}`;
 }
 
 /**
- * The URL for a single richlink cover card — the top Sawa market with a link. `read.ts` only ever
- * returns public, open markets, so this never leaks a private/hidden market's OG image.
+ * A brief, factual flourish appended when SAWA_FOLK_TONE is on (off by default). Deliberately mild and
+ * category-blind — it characterizes the price, it does not editorialize — so it stays brand-safe even
+ * on sensitive markets. A richer (LLM-written) quip could replace this later; kept pure + testable.
+ * Returns "" when no clear signal applies.
  */
-export function topSawaRichlinkUrl(results: SearchResults): string | undefined {
-  return results.sawa.find((r) => r.url)?.url;
+export function folkQuip(r: VenueResult): string {
+  const p = r.top?.price ?? (r.top?.oddsPct != null ? r.top.oddsPct / 100 : null);
+  if (p == null) return "";
+  if (p >= 0.9) return "heavy favorite";
+  const ruP = r.runnerUp?.price ?? (r.runnerUp?.oddsPct != null ? r.runnerUp.oddsPct / 100 : null);
+  if (ruP != null && Math.abs(p - ruP) <= 0.06) return "too close to call";
+  if (p <= 0.35) return "wide open";
+  return "";
+}
+
+export interface RenderOneOptions {
+  /** Append a brief editorial flourish (folk tone). Off by default; gated by SAWA_FOLK_TONE upstream. */
+  folkTone?: boolean;
+}
+
+/**
+ * The conversational single-market reply: ONE natural line — market, favorite (+ runner-up for a
+ * two-sided market), venue. NO link (links come only on a follow-up) and no disclaimer. Emits no
+ * bold/markdown, so cloud and plain-text (local/terminal) render identically.
+ */
+export function renderOne(r: VenueResult, opts: RenderOneOptions = {}): string {
+  const core = `${truncate(r.title)} — ${outcomeChunk(r)} on ${r.sourceLabel}`;
+  const quip = opts.folkTone ? folkQuip(r) : "";
+  return quip ? `${core} — ${quip}.` : `${core}.`;
+}
+
+/**
+ * Reply to a "send the link" follow-up: a bare, tappable URL (cloud iMessage auto-renders a rich
+ * preview for it; local/terminal shows it plain). Assumes `r.url` is present — the caller falls back
+ * to `renderNoVenue` when it isn't.
+ */
+export function renderLink(r: VenueResult): string {
+  return `Here's the ${r.sourceLabel} one: ${r.url}`;
+}
+
+/** Reply when "not that" has paged past the last candidate: out of options, nudge a fresh search. */
+export function renderExhausted(query: string): string {
+  const q = query ? `"${query}"` : "that";
+  return `That's everything I've got for ${q} right now — try another search?`;
+}
+
+function venueLabel(venue: Venue): string {
+  return venue === "sawa" ? "Sawa" : venue === "kalshi" ? "Kalshi" : "Polymarket";
+}
+
+/** Reply to a venue link request we can't fulfil — that venue had no match (or enrichment is off). */
+export function renderNoVenue(venue: Venue, query: string): string {
+  const q = query ? `"${query}"` : "that";
+  return `I don't have a ${venueLabel(venue)} market for ${q} right now.`;
 }
 
 /** Empty-state copy: no match anywhere → gentle nudge + tease create (not built yet). */
@@ -102,27 +127,20 @@ export function emptyReply(query: string): string {
   const q = query ? `"${query}"` : "that";
   return (
     `No live markets for ${q} on Sawa, Kalshi, or Polymarket yet.\n` +
-    `Try a broader term — or want me to spin up a market on Sawa? (creating markets is coming soon)\n\n` +
-    DISCLAIMER
+    `Try a broader term — or want me to spin up a market on Sawa? (creating markets is coming soon)`
   );
 }
 
-/** Convenience: the full rendered reply as plain parts the router turns into Spectrum content. */
-export interface RenderedSearch {
-  /** The full card as one markdown string (header + venue sections + footer), or the empty-state copy. */
-  body: string;
-  /** Present → send a richlink cover card for the top Sawa market. */
-  richlinkUrl?: string;
-  empty: boolean;
-}
-
-export function renderSearch(results: SearchResults): RenderedSearch {
-  if (results.empty) {
-    return { body: emptyReply(results.query), empty: true };
-  }
-  return {
-    body: searchBody(results),
-    richlinkUrl: topSawaRichlinkUrl(results),
-    empty: false,
-  };
+/**
+ * Flatten any residual markdown to plain text for platforms that strip formatting — iMessage **local
+ * mode** (reads/sends via the Mac's Messages app) and the terminal. The conversational renderers emit
+ * no bold/links (only bare URLs), so this is a near no-op today, but is applied for safety/consistency.
+ */
+export function toPlainText(md: string): string {
+  return md
+    // [open](url) → bare url. The URL body allows one level of balanced parens so a link target like
+    // …/Example_(word) survives intact instead of truncating at the first ")".
+    .replace(/\[([^\]]+)\]\(([^()]*(?:\([^)]*\)[^()]*)*)\)/g, "$2")
+    .replace(/\*\*([^*]+)\*\*/g, "$1") // **bold** → bold
+    .replace(/_([^_]+)_/g, "$1"); // _italic_ → italic
 }

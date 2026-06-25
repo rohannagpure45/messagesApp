@@ -15,7 +15,7 @@ import { listMarkets } from "./sawa/read";
 import { searchExternal } from "./pmxt/discover";
 import type { Config, PmxtConfig } from "./sawa/config";
 import type { Market, Outcome } from "./sawa/types";
-import { type VenueResult, scoreRelevance, tokenize } from "./venue";
+import { type Venue, type VenueResult, scoreRelevance, tokenize } from "./venue";
 
 /** How many open Sawa markets to pull for client-side ranking (the live open catalog is small). */
 const SAWA_FEED_LIMIT = 50;
@@ -43,24 +43,32 @@ export interface SearchResults {
   externalUnavailable: boolean;
 }
 
-/** Pick the headline Sawa outcome: the highest display-odds option (the current favorite). */
-function pickSawaTop(outcomes: Outcome[]): VenueResult["top"] {
-  if (outcomes.length === 0) return undefined;
-  let best = outcomes[0]!;
-  for (const o of outcomes) {
-    if ((o.oddsPct ?? -1) > (best.oddsPct ?? -1)) best = o;
-  }
-  return { label: best.label, oddsPct: best.oddsPct };
+/**
+ * Pick the headline + runner-up Sawa outcomes: the two highest display-odds options (the current
+ * favorite, then the next). The runner-up powers the conversational reply's folk-style two-sided
+ * line; the renderer drops it for Yes/No binaries.
+ */
+function pickSawaOutcomes(outcomes: Outcome[]): { top?: VenueResult["top"]; runnerUp?: VenueResult["runnerUp"] } {
+  if (outcomes.length === 0) return {};
+  const sorted = [...outcomes].sort((a, b) => (b.oddsPct ?? -1) - (a.oddsPct ?? -1));
+  const top = sorted[0]!;
+  const second = sorted[1];
+  return {
+    top: { label: top.label, oddsPct: top.oddsPct },
+    runnerUp: second ? { label: second.label, oddsPct: second.oddsPct } : undefined,
+  };
 }
 
 function sawaToVenueResult(m: Market, query: string): VenueResult {
+  const { top, runnerUp } = pickSawaOutcomes(m.outcomes);
   return {
     venue: "sawa",
     sourceLabel: "Sawa",
     realMoney: false,
     title: m.title,
     url: m.url,
-    top: pickSawaTop(m.outcomes),
+    top,
+    runnerUp,
     relevance: scoreRelevance(m.title, query),
   };
 }
@@ -78,10 +86,56 @@ const NEAR_LOCK = 0.92;
  * (Spain 14¢ for the World Cup, Karen Bass 65¢ for a mayoral race), while both locks and longshots
  * sink. 24h volume is the tiebreak.
  */
-function interest(r: VenueResult): number {
+export function interest(r: VenueResult): number {
   const p = r.top?.price ?? (r.top?.oddsPct != null ? r.top.oddsPct / 100 : null);
   if (p == null || p <= 0) return 0;
   return p < NEAR_LOCK ? p : Math.max(0, 1 - p);
+}
+
+/**
+ * Relevance margin an external market must beat the best Sawa match by before it is allowed to lead
+ * the single conversational answer. Sawa is the only venue users can act on (and the referral/
+ * distribution surface), so we bias toward it — but never bury a clearly-more-relevant external
+ * market. 0.2 ≈ "one more matched query token out of five." Owner-tunable.
+ */
+const SAWA_LEAD_EPSILON = 0.2;
+
+/**
+ * Flatten the per-venue results into ONE cross-venue ranked list — the source for the conversational
+ * reply (index 0 = the market shown first) and the follow-up cursor (`not that` pages forward).
+ *
+ * Base order is identical to the per-venue ranking — relevance desc, then the same `interest()`
+ * signal, then 24h volume — so the merge is fair. THEN the Sawa-lead tiebreak (owner decision): if a
+ * relevant Sawa market exists it leads UNLESS an external market beats the best Sawa match's
+ * relevance by more than `SAWA_LEAD_EPSILON`, in which case the clearly-more-relevant external
+ * market leads. The remaining markets keep relevance/interest order so paging stays sensible.
+ */
+export function flattenRanked(results: SearchResults): VenueResult[] {
+  const ranked = [...results.sawa, ...results.kalshi, ...results.polymarket].sort(
+    (a, b) => b.relevance - a.relevance || interest(b) - interest(a) || (b.volume24h ?? 0) - (a.volume24h ?? 0),
+  );
+  if (ranked.length === 0) return ranked;
+  const lead = pickLead(ranked);
+  if (lead === ranked[0]) return ranked;
+  return [lead, ...ranked.filter((r) => r !== lead)];
+}
+
+/** Pick the leading market: the best Sawa match unless an external one is *clearly* more relevant. */
+function pickLead(ranked: VenueResult[]): VenueResult {
+  const top = ranked[0]!;
+  if (top.venue === "sawa") return top;
+  const bestSawa = ranked.find((r) => r.venue === "sawa");
+  if (!bestSawa) return top; // no Sawa match → the most-relevant external market leads
+  return top.relevance - bestSawa.relevance > SAWA_LEAD_EPSILON ? top : bestSawa;
+}
+
+/** The venues that returned ≥1 row — carried into conversation state so link follow-ups know what exists. */
+export function venuesPresent(results: SearchResults): Venue[] {
+  const out: Venue[] = [];
+  if (results.sawa.length) out.push("sawa");
+  if (results.kalshi.length) out.push("kalshi");
+  if (results.polymarket.length) out.push("polymarket");
+  return out;
 }
 
 /** Rank by relevance desc, then interest desc, then 24h volume desc; floor + cap. */

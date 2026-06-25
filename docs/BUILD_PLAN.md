@@ -18,6 +18,24 @@
 
 ## 0. Where we are (ground truth) — read before planning
 
+### Update — 24-Jun (SEARCH reply redesigned: conversational, card removed, disclaimer dropped)
+
+- **The 3×3 "Skyscanner card" was replaced with a folk-style conversational single-market reply.** "sawa
+  <topic>" now returns ONE natural line naming the favorite (+ a runner-up for head-to-heads) and venue —
+  **no link until asked**. Lead venue = **Sawa-first within `SAWA_LEAD_EPSILON` (0.2)** else best-relevance
+  (`flattenRanked`, `src/search.ts`). The card render path (`renderSearch`/`searchBody`/`section`) was deleted.
+- **History-aware follow-ups** via new per-conversation memory (`src/sawa/conversation.ts` — an LRU+TTL
+  `ConversationStore` keyed by `space.id`; a pure, unit-tested `nextTurn` reducer): "not that"/"another"/"more"
+  pages to the next market; "send the kalshi link"/bare "kalshi" hands out that venue's bare URL (or a graceful
+  "no Kalshi market for that" miss). `IntentKind` widened to `search|next|link|other` + `classifyFollowup`
+  (regex, active-market only) + a context-aware LLM (`src/sawa/intent.ts`). `SAWA_FOLK_TONE=1` toggles a mild quip.
+- **The virtual-coin disclaimer was removed from all output** (replies, `/markets`, HELP, hello) per owner
+  decision — see §2.1 and §7 (the "disclaimer on every coin/market message" invariant is retired for
+  discovery/search; consent + virtual-coin framing is deferred to the betting phase).
+- **Status:** `typecheck` clean, **112 tests** green; design + adversarial review were run as multi-agent
+  workflows (2 confirmed bugs fixed with regression tests). **NOT yet re-verified live in iMessage** — the
+  channel-proof gate in the 23-Jun update below remains open.
+
 ### Update — 23-Jun (Phase 1 SEARCH built)
 
 - **Phase 1 SEARCH is code-complete** (messagesApp PR #2 → `sawa-spectrum-bot`, branch
@@ -26,8 +44,8 @@
   with price, implied payout, and a link. `typecheck` clean, **69 tests** green, **verified live** against
   the Sawa public API + pmxt (Kalshi+Polymarket) + Gemini Flash-Lite. Files: `src/sawa/intent.ts`
   (regex-first gate + Gemini), `src/pmxt/*` (GET-only, per-venue, fail-soft), `src/search.ts` (aggregator +
-  favorite-but-not-near-lock ranking), `src/sawa/cards.ts` (the card), `src/index.ts`+`src/routing.ts`
-  (mention-gating, idempotency).
+  favorite-but-not-near-lock ranking), `src/sawa/cards.ts` (presentation — since rebuilt as the conversational
+  reply, see the 24-Jun update above), `src/index.ts`+`src/routing.ts` (mention-gating, idempotency).
 - **Remaining for Search to be fully DONE** (per the Definition of DONE): (a) **live iMessage dogfood** in a
   real test group (needs `PROJECT_ID`/`PROJECT_SECRET`; this is also the Phase-0 §3.2 connection gate, still
   unproven), (b) **merge** PR #2, (c) **demo recorded** + feedback logged. Code + live-API behavior are
@@ -127,8 +145,10 @@ not the channel. Principles to bake in:
 
 1. **Bubble-sized, not paragraph-sized.** Lead with the answer in one short bubble; split long results across
    bubbles. No preamble.
-2. **One compact line per source.** Skyscanner-style: `Polymarket · 63¢ YES · [open]`. Price first for
-   scannability; markdown link per line; cap ~3–5 sources, "more?" on request.
+2. **One favorite market, conversationally.** Lead with the single best market as a natural line naming the
+   venue (e.g. `Brazil 59% on Sawa`); price/odds first for scannability. Other markets and venues come on a
+   **follow-up** ("not that", "another", "send the kalshi link"), not all at once. *(Updated 24-Jun — was the
+   3×3 "Skyscanner card", one line per source.)*
 3. **Exactly one clear action per message** — never a menu of competing CTAs.
 4. **Confirm conversationally, not with forms.** Echo the parsed intent back and gate actions on a **tapback**
    or one-word reply — reactions *are* our quick-reply substitute.
@@ -136,7 +156,9 @@ not the channel. Principles to bake in:
    never fake AMB pickers.
 6. **Latency feel: acknowledge, then deliver.** Send a fast "checking the odds…" bubble (stream/`responding`)
    before slow API calls so the thread never goes silent.
-7. **Virtual-coin disclaimer inline + minimal** — a short suffix on every coin/market message, not a paragraph.
+7. **Virtual-coin framing deferred to the betting phase.** Discovery/search replies carry **no disclaimer**
+   (removed 24-Jun for a clean folk voice); venues are named inline and real-money prices read as real money.
+   Consent + the no-cash-value framing belong on the money-action step in the betting phase, not here.
 
 ---
 
@@ -182,8 +204,10 @@ Sawa markets over the app API, and replies in voice. (No Search logic yet.)
 
 ## 4. Phase 1 — SEARCH (Wed 24 – Fri 26-Jun) — ship Fri 26-Jun
 
-**Deliverable:** a query like "FIFA World Cup" returns **matched markets from Sawa, Kalshi, and Polymarket**,
-with **price and payout per source**, Skyscanner-style — **one compact line each with a tappable link.**
+**Deliverable:** a query like "FIFA World Cup" returns **one favorite market in a natural conversational line**
+naming the venue (Sawa-first within an epsilon, else best-relevance) with price/payout; Kalshi/Polymarket
+markets and links come on **history-aware follow-ups** ("not that", "another", "send the kalshi link").
+*(Redesigned 24-Jun from the multi-venue "Skyscanner card" — see §0.)*
 
 - **4.1 Search intent detection** — `intent.ts` classifies search vs create vs chat; extract the query subject.
 - **4.2 Sawa side** — `read.ts` via the app API; **client-side fuzzy match** over the open-market feed
@@ -195,21 +219,24 @@ with **price and payout per source**, Skyscanner-style — **one compact line ea
 - **4.4 Matching + ranking + normalization** — unify into one row shape `{ source, title, price (¢/%),
   payout/return, url }`; rank by relevance + 24h volume; **threshold `minConfidence`** so we never show a
   bad cross-venue match.
-- **4.5 Aggregated reply (the Skyscanner card)** — compact `markdown`, one line per source, **external venues
-  clearly labeled real-money vs Sawa virtual coins**; `richlink` cover for the top Sawa market (never for a
-  private/hidden market); cap line count; apply the **§2.1 UX principles** (bubble-sized, one line/source, one
-  clear action, ack-then-deliver).
+- **4.5 Conversational reply** — ONE favorite market as a natural `markdown`/text line (favorite + a runner-up
+  for head-to-heads + venue), **no link until asked**; real-money venues read as real money (cents + return
+  multiple) vs Sawa odds %. Per-conversation memory (`src/sawa/conversation.ts`) + a pure `nextTurn` reducer
+  drive follow-ups (next/link), parsed by `classifyFollowup` (regex) + a context-aware LLM. No disclaimer
+  (removed 24-Jun). Apply the **§2.1 UX principles** (bubble-sized, one favorite, one clear action,
+  ack-then-deliver). *(Replaced the old 3×3 "Skyscanner card" — see §0.)*
 - **4.6 Empty / broad query** — no match → offer **Create** ("want me to make this market on Sawa?"); broad →
   top-k + "narrow it down."
 - **4.7 Live test + analytics + deploy** — dogfood in the test group; emit `odds_lookup` / `command`
   analytics via `POST /api/bot/events` (RAW handle/spaceId, server hashes — SPECTRUM_INTEGRATION §6); deploy;
   **record the demo; log feedback.**
 
-**DONE checklist (Fri 26-Jun):** ☑ "FIFA World Cup" returns Sawa+Kalshi+Polymarket lines with
-price+payout+link ☑ empty/broad handled ☑ intent (regex gate + Gemini) ☑ typecheck + 69 tests green
-☑ verified live against the real APIs · **☐ merged to main** (PR #2 open) · **☐ live in a real iMessage test
-group** (needs Photon creds — also the §3.2 connection gate) · ☐ demo recorded · ☐ feedback logged. **Status:
-code-complete; not yet channel-proven or merged.**
+**DONE checklist (Fri 26-Jun):** ☑ "FIFA World Cup" returns the favorite market conversationally + history-aware
+follow-ups (next/link) ☑ empty/broad handled ☑ intent (regex gate + Gemini, now context-aware) ☑ typecheck +
+112 tests green ☑ verified live against the real APIs · **☐ merged to main** (PR #2 open) · **☐ live in a real
+iMessage test group** (needs Photon creds — also the §3.2 connection gate) · ☐ conversational flow re-verified
+live in iMessage · ☐ demo recorded · ☐ feedback logged. **Status: code-complete (conversational redesign
+24-Jun; disclaimer removed); not yet channel-proven or merged.**
 
 ---
 
@@ -257,11 +284,13 @@ confirm/edit works ☐ link returned ☐ demo recorded ☐ feedback logged → *
 - **Analytics** via `POST /api/bot/events` only (batch ≤200, partial-success, RAW values → server hashes) —
   SPECTRUM_INTEGRATION §6.
 - **Idempotency:** dedupe every side effect on `message.id` (at-least-once delivery).
-- **Consent + virtual-coin disclaimer** on every coin/market message; durable `optedOut`.
+- **Consent** before the first money action; durable `optedOut`. *(The virtual-coin disclaimer on every
+  message was retired 24-Jun — discovery/search replies carry none; the no-cash-value framing belongs on the
+  money-action step in the betting phase.)*
 - **Cost controls:** cheap intent model (Gemini Flash-Lite); pmxt cache + per-space gate; never call the
   cluster matcher on every group message.
-- **Language guardrail:** persona/voice is a thin wrapper over deterministic facts; clamp length; never drop
-  the disclaimer; no harassment.
+- **Language guardrail:** persona/voice is a thin wrapper over deterministic facts; clamp length for
+  conversational brevity; no harassment.
 - **Master-credential hygiene:** `SAWA_BOT_SECRET` is highest-value; deploy-env only, never logged. `/session`
   rate-limit hardening proceeds in parallel on the Sawa-app side (non-blocking).
 

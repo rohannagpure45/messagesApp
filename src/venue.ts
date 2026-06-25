@@ -33,6 +33,12 @@ export interface VenueResult {
   volume24h?: number;
   /** The headline outcome to show on the one-liner. */
   top?: TopOutcome;
+  /**
+   * The second-place outcome, when one exists — lets the conversational reply show a folk-style
+   * two-sided line ("Brazil 59%, Argentina 41%" / "Ronaldo 8¢, Messi 93¢"). Suppressed by the
+   * renderer for Yes/No binaries (a "No" runner-up is just the complement). Optional everywhere.
+   */
+  runnerUp?: TopOutcome;
   /** Relevance score vs the query (token overlap, 0–1). Higher = better. */
   relevance: number;
 }

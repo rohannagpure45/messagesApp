@@ -1,15 +1,18 @@
 import { describe, it, expect } from "vitest";
 import {
   formatPrice,
-  searchLead,
-  searchBody,
-  topSawaRichlinkUrl,
+  outcomeChunk,
+  folkQuip,
+  renderOne,
+  renderLink,
+  renderExhausted,
+  renderNoVenue,
   emptyReply,
-  renderSearch,
+  toPlainText,
 } from "../src/sawa/cards";
-// Note: the card has no emojis — hierarchy comes from bold section headers + links, which cloud
-// iMessage renders as native styled text. Assertions below target that plain, emoji-free output.
-import type { SearchResults } from "../src/search";
+// The conversational reply has no emojis, no multi-venue card, and no disclaimer (removed by owner
+// decision): one natural sentence, which cloud iMessage renders as plain styled text. Links never
+// appear in the first reply — only on a follow-up (renderLink), as a bare tappable URL.
 import type { VenueResult } from "../src/venue";
 
 const sawa = (over: Partial<VenueResult> = {}): VenueResult => ({
@@ -32,16 +35,6 @@ const ext = (over: Partial<VenueResult> = {}): VenueResult => ({
   relevance: 0.7,
   ...over,
 });
-const results = (over: Partial<SearchResults> = {}): SearchResults => ({
-  query: "world cup",
-  sawa: [],
-  kalshi: [],
-  polymarket: [],
-  empty: false,
-  truncated: false,
-  externalUnavailable: false,
-  ...over,
-});
 
 describe("formatPrice", () => {
   it("renders cents + implied return multiple", () => {
@@ -54,86 +47,108 @@ describe("formatPrice", () => {
   });
 });
 
-describe("searchLead", () => {
-  it("is a bold header naming the query", () => {
-    expect(searchLead(results({ query: "world cup" }))).toBe('**Markets for "world cup"**');
+describe("outcomeChunk", () => {
+  it("shows favorite + runner-up for a two-sided Sawa market", () => {
+    const c = outcomeChunk(sawa({ top: { label: "Brazil", oddsPct: 59 }, runnerUp: { label: "Argentina", oddsPct: 41 } }));
+    expect(c).toBe("Brazil 59%, Argentina 41%");
+  });
+  it("shows the cents+multiple only on the favorite for a head-to-head real-money market", () => {
+    const c = outcomeChunk(ext({ top: { label: "Messi", price: 0.93 }, runnerUp: { label: "Ronaldo", price: 0.08 } }));
+    expect(c).toBe("Messi 93¢ (1.1×), Ronaldo 8¢");
+  });
+  it("suppresses a Yes/No runner-up (the 'No' side is just the complement)", () => {
+    const c = outcomeChunk(ext({ title: "Will it rain?", top: { label: "Yes", price: 0.5 }, runnerUp: { label: "No", price: 0.5 } }));
+    expect(c).toBe("Yes 50¢ (2×)");
+  });
+  it("shows 'no pool yet' for an empty Sawa pool and never the word 'odds'", () => {
+    const c = outcomeChunk(sawa({ top: { label: "Yes", oddsPct: null }, runnerUp: undefined }));
+    expect(c).toContain("no pool yet");
+    expect(c).not.toMatch(/\bodds\b/i);
   });
 });
 
-describe("searchBody", () => {
-  it("renders one compact line per market, price-first, with a tappable link", () => {
-    const body = searchBody(results({ sawa: [sawa()], kalshi: [ext()] }));
-    expect(body).toContain("**Sawa** — virtual coins");
-    expect(body).toContain("Who will win the World Cup? — Brazil 59%");
-    expect(body).toContain("[open](https://sawapredictions.com/predictions/abc)");
-    expect(body).toContain("**Kalshi** — real money");
-    expect(body).toContain("Who will win Los Angeles Mayoral Election? — Karen Bass 65¢ (1.5×)");
-    expect(body).toContain("[open](https://kalshi.com/events/x)");
-    expect(body).not.toMatch(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u); // no emoji anywhere
+describe("renderOne", () => {
+  it("is one factual line — favorite + venue — with no disclaimer, emoji, or link", () => {
+    const out = renderOne(sawa());
+    expect(out).toBe("Who will win the World Cup? — Brazil 59% on Sawa.");
+    expect(out).not.toContain("http");
+    expect(out.toLowerCase()).not.toContain("no cash value");
+    expect(out).not.toMatch(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u);
   });
 
-  it("distinguishes virtual coins from real-money venues and always carries the disclaimer", () => {
-    const body = searchBody(results({ sawa: [sawa()], polymarket: [ext({ sourceLabel: "Polymarket", venue: "polymarket" })] }));
-    expect(body).toContain("**Sawa** — virtual coins");
-    expect(body).toContain("**Polymarket** — real money");
-    expect(body.toLowerCase()).toContain("no cash value");
+  it("names a runner-up for a head-to-head (the folk two-sided line)", () => {
+    const out = renderOne(ext({ title: "Ballon d'Or winner", top: { label: "Messi", price: 0.93 }, runnerUp: { label: "Ronaldo", price: 0.08 } }));
+    expect(out).toContain("Messi 93¢ (1.1×), Ronaldo 8¢ on Kalshi");
   });
 
-  it("shows 'no pool yet' for a Sawa market with an empty pool (brand-safe, no 'odds' wording)", () => {
-    const body = searchBody(results({ sawa: [sawa({ top: { label: "Yes", oddsPct: null } })] }));
-    expect(body).toContain("Yes · no pool yet");
-    expect(body).not.toMatch(/\bodds\b/i);
+  it("reads as real money for an external venue (named inline, no disclaimer)", () => {
+    const out = renderOne(ext());
+    expect(out).toBe("Who will win Los Angeles Mayoral Election? — Karen Bass 65¢ (1.5×) on Kalshi.");
+    expect(out.toLowerCase()).not.toContain("no cash value");
   });
 
-  it("adds a 'narrow your search' note only when truncated", () => {
-    expect(searchBody(results({ sawa: [sawa()], truncated: true }))).toContain("narrow your search");
-    expect(searchBody(results({ sawa: [sawa()], truncated: false }))).not.toContain("narrow your search");
-  });
-
-  it("orders Sawa first, then Kalshi, then Polymarket", () => {
-    const body = searchBody(
-      results({
-        sawa: [sawa()],
-        kalshi: [ext()],
-        polymarket: [ext({ sourceLabel: "Polymarket", venue: "polymarket", title: "Poly market" })],
-      }),
-    );
-    expect(body.indexOf("Sawa")).toBeLessThan(body.indexOf("Kalshi"));
-    expect(body.indexOf("Kalshi")).toBeLessThan(body.indexOf("Polymarket"));
+  it("appends a folk flourish only when folkTone is on", () => {
+    const heavy = sawa({ top: { label: "Brazil", oddsPct: 95 }, runnerUp: undefined });
+    expect(renderOne(heavy)).not.toContain("heavy favorite");
+    expect(renderOne(heavy, { folkTone: true })).toContain("— heavy favorite.");
   });
 });
 
-describe("topSawaRichlinkUrl", () => {
-  it("returns the first Sawa market with a URL (public-only by construction)", () => {
-    expect(topSawaRichlinkUrl(results({ sawa: [sawa({ url: undefined }), sawa({ url: "https://s/p/2" })] }))).toBe(
-      "https://s/p/2",
-    );
-    expect(topSawaRichlinkUrl(results({ kalshi: [ext()] }))).toBeUndefined();
+describe("folkQuip", () => {
+  it("characterizes the price (heavy favorite / too close / wide open) and is otherwise silent", () => {
+    expect(folkQuip(sawa({ top: { label: "A", oddsPct: 92 } }))).toBe("heavy favorite");
+    expect(folkQuip(ext({ top: { label: "A", price: 0.5 }, runnerUp: { label: "B", price: 0.47 } }))).toBe("too close to call");
+    expect(folkQuip(ext({ top: { label: "A", price: 0.2 }, runnerUp: undefined }))).toBe("wide open");
+    expect(folkQuip(sawa({ top: { label: "A", oddsPct: 60 }, runnerUp: { label: "B", oddsPct: 40 } }))).toBe("");
   });
 });
 
-describe("renderSearch", () => {
-  it("renders the empty state with a create tease + disclaimer when nothing matched", () => {
-    const r = renderSearch(results({ empty: true, query: "nonexistent" }));
-    expect(r.empty).toBe(true);
-    expect(r.body).toContain("nonexistent");
-    expect(r.body.toLowerCase()).toContain("coming soon");
-    expect(r.richlinkUrl).toBeUndefined();
+describe("renderLink", () => {
+  it("hands out a bare tappable URL (no disclaimer), stable through toPlainText", () => {
+    const out = renderLink(ext());
+    expect(out).toContain("https://kalshi.com/events/x");
+    expect(out.toLowerCase()).not.toContain("no cash value");
+    expect(toPlainText(out)).toContain("https://kalshi.com/events/x");
+    expect(out).not.toMatch(/\]\(/); // no markdown link syntax to strip
   });
+});
 
-  it("renders a single markdown card body + richlink cover for a non-empty result", () => {
-    const r = renderSearch(results({ sawa: [sawa()], kalshi: [ext()] }));
-    expect(r.empty).toBe(false);
-    expect(r.body).toContain('**Markets for "world cup"**');
-    expect(r.body).toContain("**Sawa** — virtual coins");
-    expect(r.richlinkUrl).toBe("https://sawapredictions.com/predictions/abc");
+describe("renderExhausted", () => {
+  it("reports no more options for the query (no disclaimer)", () => {
+    const out = renderExhausted("world cup");
+    expect(out).toContain("world cup");
+    expect(out.toLowerCase()).not.toContain("no cash value");
+  });
+});
+
+describe("renderNoVenue", () => {
+  it("explains a named venue has no match, with the query (no disclaimer)", () => {
+    const out = renderNoVenue("kalshi", "world cup");
+    expect(out).toContain("Kalshi");
+    expect(out).toContain("world cup");
+    expect(out.toLowerCase()).not.toContain("no cash value");
   });
 });
 
 describe("emptyReply", () => {
-  it("names the query and teases create", () => {
+  it("names the query and teases create, with no disclaimer", () => {
     const out = emptyReply("dogecoin");
     expect(out).toContain("dogecoin");
-    expect(out.toLowerCase()).toContain("no cash value");
+    expect(out.toLowerCase()).toContain("coming soon");
+    expect(out.toLowerCase()).not.toContain("no cash value");
+  });
+});
+
+describe("toPlainText", () => {
+  it("unwraps residual bold/italic and turns markdown links into bare tappable URLs", () => {
+    const plain = toPlainText("**bold** _italic_ [open](https://s/p/1)");
+    expect(plain).toBe("bold italic https://s/p/1");
+    expect(plain).not.toContain("**");
+    expect(plain).not.toMatch(/\]\(/);
+  });
+
+  it("keeps a URL with balanced parentheses intact when unwrapping a markdown link", () => {
+    const plain = toPlainText("see [it](https://en.wikipedia.org/wiki/Example_(word))");
+    expect(plain).toBe("see https://en.wikipedia.org/wiki/Example_(word)");
   });
 });

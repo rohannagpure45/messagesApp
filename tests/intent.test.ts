@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { classify, parseIntent, __setClient } from "../src/sawa/intent";
+import { classify, classifyFollowup, parseIntent, __setClient } from "../src/sawa/intent";
+import type { FollowupContext } from "../src/sawa/intent";
 import type { IntentConfig } from "../src/sawa/config";
 
 const BOT = "sawa";
@@ -92,5 +93,78 @@ describe("parseIntent", () => {
     const intent = await parseIntent("sawa hmm what do you think", BOT, cfg);
     expect(intent.kind).toBe("other");
     expect(intent.via).toBe("llm");
+  });
+});
+
+const activeCtx: FollowupContext = {
+  hasActiveMarket: true,
+  query: "world cup",
+  currentVenue: "sawa",
+  venuesPresent: ["sawa", "kalshi"],
+};
+const coldCtx: FollowupContext = { hasActiveMarket: false, venuesPresent: [] };
+
+describe("classifyFollowup", () => {
+  it("returns null without an active market (a cold 'next'/'link' is never a follow-up)", () => {
+    expect(classifyFollowup("not that", BOT, coldCtx)).toBeNull();
+    expect(classifyFollowup("kalshi link", BOT, coldCtx)).toBeNull();
+  });
+
+  it("classifies rejection phrases as 'next'", () => {
+    for (const m of ["not that", "nah", "different one", "another", "next", "more", "wrong one", "show me another"]) {
+      expect(classifyFollowup(m, BOT, activeCtx)).toMatchObject({ kind: "next", confident: true });
+    }
+  });
+
+  it("classifies link requests and extracts the venue", () => {
+    expect(classifyFollowup("send the kalshi link", BOT, activeCtx)).toMatchObject({ kind: "link", venue: "kalshi" });
+    expect(classifyFollowup("got a polymarket one?", BOT, activeCtx)).toMatchObject({ kind: "link", venue: "polymarket" });
+    expect(classifyFollowup("poly?", BOT, activeCtx)).toMatchObject({ kind: "link", venue: "polymarket" });
+    expect(classifyFollowup("kalshi", BOT, activeCtx)).toMatchObject({ kind: "link", venue: "kalshi" });
+    const generic = classifyFollowup("link", BOT, activeCtx);
+    expect(generic).toMatchObject({ kind: "link" });
+    expect(generic!.venue).toBeUndefined();
+  });
+
+  it("returns null for an ambiguous / new-topic message (defers to the gate or context LLM)", () => {
+    expect(classifyFollowup("what about the nba finals", BOT, activeCtx)).toBeNull();
+  });
+
+  it("does NOT treat a rejection-prefixed real request as 'next' (precision over recall)", () => {
+    for (const m of ["no idea what that is", "more info please", "show me more about it", "next election"]) {
+      expect(classifyFollowup(m, BOT, activeCtx)).toBeNull();
+    }
+  });
+
+  it("still matches a rejection that ends in a benign filler", () => {
+    for (const m of ["not that one", "another one", "next market", "more please"]) {
+      expect(classifyFollowup(m, BOT, activeCtx)).toMatchObject({ kind: "next" });
+    }
+  });
+});
+
+describe("parseIntent with active-market context", () => {
+  it("prefers a regex follow-up over a new search, without calling the LLM", async () => {
+    let called = 0;
+    __setClient(stubClient('{"kind":"search","query":"kalshi"}', () => (called += 1)));
+    const intent = await parseIntent("not that", BOT, cfg, activeCtx);
+    expect(intent).toEqual({ kind: "next", via: "regex" });
+    expect(called).toBe(0);
+  });
+
+  it("routes a bare venue word to a link follow-up (no LLM needed)", async () => {
+    const intent = await parseIntent("kalshi", BOT, null, activeCtx);
+    expect(intent).toMatchObject({ kind: "link", venue: "kalshi", via: "regex" });
+  });
+
+  it("uses the context LLM to disambiguate an ambiguous follow-up as a link", async () => {
+    __setClient(stubClient('{"kind":"link","venue":"kalshi","query":""}'));
+    const intent = await parseIntent("what about kalshi", BOT, cfg, activeCtx);
+    expect(intent).toEqual({ kind: "link", venue: "kalshi", via: "llm" });
+  });
+
+  it("still treats a confident new-search trigger as a search mid-thread", async () => {
+    const intent = await parseIntent("find nba finals", BOT, cfg, activeCtx);
+    expect(intent).toMatchObject({ kind: "search", query: "nba finals", via: "regex" });
   });
 });

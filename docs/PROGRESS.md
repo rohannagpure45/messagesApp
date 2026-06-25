@@ -5,7 +5,58 @@ status lives in [`../AGENTS.md`](../AGENTS.md); the phased plan in [`BUILD_PLAN.
 
 ---
 
+## 2026-06-24 (cont.) — Conversational redesign: card → single-market folk reply; disclaimer removed
+
+**The verbose 3×3 cross-venue card (the entry below) was replaced with a folk-style, conversational
+single-market reply + history-aware follow-ups** — modeled on the "folk" iMessage bot. The owner found
+the card too text-heavy and chose to remove it entirely.
+
+**What the bot does now:** "sawa <topic>" returns ONE natural line naming the favorite (+ a runner-up for
+head-to-heads, e.g. `Ballon d'Or — Messi 93¢ (1.1×), Ronaldo 8¢ on Kalshi.`), with **no link until asked**.
+
+1. **Per-conversation memory + follow-ups** (`src/sawa/conversation.ts`, new). An LRU+TTL
+   `ConversationStore` (500 threads / 30 min, twin of `routing.ts` `SeenSet`) keyed by `space.id` stores
+   the flat ranked candidate list + a cursor. A **pure `nextTurn(state, intent, results)` reducer** drives:
+   - **"not that" / "another" / "more"** → pages to the next-best market across venues; "That's everything
+     I've got…" at the end.
+   - **"send the kalshi link" / "got a polymarket one?" / bare "kalshi"** → that venue's bare URL (cloud
+     iMessage previews it natively); a graceful "I don't have a Kalshi market for that" when absent — never
+     a fabricated link.
+2. **History-aware intent** (`src/sawa/intent.ts`). `IntentKind` widened to `search | next | link | other`;
+   a regex `classifyFollowup` (active-market only) runs before the cold gate; the LLM gets a one-line
+   context digest to disambiguate the ambiguous middle ("what about kalshi"). Cold callers (no context)
+   are byte-identical to before.
+3. **Lead-venue logic** (`src/search.ts` `flattenRanked`). Sawa leads when it has a relevant market,
+   unless an external market beats it on relevance by > `SAWA_LEAD_EPSILON` (0.2) — then best-relevance
+   leads. `runnerUp` is carried through `VenueResult` for the folk two-sided line. `SAWA_FOLK_TONE=1`
+   toggles a mild editorial flourish (off by default, factual otherwise).
+4. **The 3×3 card was removed** (`renderSearch`/`searchBody`/`section`/`topSawaRichlinkUrl` deleted);
+   `cards.ts` now holds `renderOne`/`renderLink`/`renderExhausted`/`renderNoVenue`. `/search` also uses the
+   conversational reply.
+5. **Disclaimer removed.** "Virtual Sawa coins — entertainment only, no cash value." was stripped from
+   ALL output (conversational replies, `/markets`, HELP, the hello DM) per owner decision — relaxing the
+   former "disclaimer on every coin/market message" invariant. Venues are still named inline and real-money
+   prices read as real money, so lines stay unambiguous. Consent + virtual-coin framing is deferred to the
+   future betting/money-action phase.
+
+**Process:** design (3 independent architectures → synthesis) and an adversarial code review (4 dimensions
+→ verify each finding) were run as multi-agent workflows; 2 confirmed bugs fixed with regression tests
+(a `NEXT_RE` false-positive on "more info please"/"next election"; a `toPlainText` paren-URL truncation).
+
+**Verification:** `npm run typecheck` clean; `npm test` **112/112** green (added `conversation.test.ts`;
+extended cards/intent/search). **NOT yet re-verified live in iMessage** — the terminal TUI isn't reliably
+drivable headless; cloud-iMessage re-verification is the open next step.
+
+**Next:** dogfood the conversational flow live in iMessage (search → "not that" → "send the kalshi link");
+the later phases still wait on the Sawa-app `/api/bot/*` Vercel deploy (see `AGENTS.md` deployment gate).
+
+---
+
 ## 2026-06-24 — SEARCH live in iMessage; emoji-free card; group-ready
+
+> **Superseded (same day):** the emoji-free 3×3 card described in item 2 below was replaced by the
+> conversational single-market reply documented in the entry above. The card's live verification
+> (multi-entity + topic queries) still holds for the *search logic*; only the *presentation* changed.
 
 **SEARCH is verified working live in iMessage.** Two behaviors confirmed end-to-end:
 - **Multi-entity queries** — "Switzerland, India" returns a full cross-venue card (Kalshi +

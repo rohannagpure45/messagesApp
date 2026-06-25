@@ -14,15 +14,40 @@
  */
 import OpenAI from "openai";
 import type { IntentConfig } from "./config";
+import type { Venue } from "../venue";
 
-export type IntentKind = "search" | "other";
+/**
+ * `search` (new topic) and `other` (greeting/create/account/help) are the cold-start kinds. `next`
+ * and `link` are FOLLOW-UPS — only reachable when there's an active market in the conversation:
+ *   - `next`  — "not that" / "another" / "more": page to the next-best candidate.
+ *   - `link`  — "send the kalshi link" / bare "kalshi": surface a market's link (venue-scoped or current).
+ */
+export type IntentKind = "search" | "next" | "link" | "other";
 
 export interface Intent {
   kind: IntentKind;
   /** The cleaned search subject (e.g. "FIFA World Cup"). Present when kind === "search". */
   query?: string;
+  /** Which venue a `link` follow-up targets (undefined = the currently-shown market / generic). */
+  venue?: Venue;
   /** Which stage decided this — useful for analytics/debugging. */
   via: "regex" | "llm" | "fallback";
+}
+
+/**
+ * A typed digest of the active conversation, passed to `parseIntent` so follow-ups disambiguate from
+ * new searches. NOT a raw transcript — Spectrum is a forward stream, so the durable per-thread summary
+ * IS the history. Built by `conversation.toContext(state)`.
+ */
+export interface FollowupContext {
+  /** True when there is a live market the user could be reacting to ("not that" / "send the link"). */
+  hasActiveMarket: boolean;
+  /** The active search subject — for the LLM context line. */
+  query?: string;
+  /** The venue of the currently-shown market. */
+  currentVenue?: Venue;
+  /** Which venues returned a market this search — so a "kalshi link" with no Kalshi match degrades gracefully. */
+  venuesPresent: Venue[];
 }
 
 const MAX_QUERY_LEN = 120;
@@ -92,6 +117,60 @@ export function classify(rawText: string, botName: string): Intent & { confident
   return { kind: "search", query: cleanQuery(text), via: "fallback", confident: false };
 }
 
+/** A bare venue word, optionally with a trailing "?": "kalshi", "polymarket?", "poly". */
+const BARE_VENUE_RE = /^(sawa|kalshi|polymarket|poly)\s*\??$/i;
+/** A venue word anywhere in the message. */
+const VENUE_WORD_RE = /\b(sawa|kalshi|polymarket|poly)\b/i;
+/** Explicit "give me the link/url" wording. */
+const LINK_WORD_RE = /\b(link|url)\b/i;
+/** A "fetch it for me" verb that, paired with a venue, reads as a link request. */
+const SEND_VERB_RE = /\b(send|share|gimme|give|got|have|get|grab|drop|pull up|show|open)\b/i;
+/**
+ * "Show me a different one" — only meaningful when there is an active market. Anchored to end-of-string
+ * (with an optional tail of benign fillers like "one"/"please"/"market") so a phrase that STARTS with a
+ * rejection token but continues into a real request — "more info please", "no idea what that is",
+ * "next election" — is NOT swallowed as a follow-up; it falls through to the gate / context LLM. Bare or
+ * filler-tailed rejections ("not that", "another one", "next market", "more please") still match. We
+ * favor precision here: a missed "next" just means the user rephrases, but a false "next" silently
+ * pages away the market they were looking at.
+ */
+const NEXT_RE =
+  /^(?:not (?:that|it|this|right)|that'?s not it|nah+|nope+|no+|different(?: one)?|another(?:\s+one)?|some ?thing ?else|next|more|others?|what else|wrong(?: one)?|try again|show (?:me )?(?:more|another|others?|the others?))(?:\s+(?:one|market|markets|please|pls|plz|thanks?|thx|now|then|instead))*[\s!?.,]*$/i;
+
+function extractVenue(text: string): Venue | undefined {
+  const m = text.match(VENUE_WORD_RE);
+  if (!m) return undefined;
+  const w = m[1]!.toLowerCase();
+  return w === "poly" ? "polymarket" : (w as Venue);
+}
+
+/**
+ * Regex follow-up classifier — consulted BEFORE the cold-start gate and ONLY when there is an active
+ * market (`ctx.hasActiveMarket`). Returns a CONFIDENT intent for the unambiguous follow-ups:
+ *   - `link` — an explicit "link"/"url" word, a send-verb paired with a venue, or a bare venue word.
+ *   - `next` — "not that" / "nah" / "another" / "more" / "show me another".
+ * Returns `null` for everything else (incl. always when there's no active market), so an ambiguous
+ * follow-up ("what about kalshi") or a genuine new topic falls through to the cold gate / context LLM,
+ * and a cold "next"/"link" can never be mis-read as a follow-up.
+ */
+export function classifyFollowup(
+  rawText: string,
+  botName: string,
+  ctx: FollowupContext,
+): (Intent & { confident: boolean }) | null {
+  if (!ctx.hasActiveMarket) return null;
+  const text = stripAddress(rawText, botName).trim();
+  if (!text) return null;
+
+  const venue = extractVenue(text);
+  const wantsLink =
+    LINK_WORD_RE.test(text) || BARE_VENUE_RE.test(text) || (venue !== undefined && SEND_VERB_RE.test(text));
+  if (wantsLink) return { kind: "link", venue, via: "regex", confident: true };
+
+  if (NEXT_RE.test(text)) return { kind: "next", via: "regex", confident: true };
+  return null;
+}
+
 const SYSTEM_PROMPT =
   "You classify a single chat message sent to a prediction-market assistant. " +
   'Return ONLY JSON: {"kind":"search"|"other","query":string}. ' +
@@ -101,9 +180,64 @@ const SYSTEM_PROMPT =
   '"where can I bet on", "odds on", "markets for", and trailing punctuation. ' +
   'For "other", set "query" to "".';
 
+/**
+ * Extended prompt used ONLY for the ambiguous-with-active-market case: the assistant just showed a
+ * market, so the same message could be a follow-up (next/link) or a brand-new search.
+ */
+const FOLLOWUP_SYSTEM_PROMPT =
+  "You classify ONE chat message to a prediction-market assistant that just showed the user a market. " +
+  'Return ONLY JSON: {"kind":"search"|"next"|"link"|"other","query":string,"venue":"sawa"|"kalshi"|"polymarket"|""}. ' +
+  '"next" = the user rejects the shown market or wants a different/next one ("not that","another","more"). ' +
+  '"link" = the user wants the link/URL for a market; if they name a venue put it in "venue", else "". ' +
+  '"search" = the user asks about a NEW topic; put the clean topic (no filler) in "query". ' +
+  '"other" = greeting, small talk, account/help, or a request to CREATE a market. ' +
+  'Set every unused field to "".';
+
+/** A one-line context summary fed to the LLM alongside the follow-up prompt (not a raw transcript). */
+function contextDigest(ctx: FollowupContext): string {
+  const venues = ctx.venuesPresent.length ? ctx.venuesPresent.join(", ") : "none";
+  return `Context: currently showing a ${ctx.currentVenue ?? "?"} market for "${ctx.query ?? ""}". Venues with a match: ${venues}.`;
+}
+
 interface RawLlm {
   kind?: unknown;
   query?: unknown;
+  venue?: unknown;
+}
+
+/** Clamp an arbitrary LLM venue string to a known Venue, or undefined. */
+function clampVenue(v: unknown): Venue | undefined {
+  if (typeof v !== "string") return undefined;
+  const w = v.toLowerCase();
+  if (w === "poly") return "polymarket";
+  return w === "sawa" || w === "kalshi" || w === "polymarket" ? (w as Venue) : undefined;
+}
+
+/** Interpret a cold-start LLM result (search/other only) — identical behavior to before. */
+function interpretColdLlm(parsed: RawLlm): Intent | null {
+  const kind: IntentKind = parsed.kind === "search" ? "search" : "other";
+  if (kind === "other") return { kind, via: "llm" };
+  const query = typeof parsed.query === "string" ? cleanQuery(parsed.query) : "";
+  if (query.length < 2) return null; // unusable — let the caller keep the regex guess
+  return { kind: "search", query, via: "llm" };
+}
+
+/** Interpret a follow-up LLM result (search/next/link/other + venue), strictly clamped. */
+function interpretFollowupLlm(parsed: RawLlm): Intent | null {
+  switch (parsed.kind) {
+    case "next":
+      return { kind: "next", via: "llm" };
+    case "link":
+      return { kind: "link", venue: clampVenue(parsed.venue), via: "llm" };
+    case "search": {
+      const query = typeof parsed.query === "string" ? cleanQuery(parsed.query) : "";
+      return query.length >= 2 ? { kind: "search", query, via: "llm" } : null;
+    }
+    case "other":
+      return { kind: "other", via: "llm" };
+    default:
+      return null; // unknown kind → let the caller keep the regex gate's guess
+  }
 }
 
 let client: OpenAI | null = null;
@@ -116,29 +250,27 @@ export function __setClient(c: OpenAI | null): void {
   client = c;
 }
 
-async function classifyWithLlm(text: string, cfg: IntentConfig): Promise<Intent | null> {
+async function classifyWithLlm(text: string, cfg: IntentConfig, ctx?: FollowupContext): Promise<Intent | null> {
+  const useCtx = ctx?.hasActiveMarket === true;
   try {
+    const messages = useCtx
+      ? [
+          { role: "system" as const, content: FOLLOWUP_SYSTEM_PROMPT },
+          { role: "system" as const, content: contextDigest(ctx!) },
+          { role: "user" as const, content: text.slice(0, 400) },
+        ]
+      : [
+          { role: "system" as const, content: SYSTEM_PROMPT },
+          { role: "user" as const, content: text.slice(0, 400) },
+        ];
     const resp = await getClient(cfg).chat.completions.create(
-      {
-        model: cfg.model,
-        temperature: 0,
-        max_tokens: 80,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: text.slice(0, 400) },
-        ],
-      },
+      { model: cfg.model, temperature: 0, max_tokens: 80, response_format: { type: "json_object" }, messages },
       { timeout: 6_000 },
     );
     const content = resp.choices[0]?.message?.content;
     if (!content) return null;
     const parsed = JSON.parse(content) as RawLlm;
-    const kind: IntentKind = parsed.kind === "search" ? "search" : "other";
-    if (kind === "other") return { kind, via: "llm" };
-    const query = typeof parsed.query === "string" ? cleanQuery(parsed.query) : "";
-    if (query.length < 2) return null; // unusable — let the caller keep the regex guess
-    return { kind: "search", query, via: "llm" };
+    return useCtx ? interpretFollowupLlm(parsed) : interpretColdLlm(parsed);
   } catch (err) {
     console.warn(`[intent] LLM classify failed — using regex gate. ${(err as Error).message}`);
     return null;
@@ -146,20 +278,33 @@ async function classifyWithLlm(text: string, cfg: IntentConfig): Promise<Intent 
 }
 
 /**
- * Parse a message into an Intent. Uses the regex gate first; only consults the LLM when the gate
- * is unsure and `intentCfg` is provided. Always resolves — never throws.
+ * Parse a message into an Intent. With an active-market `ctx`, a zero-cost regex follow-up gate runs
+ * FIRST (so "not that"/"send the kalshi link" resolve without the LLM). Otherwise the cold-start gate
+ * runs as before; the LLM is consulted only when the gate is unsure and `intentCfg` is provided —
+ * context-aware when there's an active market, byte-identical to before when there isn't. Never throws.
  */
 export async function parseIntent(
   rawText: string,
   botName: string,
   intentCfg: IntentConfig | null,
+  ctx?: FollowupContext,
 ): Promise<Intent> {
+  // 1. Active-market follow-up gate (regex, zero-cost) — only fires when a market is in play.
+  if (ctx?.hasActiveMarket) {
+    const fu = classifyFollowup(rawText, botName, ctx);
+    if (fu?.confident) {
+      const { confident: _c, ...intent } = fu;
+      return intent;
+    }
+  }
+  // 2. Cold-start gate (unchanged for callers without ctx). A confident new search/greeting wins.
   const gate = classify(rawText, botName);
   if (gate.confident || !intentCfg) {
     const { confident: _c, ...intent } = gate;
     return intent;
   }
-  const llm = await classifyWithLlm(stripAddress(rawText, botName), intentCfg);
+  // 3. LLM fallback — context-aware when there's an active market, else identical to before.
+  const llm = await classifyWithLlm(stripAddress(rawText, botName), intentCfg, ctx);
   if (llm) return llm;
   const { confident: _c, ...intent } = gate;
   return intent;

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { runSearch, isBroadQuery } from "../src/search";
+import { runSearch, isBroadQuery, flattenRanked, venuesPresent } from "../src/search";
 import { __clearCache, __setClock } from "../src/pmxt/discover";
+import type { SearchResults } from "../src/search";
 import type { Config, PmxtConfig } from "../src/sawa/config";
 
 const config: Config = {
@@ -144,6 +145,58 @@ describe("runSearch", () => {
     expect(r.kalshi).toEqual([]);
     expect(r.polymarket).toEqual([]);
     expect(r.empty).toBe(false);
+  });
+
+  it("carries a runner-up outcome for a two-sided market (folk two-sided line)", async () => {
+    installStub({ sawa: [feedRow("s1", "Who will win the World Cup?", { Brazil: 59, Argentina: 41 })] });
+    const r = await runSearch("world cup", { config, pmxt: null });
+    expect(r.sawa[0]!.top).toEqual({ label: "Brazil", oddsPct: 59 });
+    expect(r.sawa[0]!.runnerUp).toEqual({ label: "Argentina", oddsPct: 41 });
+  });
+});
+
+describe("flattenRanked", () => {
+  it("leads with the Sawa market when one is relevant, then pages cross-venue", async () => {
+    installStub({
+      sawa: [feedRow("s1", "Who will win the World Cup?", { Brazil: 59, Argentina: 41 })],
+      kalshi: [pmxtMarket("kalshi", "World Cup Winner - Will Brazil win?", "Brazil", 0.22, 5000)],
+      polymarket: [pmxtMarket("polymarket", "World Cup Winner - Will France win?", "France", 0.15)],
+    });
+    const flat = flattenRanked(await runSearch("world cup", { config, pmxt }));
+    expect(flat[0]!.venue).toBe("sawa"); // Sawa leads the single conversational answer
+    expect(flat).toHaveLength(3);
+  });
+
+  it("lets a clearly-more-relevant external market lead when the Sawa match is thin", async () => {
+    installStub({
+      sawa: [feedRow("s1", "Will the World Cup be hot?", { Yes: 1 })], // partial token overlap only
+      kalshi: [pmxtMarket("kalshi", "FIFA World Cup 2026 winner - Brazil?", "Brazil", 0.22, 5000)],
+    });
+    const flat = flattenRanked(await runSearch("FIFA World Cup 2026", { config, pmxt }));
+    expect(flat[0]!.venue).toBe("kalshi"); // beats the best Sawa match by more than the epsilon
+  });
+
+  it("returns [] for an empty result", () => {
+    const empty: SearchResults = {
+      query: "x",
+      sawa: [],
+      kalshi: [],
+      polymarket: [],
+      empty: true,
+      truncated: false,
+      externalUnavailable: false,
+    };
+    expect(flattenRanked(empty)).toEqual([]);
+  });
+});
+
+describe("venuesPresent", () => {
+  it("reports only the venues that returned at least one row", async () => {
+    installStub({
+      sawa: [feedRow("s1", "World Cup winner?", { Brazil: 1 })],
+      kalshi: [pmxtMarket("kalshi", "World Cup - Brazil?", "Brazil", 0.2)],
+    });
+    expect(venuesPresent(await runSearch("world cup", { config, pmxt }))).toEqual(["sawa", "kalshi"]);
   });
 });
 

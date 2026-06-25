@@ -48,11 +48,13 @@ sawa bitcoin
 /help
 ```
 
-You should see the Skyscanner card: a bold **Markets for "…"** header, then a bold-headed section per
-venue (Sawa → Kalshi → Polymarket — each tagged *virtual coins* or *real money*), one compact line per
-market with a price / payout and an `[open](…)` link, then the legend + disclaimer footer. **No emoji** —
-hierarchy is bold headers + links. This proves the **logic + live data** path; it does not prove iMessage
-rendering (Section 2).
+You should see a **conversational single-market reply**: ONE natural line naming the favorite (+ a runner-up
+for head-to-heads) and venue — e.g. `Who will win the World Cup? — Brazil 59%, Argentina 41% on Sawa.` —
+with **no emoji, no link, and no disclaimer**. Real-money venues read as real money (cents + return multiple,
+e.g. `… — Karen Bass 65¢ (1.5×) on Kalshi.`). Then try follow-ups in the same thread: `not that` (pages to the
+next market), `send the kalshi link` (that venue's bare URL, or a graceful "no Kalshi market for that"). This
+proves the **logic + live data + conversation** path; it does not prove iMessage rendering (Section 2).
+*(Redesigned 24-Jun from the 3×3 "Skyscanner card" — see `PROGRESS.md`.)*
 
 ---
 
@@ -108,20 +110,23 @@ rendering (Section 2).
 
    | Send | Expect |
    |---|---|
-   | `sawa FIFA World Cup` | Sawa + Kalshi + Polymarket lines, prices, payouts, links, disclaimer |
+   | `sawa FIFA World Cup` | ONE conversational line: the favorite market + venue (e.g. `… Brazil 59% on Sawa.`) — no card, no disclaimer |
+   | `not that` (after a result) | the next-best market, one line |
+   | `send the kalshi link` (after a result) | a bare Kalshi URL (cloud iMessage previews it), or "I don't have a Kalshi market for that" |
    | `sawa where can I bet on the LA mayor election` | a competitive race surfaced (e.g. a 60–70¢ favorite) |
-   | `sawa bitcoin` | Kalshi/Polymarket bitcoin markets (Sawa may have none) |
+   | `sawa bitcoin` | a bitcoin market (Kalshi/Polymarket; Sawa may have none) |
    | `sawa asdfqwer nonsense` | empty-state: "No live markets … try a broader term" + create tease |
    | `hey sawa` | a short nudge ("I find prediction markets…") — not a search |
    | (in a group) `nice game last night` | **no reply** (not hailed) |
 
-   The **top Sawa market** also arrives as a native **rich-link card** (cover image + title) — that bubble is
-   guaranteed tappable.
+   When you ask for a link in a follow-up (`send the kalshi link`), the bot sends the **bare URL** — cloud
+   iMessage renders it as a native rich-link preview, so that bubble is tappable.
 
 ### Acceptance (what "Search works in iMessage" means)
 - ☐ The bot receives a group message and replies (the connection gate).
-- ☐ "FIFA World Cup" returns Sawa + Kalshi + Polymarket lines with price + payout + a link each.
-- ☐ Real-money venues are clearly labeled vs Sawa virtual coins; the disclaimer is present.
+- ☐ "FIFA World Cup" returns ONE conversational line: the favorite market + venue + price (no card, no disclaimer).
+- ☐ Real-money venues (Kalshi/Polymarket) read as real money (cents + return multiple) vs Sawa odds %.
+- ☐ Follow-ups work in-thread: "not that" pages the next market; "send the kalshi link" returns that venue's URL (or a graceful miss).
 - ☐ Empty/broad queries and a bare greeting are handled.
 - ☐ Mention-gating: ignored in a group unless hailed; always answers in a DM.
 

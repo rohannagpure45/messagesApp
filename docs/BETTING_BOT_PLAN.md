@@ -105,7 +105,7 @@ direct `placeBet` (§4).
 ### v1 core
 | Capability | Trigger | Backend | Output |
 |---|---|---|---|
-| **Search / discover** | "sawa find <topic>" · `/markets` `/search` | GET read path (`src/sawa/read.ts`) | mini market cards |
+| **Search / discover** | "sawa find <topic>" · `/markets` `/search` | GET read path (`src/sawa/read.ts`) | folk-style conversational single-market reply + history-aware follow-ups ("not that"/"another"/"send the kalshi link") |
 | **Market detail + odds** | "sawa odds <market>" · `/show` `/odds` | GET detail + latest `OddsSnapshot` | rich card: richlink + odds bars (+ pmxt anchor, §5) |
 | **Stake / bet** | "100 on YES" · `/bet` | `POST /api/predictions/[id]/bet` (JWT) | confirm card → place → confetti |
 | **Balance** | "my balance" · `/balance` | `GET /api/user/stats` (JWT) | balance card (**DM-only in groups**, §9) |
@@ -173,9 +173,10 @@ visual language per surface:
   is the richest interactive bubble but **requires a real iMessage app extension** (`teamId`,
   `extensionBundleId`, App Store entry). Out of v1; the path to the most app-like UI later.
 
-Consistency rules: every coin/market message keeps the virtual-coin disclaimer; persona/voice is a thin
-LLM-generated wrapper around **deterministic** facts (odds, quotes, results), guard-railed (length cap,
-no harassment, never drops the disclaimer).
+Consistency rules: persona/voice is a thin LLM-generated wrapper around **deterministic** facts (odds,
+quotes, results), guard-railed (length cap, no harassment). *(The "virtual-coin disclaimer on every
+coin/market message" rule was retired 24-Jun — discovery/search replies carry none; the no-cash-value
+framing is deferred to the betting/money-action phase.)*
 
 ---
 
@@ -320,8 +321,9 @@ new ones); in groups log only the interacting actor; pmxt receives **no** user i
 title/category only). **In-chat / outbound:** one-time consent before the first money action, **wired via
 `/api/bot/session`'s `acceptTerms` flag** (sets `termsAcceptedAt` so the first bet doesn't 403 — no separate
 `/api/user/terms` call); durable `optedOut` (checked via `POST /api/bot/state`); **balance / portfolio / position replies in a group go DM-only or are redacted** (never expose
-a member's wallet to the space); **never richlink a `isPrivate`/`isHidden` market** (OG leak). Virtual-coin
-disclaimer on every coin/market message.
+a member's wallet to the space); **never richlink a `isPrivate`/`isHidden` market** (OG leak). *(The
+per-message virtual-coin disclaimer was removed 24-Jun for discovery/search; consent + virtual-coin framing
+applies at the money-action step in the betting phase.)*
 
 ## 10. Risks / must-verify
 1. **`BOT_SECRET` is a master credential (critical):** `POST /api/bot/session` mints a valid 7-day user JWT
@@ -341,15 +343,20 @@ disclaimer on every coin/market message.
    7. richlink depends on market-page OG tags + fails silently → verify OG (Part A) and define the markdown
    fallback. 8. `space.send()` id == tapback `target.id` (gates reaction-confirm AND engagement) — prove
    before trusting. 9. pmxt match-cluster quality — threshold `minConfidence`; cluster credit cost — cache +
-   per-space gate. 10. webhook at-least-once → dedupe on `message.id`. 11. LLM banter safety — clamp; keep
-   disclaimer. 12. `effect` wraps only text/markdown/attachment; `effect`/`attachment` support varies —
+   per-space gate. 10. webhook at-least-once → dedupe on `message.id`. 11. LLM banter safety — clamp (length
+   cap, no harassment, facts stay deterministic). 12. `effect` wraps only text/markdown/attachment; `effect`/`attachment` support varies —
    degrade gracefully. 13. group interjection cooldown keyed on `spaceId`.
 
 ## 11. Build order & verification
-> **Progress (23-Jun):** **SEARCH is built** — steps (2 reads/Option C), (4 presentation), and (8 pmxt
+> **Progress (24-Jun):** **SEARCH is built** — steps (2 reads/Option C), (4 presentation), and (8 pmxt
 > enrichment) below are DONE for the discovery path (messagesApp PR #2): `read.ts` (Option C), `src/pmxt/*`,
-> `src/search.ts`, `src/sawa/cards.ts`, `src/sawa/intent.ts`, mention-gated router. Steps (3 betting),
-> (5 create), (6 portfolio), (7 analytics) are **untouched** and gated on the `/api/bot/*` deployment.
+> `src/search.ts`, `src/sawa/cards.ts`, `src/sawa/intent.ts`, mention-gated router. **The presentation (step
+> 4) was redesigned 24-Jun** from the 3×3 cross-venue "Skyscanner card" into a **folk-style conversational
+> single-market reply** with per-conversation memory + history-aware follow-ups (`src/sawa/conversation.ts`,
+> pure `nextTurn` reducer; `intent.ts` widened to `search|next|link|other`; Sawa-lead-within-epsilon ranking
+> in `flattenRanked`). The per-message virtual-coin disclaimer was removed. 112 tests green; **not yet
+> re-verified live in iMessage.** Steps (3 betting), (5 create), (6 portfolio), (7 analytics) are
+> **untouched** and gated on the `/api/bot/*` deployment.
 
 **Order:** (1) ~~Part A models + RLS~~ **DB/RLS DONE (live in Supabase).** Endpoints coded in PR #26 but
 **OPEN/not deployed** (`/api/bot/*` → 404) — **merge + deploy #26/#27 before steps 3/5/7.** Remaining Part A:
