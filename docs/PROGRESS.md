@@ -5,6 +5,30 @@ status lives in [`../AGENTS.md`](../AGENTS.md); the phased plan in [`BUILD_PLAN.
 
 ---
 
+## 2026-06-25 — rich-link preview on the "send the link" follow-up
+
+**Symptom (owner, from live use):** when the bot hands out a market link it shows differently on
+LOCAL (Mac Messages.app) vs the CLOUD Business line, and there's no market image on the link.
+
+**Root cause:** `renderLink` returned the URL *inside a sentence* (`"Here's the Kalshi one: https://…"`)
+sent as one text/markdown bubble. iMessage only unfurls a URL into an Open Graph card (title + cover
+image) when the URL is sent **alone** — a URL buried in surrounding text renders as a flat tappable
+link. The cloud line (`sendText` + `enableDataDetection`) and Messages.app handle a buried URL
+differently, which is exactly the "appears one way on local, another on cloud" report.
+
+**Fix:** split the lead-in from the URL. The reducer's link turn now carries the target market in a new
+`TurnOutcome.link` (URL kept OUT of `body`); `src/index.ts` `sendLink` sends the URL as its **own**
+message — `richlink(url)` on a cloud/dedicated line (the provider sends a bare URL with link-preview
+enabled → the destination's OG card), and a bare `text(url)` on LOCAL iMessage / terminal (Messages.app
+unfurls a lone URL the same way; local supports only text + attachments, so `richlink` is avoided
+there). The image is the destination page's `og:image` (Kalshi/Polymarket market pages carry one);
+`richlink(url)` takes only a URL — Spectrum scrapes the cover, we can't inject our own — so an
+attachment was deliberately NOT added (it would duplicate the unfurled image). Best-effort via `guard`.
+
+**Verification:** `npm run typecheck` clean; `npm test` 196 green (reducer link tests now assert the
+URL rides `outcome.link`, not `body`; a `next` turn carries no link). Live rich-card render needs a
+cloud/dedicated line to confirm (owner step) — LOCAL shows the same card via Messages.app's own unfurl.
+
 ## 2026-06-25 — conversational rearrange (first live group test)
 
 The first live LOCAL-mode GROUP test surfaced five gaps; the owner asked to rearrange the flow so the LLM

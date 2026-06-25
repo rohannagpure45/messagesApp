@@ -128,12 +128,15 @@ export function marketFacts(r: VenueResult): string {
 }
 
 /**
- * Reply to a "send the link" follow-up: a bare, tappable URL (cloud iMessage auto-renders a rich
- * preview for it; local/terminal shows it plain). Assumes `r.url` is present — the caller falls back
- * to `renderNoVenue` when it isn't.
+ * Lead-in for a "send the link" follow-up. The URL itself is sent SEPARATELY as its own message (see
+ * index.ts `sendLink` → `richlink(url)` on cloud, bare `text(url)` on local/terminal): a URL sent
+ * ALONE is what iMessage unfurls into the market's Open Graph card (title + cover image), whereas a URL
+ * buried in a sentence renders as a flat tappable link with no preview — the cloud-vs-local mismatch we
+ * were seeing. So this line just names the venue; the card below it carries the link and image. Kept
+ * emoji-free for the folk voice. Assumes `r.url` is present — the caller falls back to `renderNoVenue`.
  */
 export function renderLink(r: VenueResult): string {
-  return `Here's the ${r.sourceLabel} one: ${r.url}`;
+  return `Here's the ${r.sourceLabel} one:`;
 }
 
 /** Reply when "not that" has paged past the last candidate: out of options, nudge a fresh search. */

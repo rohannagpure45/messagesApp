@@ -33,6 +33,7 @@ import { stubCreate } from "./sawa/createStub";
 import { RecentBuffer, suggestPayload } from "./sawa/suggest";
 import { parseIntent, stripAddress, refineClarify } from "./sawa/intent";
 import { runSearch, flattenRanked } from "./search";
+import type { VenueResult } from "./venue";
 import { toPlainText } from "./sawa/cards";
 import { ConversationStore, toContext, nextTurn, clarifyState, resolveClarifyTurn, pickedAnswer } from "./sawa/conversation";
 import { decideClarify, resolveAnswer, renderClarifyText, type ClarifyQuestion } from "./sawa/clarify";
@@ -212,6 +213,22 @@ function isFromSelf(message: Message): boolean {
  */
 async function sendBody(space: Space, body: string): Promise<void> {
   await guard("reply send", () => space.send(localImessage ? text(toPlainText(body)) : markdown(body)));
+}
+
+/**
+ * Hand out a market link as its OWN message so iMessage unfurls it into a rich Open Graph card — the
+ * market's title + cover image — instead of the flat tappable link you get when a URL is buried in a
+ * sentence. Cloud/dedicated iMessage: `richlink(url)` (the provider sends the bare URL with link
+ * preview enabled). LOCAL iMessage supports only text + attachments, so send the bare URL ALONE — the
+ * Mac's Messages app unfurls a lone URL the same way. Terminal: a plain URL line. Best-effort: a flaky
+ * send must never bubble into the handler's "unreachable" apology, and a malformed URL that makes
+ * `richlink` throw at build time is swallowed here rather than crashing the loop.
+ */
+async function sendLink(space: Space, target: VenueResult, platform: string): Promise<void> {
+  const url = target.url;
+  if (!url) return;
+  const richCapable = platform === "iMessage" && !localImessage; // cloud/dedicated line unfurls richlink
+  await guard("link send", () => space.send(richCapable ? richlink(url) : text(url)));
 }
 
 /**
@@ -407,6 +424,9 @@ async function handleNatural(
     const outcome = nextTurn(state, intent, null, { folkTone: settings.get(spaceId, "quips") });
     convo.set(sKey, outcome.newState);
     await sendBody(space, outcome.body);
+    // A link turn carries the target market: send the URL as its own message so it unfurls into the
+    // market's rich preview (image + title). `next` turns set no `link`, so this is link-only.
+    if (outcome.link) await sendLink(space, outcome.link, platform);
     return;
   }
   // "other" (greeting / create / account / help) or a search with no extractable subject — nudge (the

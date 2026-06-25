@@ -151,10 +151,11 @@ describe("nextTurn", () => {
     expect(out.newState.candidates).toEqual([]);
   });
 
-  it("next → pages to the following candidate", () => {
+  it("next → pages to the following candidate (and carries no link)", () => {
     const out = nextTurn(state({ cursor: 0 }), { kind: "next", via: "regex" }, null);
     expect(out.newState.cursor).toBe(1);
     expect(out.body).toContain("on Kalshi");
+    expect(out.link).toBeUndefined(); // only link turns carry a link → no spurious URL message
   });
 
   it("next at the end → reports exhaustion and holds the cursor (idempotent)", () => {
@@ -163,22 +164,26 @@ describe("nextTurn", () => {
     expect(out.newState.cursor).toBe(1);
   });
 
-  it("link (venue) → hands out that venue's URL, records it linked, cursor unchanged", () => {
+  it("link (venue) → carries that venue's market as `link` (URL out of `body`), records it linked, cursor unchanged", () => {
     const out = nextTurn(state({ cursor: 0 }), { kind: "link", venue: "kalshi", via: "regex" }, null);
-    expect(out.body).toContain("https://kalshi.com/e/x");
+    expect(out.link?.url).toBe("https://kalshi.com/e/x"); // the URL is handed to the caller to send as a rich card
+    expect(out.link?.venue).toBe("kalshi");
+    expect(out.body).not.toContain("http"); // …NOT embedded in the line (a buried URL won't unfurl)
+    expect(out.body).toContain("Kalshi");
     expect(out.newState.linkedVenues.has("kalshi")).toBe(true);
     expect(out.newState.cursor).toBe(0);
   });
 
-  it("link for a venue with no match → no-venue reply, never a fabricated URL", () => {
+  it("link for a venue with no match → no-venue reply, no `link`, never a fabricated URL", () => {
     const out = nextTurn(state(), { kind: "link", venue: "polymarket", via: "regex" }, null);
     expect(out.body).toContain("Polymarket");
     expect(out.body).not.toContain("http");
+    expect(out.link).toBeUndefined();
   });
 
-  it("link (generic) → returns the currently-shown market's URL", () => {
+  it("link (generic) → carries the currently-shown market as `link`", () => {
     const out = nextTurn(state({ cursor: 0 }), { kind: "link", via: "regex" }, null);
-    expect(out.body).toContain("https://sawapredictions.com/p/1");
+    expect(out.link?.url).toBe("https://sawapredictions.com/p/1");
   });
 });
 

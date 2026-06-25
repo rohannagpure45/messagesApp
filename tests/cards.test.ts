@@ -134,11 +134,11 @@ describe("folkQuip", () => {
 });
 
 describe("renderLink", () => {
-  it("hands out a bare tappable URL (no disclaimer), stable through toPlainText", () => {
+  it("is a venue-named lead-in WITHOUT the URL (the URL is sent separately as a rich card)", () => {
     const out = renderLink(ext());
-    expect(out).toContain("https://kalshi.com/events/x");
+    expect(out).toContain("Kalshi");
+    expect(out).not.toContain("http"); // the URL goes out as its own richlink/text message → it unfurls
     expect(out.toLowerCase()).not.toContain("no cash value");
-    expect(toPlainText(out)).toContain("https://kalshi.com/events/x");
     expect(out).not.toMatch(/\]\(/); // no markdown link syntax to strip
   });
 });

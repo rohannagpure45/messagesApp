@@ -51,6 +51,13 @@ export interface ConversationState {
 export interface TurnOutcome {
   body: string;
   newState: ConversationState;
+  /**
+   * Set ONLY when this turn hands out a market link. The caller sends `link.url` as its OWN message — a
+   * rich-link card on cloud iMessage (`richlink`, which unfurls the destination's Open Graph title +
+   * cover image), a bare URL on local iMessage (Messages.app unfurls it) / terminal. A URL buried in a
+   * sentence is NOT unfurled, so the URL is deliberately kept OUT of `body` (which is just the lead-in).
+   */
+  link?: VenueResult;
 }
 
 export interface NextTurnOptions {
@@ -231,14 +238,14 @@ function onLink(state: ConversationState | null, intent: Intent): TurnOutcome {
     if (!target || !target.url) {
       return { body: renderNoVenue(intent.venue, state.query), newState: { ...state } };
     }
-    return { body: renderLink(target), newState: linkOf(state, intent.venue) };
+    return { body: renderLink(target), newState: linkOf(state, intent.venue), link: target };
   }
   // Generic "link" → the currently-shown market's URL.
   const current = state.candidates[clampCursor(state)]!;
   if (!current.url) {
     return { body: renderNoVenue(current.venue, state.query), newState: { ...state } };
   }
-  return { body: renderLink(current), newState: linkOf(state, current.venue) };
+  return { body: renderLink(current), newState: linkOf(state, current.venue), link: current };
 }
 
 /** Clone state with `venue` recorded as linked (cursor unchanged — a link is a side-quest). */
