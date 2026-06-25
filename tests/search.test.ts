@@ -3,6 +3,7 @@ import { runSearch, isBroadQuery, flattenRanked, venuesPresent, __setClock as __
 import { __clearCache, __setClock } from "../src/pmxt/discover";
 import type { SearchResults } from "../src/search";
 import type { Config, PmxtConfig } from "../src/sawa/config";
+import type { VenueResult } from "../src/venue";
 
 const config: Config = {
   apiBaseUrl: "https://sawa.test",
@@ -265,6 +266,28 @@ describe("flattenRanked", () => {
       externalErrored: false,
     };
     expect(flattenRanked(empty)).toEqual([]);
+  });
+
+  it("does not let a barely-relevant Sawa row lead over a clearly-relevant external one", () => {
+    // Sawa 0.4 vs Kalshi 0.6: the 0.2 gap is within SAWA_LEAD_EPSILON, so the OLD bias handed the lead
+    // to the weak Sawa row — the bitcoin/oil failure mode. The min-lead-relevance floor (0.5) blocks it.
+    const weakSawa: VenueResult = {
+      venue: "sawa", sourceLabel: "Sawa", realMoney: false, title: "weak", relevance: 0.4,
+      top: { label: "Yes", oddsPct: 50 },
+    };
+    const strongKalshi: VenueResult = {
+      venue: "kalshi", sourceLabel: "Kalshi", realMoney: true, title: "Bitcoin price target", relevance: 0.6,
+      top: { label: "Yes", price: 0.5 }, url: "https://kalshi.com/e/x",
+    };
+    const r: SearchResults = {
+      query: "bitcoin price target", sawa: [weakSawa], kalshi: [strongKalshi], polymarket: [],
+      empty: false, truncated: false, externalUnavailable: false, externalErrored: false,
+    };
+    expect(flattenRanked(r)[0]!.venue).toBe("kalshi");
+
+    // Counter-check: a Sawa match at the 0.5 bar still claims the bias within the epsilon.
+    const r2: SearchResults = { ...r, sawa: [{ ...weakSawa, relevance: 0.5 }] };
+    expect(flattenRanked(r2)[0]!.venue).toBe("sawa");
   });
 });
 

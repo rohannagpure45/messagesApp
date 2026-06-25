@@ -143,6 +143,14 @@ function compareResults(a: VenueResult, b: VenueResult, nowMs: number): number {
 const SAWA_LEAD_EPSILON = 0.2;
 
 /**
+ * Minimum absolute relevance the best Sawa match must itself clear to claim the Sawa-lead bias. A row
+ * that only scrapes past `RELEVANCE_MIN` (one tangential token) is not a real answer and must not bury
+ * a clearly-relevant external market — the bitcoin/oil live-test failure, where a weak Sawa match led
+ * over real Kalshi/Polymarket markets. Below this, the lead falls to pure cross-venue ranking.
+ */
+const SAWA_MIN_LEAD_RELEVANCE = 0.5;
+
+/**
  * Flatten the per-venue results into ONE cross-venue ranked list — the source for the conversational
  * reply (index 0 = the market shown first) and the follow-up cursor (`not that` pages forward).
  *
@@ -169,6 +177,8 @@ function pickLead(ranked: VenueResult[]): VenueResult {
   if (top.venue === "sawa") return top;
   const bestSawa = ranked.find((r) => r.venue === "sawa");
   if (!bestSawa) return top; // no Sawa match → the most-relevant external market leads
+  // A barely-relevant Sawa row doesn't earn the bias — let the clearly-relevant external market lead.
+  if (bestSawa.relevance < SAWA_MIN_LEAD_RELEVANCE) return top;
   return top.relevance - bestSawa.relevance > SAWA_LEAD_EPSILON ? top : bestSawa;
 }
 

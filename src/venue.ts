@@ -54,6 +54,24 @@ const STOPWORDS = new Set([
   "who", "what", "when", "where", "which", "by", "at", "vs", "any",
 ]);
 
+/**
+ * Domain role-words stripped from the QUERY side of relevance only (NOT from titles). These are how
+ * users frame a request ("a market on bitcoin", "odds for X") — they carry no topic signal, so a
+ * query token like "market" must not score a hit against a title that merely contains the word (the
+ * live-test failure: "market on bitcoin" matched a Sawa market titled "…damage at the market"). Kept
+ * out of the global STOPWORDS so a legitimate title token like "market" in "stock market" still
+ * tokenizes normally on the title side.
+ *
+ * Accepted constraint: a query made ENTIRELY of role-words (e.g. "prediction market", "betting odds"
+ * → only "betting" survives, but "prediction market" survives as nothing) scores 0 and matches nothing.
+ * Meta-queries about markets-as-a-concept are not a real discovery use case (users search a TOPIC), so
+ * filtering them to empty is correct, not a regression.
+ */
+const QUERY_ROLE_WORDS = new Set([
+  "market", "markets", "prediction", "predictions", "bet", "bets",
+  "wager", "wagers", "odds", "line", "lines", "poll", "polls",
+]);
+
 /** Split a string into lowercased alphanumeric tokens, dropping stopwords and 1-char tokens. */
 export function tokenize(s: string): string[] {
   return s
@@ -72,7 +90,9 @@ export function tokenize(s: string): string[] {
  * Identical scoring across venues keeps the merged ranking fair.
  */
 export function scoreRelevance(title: string, query: string): number {
-  const q = tokenize(query);
+  // Role-words are dropped from the QUERY only (see QUERY_ROLE_WORDS) so framing words can't carry a
+  // false hit. If the query is ALL role-words ("market", "odds") there is no topic to match → 0.
+  const q = tokenize(query).filter((t) => !QUERY_ROLE_WORDS.has(t));
   if (q.length === 0) return 0;
   const titleTokens = new Set(tokenize(title));
   let hits = 0;

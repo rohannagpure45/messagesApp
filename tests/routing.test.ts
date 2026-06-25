@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { mentionsBot, shouldHandle, SeenSet, normalizeHandle } from "../src/routing";
+import { mentionsBot, shouldHandle, SeenSet, normalizeHandle, actionableWhenRelaxed } from "../src/routing";
+import type { Intent } from "../src/sawa/intent";
 
 describe("mentionsBot", () => {
   it("matches when the bot is hailed at the start or via @mention", () => {
@@ -37,6 +38,25 @@ describe("shouldHandle", () => {
     expect(shouldHandle({ isGroup: false, isSlash: false, body: "world cup", botName: "sawa" })).toBe(true); // DM
     expect(shouldHandle({ isGroup: true, isSlash: false, body: "sawa world cup", botName: "sawa" })).toBe(true);
     expect(shouldHandle({ isGroup: true, isSlash: false, body: "lol nice game", botName: "sawa" })).toBe(false);
+  });
+});
+
+describe("actionableWhenRelaxed", () => {
+  const intent = (over: Partial<Intent>): Intent => ({ kind: "search", via: "regex", ...over });
+
+  it("continues a thread follow-up (next/link) without a re-hail", () => {
+    expect(actionableWhenRelaxed(intent({ kind: "next" }))).toBe(true);
+    expect(actionableWhenRelaxed(intent({ kind: "link", venue: "kalshi" }))).toBe(true);
+  });
+
+  it("honors an EXPLICIT search (regex trigger) but not a bare-topic or LLM guess", () => {
+    expect(actionableWhenRelaxed(intent({ kind: "search", query: "oil prices", via: "regex" }))).toBe(true);
+    expect(actionableWhenRelaxed(intent({ kind: "search", query: "argentina", via: "fallback" }))).toBe(false);
+    expect(actionableWhenRelaxed(intent({ kind: "search", query: "argentina", via: "llm" }))).toBe(false);
+  });
+
+  it("stays silent on small talk / non-search intents overheard in a thread", () => {
+    expect(actionableWhenRelaxed(intent({ kind: "other" }))).toBe(false);
   });
 });
 

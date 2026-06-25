@@ -1,7 +1,9 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { classify, classifyFollowup, parseIntent, __setClient } from "../src/sawa/intent";
+import { classify, classifyFollowup, parseIntent, refineClarify, __setClient } from "../src/sawa/intent";
 import type { FollowupContext } from "../src/sawa/intent";
 import type { IntentConfig } from "../src/sawa/config";
+import type { ClarifyQuestion } from "../src/sawa/clarify";
+import type { VenueResult } from "../src/venue";
 
 const BOT = "sawa";
 const cfg: IntentConfig = { apiKey: "k", model: "m", baseUrl: "https://x" };
@@ -86,6 +88,20 @@ describe("classify (regex-first gate)", () => {
     });
     // The bare verb "find" still works (longest-first alternation never swallows the subject).
     expect(classify("find world cup", BOT)).toMatchObject({ kind: "search", query: "world cup" });
+  });
+
+  it("peels a residual role phrase the first verb-trigger leaves behind (the bitcoin/oil bug)", () => {
+    // "find me" strips only itself → "a market on bitcoin"; cleanQuery peels "a market on" → "bitcoin",
+    // so the role-word "market" can no longer match an unrelated Sawa market ("…damage at the market").
+    expect(classify("sawa find me a market on bitcoin", BOT)).toMatchObject({ kind: "search", query: "bitcoin" });
+    expect(classify("find market on oil prices", BOT)).toMatchObject({ kind: "search", query: "oil prices" });
+    expect(classify("sawa find me a market on the election", BOT)).toMatchObject({ kind: "search", query: "election" });
+    expect(classify("get me a prediction for the super bowl", BOT)).toMatchObject({
+      kind: "search",
+      query: "super bowl",
+    });
+    // A legitimate "market" content word (no on/for/about/of right after it) is preserved untouched.
+    expect(classify("sawa market cap of bitcoin", BOT)).toMatchObject({ kind: "search", query: "market cap of bitcoin" });
   });
 });
 
@@ -247,5 +263,49 @@ describe("classifyWithLlm JSON robustness (Issue 1)", () => {
     const intent = await parseIntent("sawa some ambiguous thing", BOT, cfg);
     expect(intent.via).toBe("fallback");
     expect(intent).toMatchObject({ kind: "search", query: "some ambiguous thing" });
+  });
+});
+
+describe("refineClarify (LLM relabel / veto, fail-soft)", () => {
+  const row = (title: string): VenueResult => ({
+    venue: "kalshi", sourceLabel: "Kalshi", realMoney: true, title, url: "https://k/x",
+    top: { label: "Yes", price: 0.5 }, relevance: 1,
+  });
+  const question: ClarifyQuestion = {
+    question: 'Which "world cup" market did you mean?',
+    options: [
+      { label: "Will Brazil win the World Cup?", result: row("Will Brazil win the World Cup?") },
+      { label: "Will France win the World Cup?", result: row("Will France win the World Cup?") },
+    ],
+  };
+
+  it("VETOES when the model says these are one market's outcomes (→ answer directly)", async () => {
+    __setClient(stubClient('{"ambiguous":false}'));
+    expect(await refineClarify("world cup", question, cfg)).toBeNull();
+  });
+
+  it("relabels the options in order when the model confirms ambiguity", async () => {
+    __setClient(stubClient('{"ambiguous":true,"labels":["Brazil to win","France to win"]}'));
+    const out = await refineClarify("world cup", question, cfg);
+    expect(out!.options.map((o) => o.label)).toEqual(["Brazil to win", "France to win"]);
+    expect(out!.options[0]!.result.title).toBe("Will Brazil win the World Cup?"); // result mapping preserved
+  });
+
+  it("keeps the deterministic question on a label-count mismatch", async () => {
+    __setClient(stubClient('{"ambiguous":true,"labels":["only one"]}'));
+    const out = await refineClarify("world cup", question, cfg);
+    expect(out!.options.map((o) => o.label)).toEqual(question.options.map((o) => o.label));
+  });
+
+  it("is fail-soft: an unparseable body keeps the deterministic question (we still ask)", async () => {
+    __setClient(stubClient("not json at all"));
+    expect(await refineClarify("world cup", question, cfg)).toBe(question);
+  });
+
+  it("is fail-soft: a thrown LLM error keeps the deterministic question", async () => {
+    __setClient(stubClient(() => {
+      throw new Error("network down");
+    }));
+    expect(await refineClarify("world cup", question, cfg)).toBe(question);
   });
 });

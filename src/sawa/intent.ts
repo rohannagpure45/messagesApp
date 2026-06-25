@@ -15,6 +15,7 @@
 import OpenAI from "openai";
 import type { IntentConfig } from "./config";
 import type { Venue } from "../venue";
+import type { ClarifyQuestion } from "./clarify";
 
 /**
  * `search` (new topic) and `other` (greeting/create/account/help) are the cold-start kinds. `next`
@@ -83,13 +84,25 @@ const SEARCH_TRIGGERS: { re: RegExp; strip: RegExp }[] = [
   { re: /\b(is there|are there|any) (a )?markets?\b/i, strip: /^.*\b(is there|are there|any) (a )?markets?\b( on| for| about)?\s*/i },
 ];
 
-/** Trim trailing filler/punctuation and a leading article from an extracted subject. */
+/**
+ * A leading "(a/the) market(s)/prediction/bet/odds/line (on|for|about|of)" role phrase. When the
+ * FIRST search trigger is a bare verb ("find me"), it strips only itself — so "find me a market on
+ * bitcoin" leaves "a market on bitcoin", and the role-word "market" then spuriously matches an
+ * unrelated Sawa market ("…damage at the market"). Peeling this residual yields the clean entity
+ * ("bitcoin"). Anchored at the start; only fires when a real subject follows, so "market cap of X"
+ * (no on/for/about/of after "market") and "stock market crash" are untouched.
+ */
+const LEADING_ROLE_PHRASE_RE =
+  /^\s*(?:markets?|predictions?|bets?|wagers?|polls?|lines?|odds)\s+(?:on|for|about|of)\s+(?:(?:the|a|an)\s+)?/i;
+
+/** Trim trailing filler/punctuation and a leading article/role-phrase from an extracted subject. */
 function cleanQuery(s: string): string {
   return s
     .replace(/[?!.]+$/g, "")
     .replace(/\bmarkets?\??$/i, "")
     .replace(/\b(please|pls|plz|thanks?|thx)\b/gi, "")
     .replace(/^\s*(the|a|an)\s+/i, "") // leading article: "the FIFA World Cup" → "FIFA World Cup"
+    .replace(LEADING_ROLE_PHRASE_RE, "") // residual role phrase: "market on bitcoin" → "bitcoin"
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, MAX_QUERY_LEN);
@@ -324,6 +337,75 @@ async function classifyWithLlm(text: string, cfg: IntentConfig, ctx?: FollowupCo
   } catch (err) {
     console.warn(`[intent] LLM classify failed — using regex gate. ${(err as Error).message}`);
     return null;
+  }
+}
+
+/**
+ * Optional LLM refinement for a clarifying question. The deterministic `clarify.decideClarify` already
+ * decided these candidates are ambiguous; this lets the model (a) VETO that — `ambiguous:false` when
+ * the titles are really one market's outcomes (e.g. different teams to win the SAME event), so the
+ * caller answers directly — and (b) replace the raw titles with short, natural option labels. Strictly
+ * fail-soft: any error / unusable shape returns the deterministic question UNCHANGED (we still ask).
+ */
+const CLARIFY_SYSTEM_PROMPT =
+  "You help a prediction-market assistant decide whether to ask the user a clarifying question. " +
+  "You are given a topic and a numbered list of candidate market titles the search found. Decide if " +
+  "these are GENUINELY DIFFERENT markets the user must choose between (different questions, targets, " +
+  "timeframes, or player props) OR merely outcomes/variants of ONE market (e.g. different teams to win " +
+  'the SAME event). Return ONLY JSON: {"ambiguous":boolean,"labels":[string,...]}. Set ambiguous=false ' +
+  "when they are one market's outcomes (the assistant will just show the favorite). When ambiguous=true, " +
+  "return one SHORT (under 6 words) human label per market, in the SAME ORDER as given. " +
+  "Return a SINGLE JSON object, never an array.";
+
+interface RawClarifyLlm {
+  ambiguous?: unknown;
+  labels?: unknown;
+}
+
+export async function refineClarify(
+  query: string,
+  question: ClarifyQuestion,
+  cfg: IntentConfig,
+): Promise<ClarifyQuestion | null> {
+  const list = question.options.map((o, i) => `${i + 1}. ${o.result.title}`).join("\n");
+  try {
+    const resp = await getClient(cfg).chat.completions.create(
+      {
+        model: cfg.model,
+        temperature: 0,
+        max_tokens: 256,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system" as const, content: CLARIFY_SYSTEM_PROMPT },
+          { role: "user" as const, content: `Topic: ${query || "(none)"}\nMarkets:\n${list}` },
+        ],
+      },
+      { timeout: 6_000 },
+    );
+    const content = resp.choices[0]?.message?.content;
+    if (!content) return question;
+    let parsed: RawClarifyLlm;
+    try {
+      parsed = parseLlmJson(content) as unknown as RawClarifyLlm;
+    } catch {
+      return question; // unparseable → keep the deterministic question
+    }
+    // VETO: the model says these are one market's outcomes → don't ask, answer directly.
+    if (parsed.ambiguous === false || parsed.ambiguous === "false" || parsed.ambiguous === 0) return null;
+    // Relabel from the model only when the array shape matches 1:1; else keep our deterministic labels.
+    if (Array.isArray(parsed.labels) && parsed.labels.length === question.options.length) {
+      const labels = parsed.labels;
+      const options = question.options.map((o, i) => {
+        const v = labels[i];
+        // Keep labels short — they render as iMessage poll options (and a numbered list elsewhere).
+        return typeof v === "string" && v.trim() ? { ...o, label: v.trim().slice(0, 44) } : o;
+      });
+      return { ...question, options };
+    }
+    return question;
+  } catch (err) {
+    console.warn(`[clarify] LLM refine failed — using deterministic question. ${(err as Error).message}`);
+    return question;
   }
 }
 

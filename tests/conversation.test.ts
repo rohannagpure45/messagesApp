@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { ConversationStore, toContext, nextTurn, __setClock } from "../src/sawa/conversation";
+import { ConversationStore, toContext, nextTurn, clarifyState, resolveClarifyTurn, __setClock } from "../src/sawa/conversation";
+import type { ClarifyQuestion } from "../src/sawa/clarify";
 import type { ConversationState } from "../src/sawa/conversation";
 import type { Intent } from "../src/sawa/intent";
 import type { SearchResults } from "../src/search";
@@ -170,5 +171,45 @@ describe("nextTurn", () => {
   it("link (generic) → returns the currently-shown market's URL", () => {
     const out = nextTurn(state({ cursor: 0 }), { kind: "link", via: "regex" }, null);
     expect(out.body).toContain("https://sawapredictions.com/p/1");
+  });
+});
+
+describe("clarify turns", () => {
+  const candidates = [
+    sawaRow({ title: "Bitcoin dominance above 60%", url: "https://sawapredictions.com/p/9" }),
+    kalshiRow({ title: "Bitcoin price on Dec 31", url: "https://kalshi.com/e/btc" }),
+  ];
+  const question: ClarifyQuestion = {
+    question: 'Which "bitcoin" market did you mean?',
+    options: [
+      { label: "Dominance 60%", result: candidates[0]! },
+      { label: "Price Dec 31", result: candidates[1]! },
+    ],
+  };
+
+  it("clarifyState carries the candidates + the pending question bound to the asker (no market shown yet)", () => {
+    const s = clarifyState("bitcoin", candidates, results({ sawa: [candidates[0]!], kalshi: [candidates[1]!] }), question, "+15550000001");
+    expect(s.pending).toBe(question);
+    expect(s.pendingBy).toBe("+15550000001"); // bound so a bystander can't answer
+    expect(s.candidates).toHaveLength(2);
+    expect(s.cursor).toBe(0);
+    expect(s.query).toBe("bitcoin");
+  });
+
+  it("resolveClarifyTurn shows the chosen market, points the cursor at it, and clears pending + pendingBy", () => {
+    const s = clarifyState("bitcoin", candidates, results({ sawa: [candidates[0]!], kalshi: [candidates[1]!] }), question, "+15550000001");
+    const out = resolveClarifyTurn(s, question.options[1]!); // the user picked the Kalshi market
+    expect(out.body).toContain("Bitcoin price on Dec 31");
+    expect(out.body).toContain("on Kalshi");
+    expect(out.newState.cursor).toBe(1);
+    expect(out.newState.pending).toBeUndefined();
+    expect(out.newState.pendingBy).toBeUndefined();
+  });
+
+  it("resolveClarifyTurn shows the option's OWN market when it isn't in the current candidates (no candidates[0] substitution)", () => {
+    const stale = clarifyState("bitcoin", [kalshiRow({ title: "Some other market" })], results(), question, "+15550000001");
+    const out = resolveClarifyTurn(stale, question.options[0]!); // option.result is NOT in `stale.candidates`
+    expect(out.body).toContain("Bitcoin dominance above 60%"); // the tapped market, not candidates[0]
+    expect(out.body).not.toContain("Some other market");
   });
 });

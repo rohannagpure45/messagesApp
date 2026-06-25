@@ -15,6 +15,7 @@
 import type { Venue, VenueResult } from "../venue";
 import type { Intent, FollowupContext } from "./intent";
 import { type SearchResults, flattenRanked, venuesPresent } from "../search";
+import type { ClarifyQuestion, ClarifyOption } from "./clarify";
 import { renderOne, renderLink, renderExhausted, renderNoVenue, emptyReply } from "./cards";
 
 export interface ConversationState {
@@ -30,6 +31,18 @@ export interface ConversationState {
   venuesPresent: Venue[];
   /** True when pmxt enrichment was unavailable (Sawa-only) — distinguishes "off" from "no match". */
   externalUnavailable: boolean;
+  /**
+   * A clarifying question awaiting the user's pick (poll tap or text reply). Present ONLY between
+   * asking "which market?" and resolving the answer; cleared the moment a choice lands or a new search
+   * overwrites the thread. Drives the resolve-first branch in the handler.
+   */
+  pending?: ClarifyQuestion;
+  /**
+   * Normalized handle of the person the pending clarify was asked of (the one who hailed). A TEXT
+   * answer is bound to them, so in a shared space (a group, or local mode reading the whole inbox) a
+   * bystander's unhailed "2" can't resolve someone else's question. Paired with `pending`.
+   */
+  pendingBy?: string;
   /** Last-touched wall-clock ms — drives TTL eviction (stamped by the store on `set`). */
   updatedAt: number;
 }
@@ -227,4 +240,49 @@ function onLink(state: ConversationState | null, intent: Intent): TurnOutcome {
 /** Clone state with `venue` recorded as linked (cursor unchanged — a link is a side-quest). */
 function linkOf(state: ConversationState, venue: Venue): ConversationState {
   return { ...state, linkedVenues: new Set(state.linkedVenues).add(venue) };
+}
+
+/**
+ * Build the thread state for a clarify turn: the full ranked candidates are kept (so "another" / link
+ * follow-ups still work once a choice is made) plus the `pending` question. The reply (the poll / text
+ * list) is produced by the caller from `question`; this only assembles state. `cursor` is 0 but no
+ * single market has been "shown" yet — resolution sets the cursor to the chosen market.
+ */
+export function clarifyState(
+  query: string,
+  candidates: VenueResult[],
+  results: SearchResults,
+  question: ClarifyQuestion,
+  pendingBy: string,
+): ConversationState {
+  return {
+    query,
+    candidates,
+    cursor: 0,
+    linkedVenues: new Set(),
+    venuesPresent: venuesPresent(results),
+    externalUnavailable: results.externalUnavailable,
+    pending: question,
+    pendingBy,
+    updatedAt: 0,
+  };
+}
+
+/**
+ * Resolve a clarify answer: show the chosen market (folk-style line), point the cursor at it so a
+ * later "another" / "send the link" continues from there, and CLEAR `pending`. Pure — the caller
+ * resolves the option (via `clarify.resolveAnswer`) and persists `newState`.
+ */
+export function resolveClarifyTurn(
+  state: ConversationState,
+  option: ClarifyOption,
+  opts: NextTurnOptions = {},
+): TurnOutcome {
+  // Show the option's OWN market. Only sync the cursor when that market is in the current candidates;
+  // if it isn't (e.g. a stale poll tapped after a new search replaced the list), show it directly
+  // rather than silently substituting candidates[0] (the `?? candidates[0]` bug the review caught).
+  const idx = state.candidates.indexOf(option.result);
+  const chosen = idx >= 0 ? state.candidates[idx]! : option.result;
+  const cursor = idx >= 0 ? idx : state.cursor;
+  return { body: renderOne(chosen, opts), newState: { ...state, cursor, pending: undefined, pendingBy: undefined } };
 }

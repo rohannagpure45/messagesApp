@@ -7,8 +7,24 @@
  * there is no "@mention" event, so we infer addressing from the text (SPECTRUM_INTEGRATION §1).
  */
 
+import type { Intent } from "./sawa/intent";
+
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * When a message is NOT hailed but there's an active thread in the space (the "relaxed" path — so
+ * follow-ups and poll answers work without re-typing "sawa"), decide whether it's safe to act on the
+ * parsed intent. We continue the thread (`next`/`link`) or honor an EXPLICIT search request (a regex
+ * trigger like "find a market on X" / "odds on Y") — but NEVER a bare-topic guess (`via` !== "regex")
+ * or small talk, so the bot stays silent on inbox bystander chatter it merely overheard. A pending
+ * clarify answer is resolved by the caller BEFORE this gate, so it is unaffected.
+ */
+export function actionableWhenRelaxed(intent: Intent): boolean {
+  if (intent.kind === "next" || intent.kind === "link") return true;
+  if (intent.kind === "search") return intent.via === "regex";
+  return false;
 }
 
 /**

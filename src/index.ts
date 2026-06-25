@@ -13,7 +13,7 @@ import "./env"; // MUST be first: loads ./.env into process.env before anything 
 
 import net from "node:net";
 import path from "node:path";
-import { Spectrum, text, markdown, richlink } from "spectrum-ts";
+import { Spectrum, text, markdown, richlink, poll } from "spectrum-ts";
 import { imessage } from "spectrum-ts/providers/imessage";
 import { terminal } from "spectrum-ts/providers/terminal";
 import type { Space, Message } from "spectrum-ts";
@@ -31,10 +31,11 @@ import { listMarkets, getMarket } from "./sawa/read";
 import { formatList, formatMarket } from "./sawa/format";
 import { stubCreate } from "./sawa/createStub";
 import { RecentBuffer, suggestPayload } from "./sawa/suggest";
-import { parseIntent, stripAddress } from "./sawa/intent";
-import { runSearch } from "./search";
+import { parseIntent, stripAddress, refineClarify } from "./sawa/intent";
+import { runSearch, flattenRanked } from "./search";
 import { toPlainText } from "./sawa/cards";
-import { ConversationStore, toContext, nextTurn } from "./sawa/conversation";
+import { ConversationStore, toContext, nextTurn, clarifyState, resolveClarifyTurn } from "./sawa/conversation";
+import { decideClarify, resolveAnswer, renderClarifyText, type ClarifyQuestion } from "./sawa/clarify";
 import {
   SpaceSettings,
   fileSettingsPersistence,
@@ -43,7 +44,7 @@ import {
   confirmChanges,
   describeSettings,
 } from "./sawa/settings";
-import { shouldHandle, SeenSet, normalizeHandle } from "./routing";
+import { shouldHandle, SeenSet, normalizeHandle, actionableWhenRelaxed } from "./routing";
 
 // Single-instance lock (a localhost mutex, NOT a network server). Two bot processes on one Photon
 // project duel over the iMessage subscription — Photon delivers each text to only one of them, so
@@ -212,25 +213,70 @@ async function sendBody(space: Space, body: string): Promise<void> {
   await guard("reply send", () => space.send(localImessage ? text(toPlainText(body)) : markdown(body)));
 }
 
-/** Run a fresh cross-venue search, reply with the single best market, and store the thread state. */
-async function runConversationalSearch(space: Space, spaceId: string, query: string): Promise<void> {
+/**
+ * Can THIS platform render a native iMessage Poll? Cloud iMessage + the terminal TUI can; LOCAL
+ * iMessage (the Mac's Messages app) is text + attachments only, so it falls back to a numbered list.
+ */
+function pollCapable(platform: string): boolean {
+  return !(platform === "iMessage" && localImessage);
+}
+
+/**
+ * Ask a clarifying question: a native Poll where supported (the user taps a choice → a `poll_option`
+ * event we resolve in the loop), else a numbered text list (the user replies "2" / the name → resolved
+ * on the text path). Both correlate back to the `pending` question stored in conversation state.
+ */
+async function sendClarify(space: Space, question: ClarifyQuestion, platform: string): Promise<void> {
+  if (pollCapable(platform)) {
+    await guard("clarify poll", () => space.send(poll(question.question, ...question.options.map((o) => o.label))));
+  } else {
+    await sendBody(space, renderClarifyText(question));
+  }
+}
+
+/**
+ * Run a fresh cross-venue search. When several DISTINCT markets match one topic (e.g. "bitcoin"), ASK
+ * which one (a poll / numbered list) instead of guessing; otherwise reply with the single best market.
+ * Either way the thread state is stored so follow-ups ("not that" / "send the link") resolve.
+ */
+async function runConversationalSearch(
+  space: Space,
+  spaceId: string,
+  query: string,
+  platform: string,
+  senderId: string,
+): Promise<void> {
   if (!config) return void (await guard("config notice", () => space.send(needsConfig())));
   // Resolve agent settings for this space: "sawa only" drops external enrichment; "quips" sets the tone.
   const pmxt = settings.get(spaceId, "external") ? pmxtConfig : null;
+  const folkTone = settings.get(spaceId, "quips");
   const results = await runSearch(query, { config, pmxt });
-  const outcome = nextTurn(null, { kind: "search", query, via: "regex" }, results, {
-    folkTone: settings.get(spaceId, "quips"),
-  });
+  const candidates = results.empty ? [] : flattenRanked(results);
+
+  // Ambiguous topic → ask which market. Deterministic decision; the LLM may relabel/veto if configured.
+  if (candidates.length > 0) {
+    let question = decideClarify(candidates, query);
+    if (question && intentConfig) question = await refineClarify(query, question, intentConfig);
+    if (question) {
+      // Bind the pending question to the asker so only THEY can answer it with unhailed text.
+      convo.set(spaceId, clarifyState(query, candidates, results, question, senderId));
+      await sendClarify(space, question, platform);
+      return;
+    }
+  }
+
+  // Single best answer (the folk-style one-liner) or the graceful empty-state — via the pure reducer.
+  const outcome = nextTurn(null, { kind: "search", query, via: "regex" }, results, { folkTone });
   convo.set(spaceId, outcome.newState);
   await sendBody(space, outcome.body);
 }
 
 /** Slash-command fallback (power users + the terminal TUI). */
-async function handleSlash(space: Space, cmd: string, arg: string): Promise<void> {
+async function handleSlash(space: Space, cmd: string, arg: string, platform: string, senderId: string): Promise<void> {
   switch (cmd) {
     case "/search": {
       if (!arg) return void (await space.send("Usage: /search <topic>"));
-      await runConversationalSearch(space, space.id, arg);
+      await runConversationalSearch(space, space.id, arg, platform, senderId);
       return;
     }
     case "/markets": {
@@ -267,34 +313,65 @@ async function handleSlash(space: Space, cmd: string, arg: string): Promise<void
 }
 
 /**
- * Natural-language path: read the conversation's thread state, classify intent WITH that context
- * (so "not that" / "send the kalshi link" disambiguate from a new search), then route. A `search`
- * runs a fresh lookup; `next`/`link` page the stored candidates via the pure reducer; `other` nudges.
+ * Natural-language path. `relaxed` is true when the message was NOT hailed but there's an active thread
+ * in this space (so follow-ups + clarify answers work without re-typing "sawa"); in that mode we only
+ * continue the thread or honor an explicit search, staying silent on anything else.
+ *
+ * Order: resolve a pending clarify answer ("2" / "the kalshi one") → settings (hailed only) → classify
+ * intent WITH thread context → route. A `search` runs a fresh lookup; `next`/`link` page the stored
+ * candidates via the pure reducer; `other` nudges (only when hailed).
  */
-async function handleNatural(space: Space, body: string): Promise<void> {
+async function handleNatural(
+  space: Space,
+  body: string,
+  platform: string,
+  relaxed: boolean,
+  senderId: string,
+): Promise<void> {
   const spaceId = space.id;
-  const state = convo.get(spaceId) ?? null;
-
-  // Agent settings, addressed in natural language ("quips off", "sawa only", "settings") — resolved
-  // BEFORE search so a toggle phrase is applied, never searched. `peelSettings` also strips a LEADING
-  // toggle off a compound message ("turn on the quips, look for X") and hands back the remainder.
+  let state = convo.get(spaceId) ?? null;
   const addressed = stripAddress(body, botName);
-  if (isSettingsQuery(addressed)) {
-    await sendBody(space, describeSettings(settings.resolved(spaceId)));
-    return;
+
+  // A pending clarify ("which market?") answer on the TEXT path (poll taps resolve in the loop). Bound
+  // to the ASKER: a bystander's "2" in a shared space (group / local-mode inbox) is NOT their answer to
+  // give, so we skip resolution for anyone else and leave the question standing for the asker.
+  if (state?.pending && state.pendingBy === senderId) {
+    const opt = resolveAnswer(state.pending, addressed);
+    if (opt) {
+      const outcome = resolveClarifyTurn(state, opt, { folkTone: settings.get(spaceId, "quips") });
+      convo.set(spaceId, outcome.newState);
+      await sendBody(space, outcome.body);
+      return;
+    }
+    // The asker said something that isn't an answer → drop the pending and treat it as a fresh intent.
+    state = { ...state, pending: undefined, pendingBy: undefined };
+    convo.set(spaceId, state);
   }
-  const { changes, rest } = peelSettings(addressed);
-  if (changes.length) {
-    for (const c of changes) settings.set(spaceId, c.key, c.on);
-    await sendBody(space, confirmChanges(changes));
-    if (!rest) return; // pure toggle — nothing left to do
-    body = rest; // continue with the remainder of the compound (address already stripped)
+
+  // Agent settings ("quips off", "sawa only", "settings") — resolved BEFORE search so a toggle phrase
+  // is applied, never searched. Only when explicitly hailed: a relaxed/overheard message must not toggle
+  // config. `peelSettings` also strips a LEADING toggle off a compound ("turn on quips, look for X").
+  if (!relaxed) {
+    if (isSettingsQuery(addressed)) {
+      await sendBody(space, describeSettings(settings.resolved(spaceId)));
+      return;
+    }
+    const { changes, rest } = peelSettings(addressed);
+    if (changes.length) {
+      for (const c of changes) settings.set(spaceId, c.key, c.on);
+      await sendBody(space, confirmChanges(changes));
+      if (!rest) return; // pure toggle — nothing left to do
+      body = rest; // continue with the remainder of the compound (address already stripped)
+    }
   }
 
   const intent = await parseIntent(body, botName, intentConfig, toContext(state));
 
+  // Relaxed (overheard, active thread): only act on a thread follow-up or an EXPLICIT search request.
+  if (relaxed && !actionableWhenRelaxed(intent)) return;
+
   if (intent.kind === "search" && intent.query) {
-    await runConversationalSearch(space, spaceId, intent.query);
+    await runConversationalSearch(space, spaceId, intent.query, platform, senderId);
     return;
   }
   if (intent.kind === "next" || intent.kind === "link") {
@@ -303,11 +380,46 @@ async function handleNatural(space: Space, body: string): Promise<void> {
     await sendBody(space, outcome.body);
     return;
   }
-  // "other" (greeting / create / account / help) or a search with no extractable subject — nudge.
+  // "other" (greeting / create / account / help) or a search with no extractable subject — nudge (the
+  // relaxed case already returned above, so this only fires for an explicitly-addressed message).
   await space.send(
     `I find prediction markets across Sawa, Kalshi & Polymarket. ` +
       `Try "${botName} FIFA World Cup" or /help.`,
   );
+}
+
+/** Normalize a poll/question title for correlation (no poll id is delivered inbound — match by title). */
+function normTitle(s: string): string {
+  return s.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/**
+ * A native poll vote (`poll_option`) — the answer to a clarifying "which market?" poll. Correlate to
+ * the space's `pending` question by TITLE (no poll id is delivered inbound — see SPECTRUM_INTEGRATION
+ * §4) and resolve the tapped option to a market. A poll tap needs NO "sawa" hail and is NOT bound to
+ * the asker the way a text answer is: it's a deliberate, visible tap on OUR own poll bubble, so any
+ * participant tapping it is unambiguously addressing the bot. Polls also never reach LOCAL mode (the
+ * whole-inbox path), so the relaxed-text safety concern doesn't apply. Idempotent on the vote id.
+ *
+ * Known edge (title-only correlation): if the SAME query is re-asked before this vote lands, both polls
+ * share a title but the new `pending` has different options — a stale tap then fails `resolveAnswer` and
+ * is silently dropped (the user just taps the current poll). Message ordering is Spectrum-guaranteed, so
+ * a vote arriving after the text path already cleared `pending` simply finds none and returns.
+ */
+async function handlePollVote(space: Space, message: Message): Promise<void> {
+  if (message.content.type !== "poll_option") return;
+  if (!message.content.selected) return; // act on a selection, not a deselect
+  if (isFromSelf(message)) return;
+  const spaceId = space.id;
+  const state = convo.get(spaceId);
+  if (!state?.pending) return;
+  if (normTitle(message.content.poll.title) !== normTitle(state.pending.question)) return; // not our poll
+  if (seen.seen(message.id)) return; // at-least-once delivery → never resolve the same vote twice
+  const opt = resolveAnswer(state.pending, message.content.option.title);
+  if (!opt) return;
+  const outcome = resolveClarifyTurn(state, opt, { folkTone: settings.get(spaceId, "quips") });
+  convo.set(spaceId, outcome.newState);
+  await sendBody(space, outcome.body);
 }
 
 // Startup outbound initiation (SAWA_HELLO_TO="+15551234567", or a comma-separated list of handles).
@@ -373,7 +485,13 @@ for await (const [space, message] of app.messages) {
   console.warn(
     `[sawa] ⟵ event [${message.platform}] type=${message.content.type} from=${normalizeHandle(message.sender?.id ?? "unknown")}`,
   );
-  if (message.content.type !== "text") continue; // v1: text only (poll/reaction land later)
+  // A native poll vote — the answer to a clarifying "which market?" poll. Handled before the text gate
+  // (it carries no text/hail) and only acts on a pending clarify in this space. Cloud/terminal only.
+  if (message.content.type === "poll_option") {
+    await guard("poll vote", () => handlePollVote(space, message));
+    continue;
+  }
+  if (message.content.type !== "text") continue; // v1: text + poll_option (reactions land later)
   if (isFromSelf(message)) continue; // never act on our own sends (critical in local mode on a shared Apple ID)
 
   const body = message.content.text.trim();
@@ -389,10 +507,16 @@ for await (const [space, message] of app.messages) {
 
   // In local mode the bot reads the Mac's whole inbox, so require an explicit "sawa …" hail everywhere
   // (treat like a group) — otherwise it would auto-reply to every DM this Apple ID receives.
-  if (!shouldHandle({ isGroup: isGroup || localImessage, isSlash, body, botName })) {
-    // Bystander chatter in a group — feed the buffer (for future reply-driven suggestions), no reply.
+  const hailed = shouldHandle({ isGroup: isGroup || localImessage, isSlash, body, botName });
+  // Relaxed follow-up: a non-hailed message is still handled WHEN there's an active thread in this space
+  // (within TTL) — so a poll/clarify answer ("2"), "send the kalshi link", or "find a market on X" work
+  // without re-hailing. handleNatural gates it to thread follow-ups + explicit searches and stays silent
+  // otherwise, so overheard inbox chatter never gets a reply.
+  const relaxed = !hailed && convo.get(space.id) !== undefined;
+  if (!hailed && !relaxed) {
+    // Bystander chatter (not addressed, no active thread) — feed the buffer for future suggestions, no reply.
     console.warn(
-      `[sawa] ⊘ ignored [${message.platform}/group] from=${senderId} — not addressed (lead with "${botName} …" or @${botName}).`,
+      `[sawa] ⊘ ignored [${message.platform}/${isGroup ? "group" : "dm"}] from=${senderId} — not addressed (lead with "${botName} …" or @${botName}).`,
     );
     recent.push(senderId, body);
     continue;
@@ -411,9 +535,9 @@ for await (const [space, message] of app.messages) {
         const parts = body.split(/\s+/);
         const cmd = (parts[0] ?? "").toLowerCase();
         const arg = parts.slice(1).join(" ").trim();
-        await handleSlash(space, cmd, arg);
+        await handleSlash(space, cmd, arg, message.platform, senderId);
       } else {
-        await handleNatural(space, body);
+        await handleNatural(space, body, message.platform, relaxed, senderId);
       }
     } catch (err) {
       console.error(`[sawa] handler failed:`, err);

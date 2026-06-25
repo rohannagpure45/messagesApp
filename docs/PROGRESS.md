@@ -5,6 +5,38 @@ status lives in [`../AGENTS.md`](../AGENTS.md); the phased plan in [`BUILD_PLAN.
 
 ---
 
+## 2026-06-25 — clarifying questions (ask-don't-guess) + hail-free follow-ups
+
+From the first live iMessage DM session (the user bringing the bot up): four problems — (1) "find me a
+market on bitcoin" returned an unrelated Sawa market ("…damage at the market? Lily/Dana"); (2) follow-ups
+failed without re-typing "sawa" ("Send me the kalshi link", "find a market on oil prices"); (3) the intent
+LLM wasn't narrowing the query before pmxt; (4) an ambiguous topic should *ask* (a poll), not guess. Scoped
+with a 3-question owner gate and an adversarial 4-lens review. `npm test` **187** (+31); typecheck clean.
+Full spec: [`CLARIFY_FOLLOWUP.md`](CLARIFY_FOLLOWUP.md).
+
+1. **Phase A — query precision (the bitcoin/oil bug).** `cleanQuery` peels a residual `"a market on X"`
+   role phrase → `"bitcoin"` (`src/sawa/intent.ts`); `scoreRelevance` drops domain role-words from the
+   *query* side so `"market"` can't match `"…at the market"` (`src/venue.ts`); `pickLead` requires the best
+   Sawa match to clear 0.5 relevance before the Sawa-lead bias applies (`src/search.ts`).
+2. **Phase B — clarifying questions ("only when ambiguous").** New pure `src/sawa/clarify.ts`
+   (`clusterTopics` collapses one event's per-outcome slices so World Cup still answers directly;
+   `decideClarify`, `resolveAnswer`, `renderClarifyText`). A native iMessage **Poll** where supported
+   (`pollCapable`), a numbered-text list on local iMessage; answers accepted from a `poll_option` tap OR a
+   text reply, correlated to a `pending` clarify in conversation state. `refineClarify` (`src/sawa/intent.ts`)
+   is an optional fail-soft LLM pass that vetoes a false-ambiguity and relabels options. NOT the
+   `customizedMiniApp` deep-link card (needs a published iOS extension app; no inbound selection event).
+3. **Phase C — hail-free follow-ups ("relax within an active thread").** The loop computes `relaxed`
+   (no hail BUT an active thread in the space); `actionableWhenRelaxed` (`src/routing.ts`) permits only a
+   follow-up or an *explicit* search, silent otherwise — so "send the kalshi link" / "find a market on X"
+   work without re-hailing while inbox bystander chatter stays ignored.
+
+**Safety (review-hardened):** clarify text answers are **sender-bound** (`pendingBy`) so a bystander's
+unhailed "2" can't answer someone else's question in a shared/local-inbox space; `resolveClarifyTurn` shows
+the tapped market directly (never `candidates[0]`) if it isn't in the current list. Space-keying keeps the
+bot's other chats hail-gated. See [`CLARIFY_FOLLOWUP.md`](CLARIFY_FOLLOWUP.md) §Safety.
+
+---
+
 ## 2026-06-25 (live group retest #2) — pmxt 429 root-caused; staged fan-out + graceful empty-state
 
 A third live test reported "bitcoin returns nothing" and "wrong player-prop market/link". The headless log
