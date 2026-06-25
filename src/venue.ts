@@ -41,6 +41,12 @@ export interface VenueResult {
   runnerUp?: TopOutcome;
   /** Relevance score vs the query (token overlap, 0–1). Higher = better. */
   relevance: number;
+  /**
+   * When this market resolves, as epoch ms (pmxt `resolutionDate` / Sawa `deadline`). Drives the
+   * recency ranking signal: upcoming-soonest first, already-resolved (past) last. Optional — markets
+   * without a parseable date rank neutrally (neither boosted nor buried).
+   */
+  closesAt?: number;
 }
 
 const STOPWORDS = new Set([

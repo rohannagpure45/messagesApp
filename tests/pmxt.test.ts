@@ -33,6 +33,7 @@ function market(over: Record<string, unknown> = {}) {
     url: "https://kalshi.com/events/x",
     image: "https://img.example/x.png",
     volume24h: 1000,
+    resolutionDate: "2026-07-06T17:00:00.000Z",
     outcomes: [
       { label: "Karen Bass", price: 0.65 },
       { label: "Nithya Raman", price: 0.34 },
@@ -81,6 +82,7 @@ describe("searchVenue", () => {
       top: { label: "Karen Bass", price: 0.65 },
     });
     expect(vr!.relevance).toBeGreaterThan(0);
+    expect(vr!.closesAt).toBe(Date.parse("2026-07-06T17:00:00.000Z")); // resolutionDate → closesAt (recency)
   });
 
   it("prefers the AFFIRMATIVE outcome over a higher-priced 'Not …' side", async () => {

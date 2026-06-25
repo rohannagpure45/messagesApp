@@ -33,98 +33,107 @@ interface SettingSpec {
   /** Confirmation copy. */
   onReply: string;
   offReply: string;
-  /** A short address-stripped clause that turns the setting ON / OFF. */
-  on: RegExp;
-  off: RegExp;
+  /** Names this setting in a clause (word-boundary). A direction word decides on vs off. */
+  subject: RegExp;
 }
 
-// --- subject vocab, assembled into per-setting matchers ---------------------------------------
+// --- recognizer: subject + direction, robust to word order / filler ---------------------------
 
-const QUIP = "(?:quips?|jokes?|banter|folk[\\s-]?tone|flair|flourish|sass|personality|humou?r)";
-// External-venue subjects are kept NON-COLLIDING with the venue link follow-ups: a bare "kalshi"
-// (a link request) has no direction token, so it is never read as a toggle — only "kalshi off" is.
-const EXT = "(?:external(?:\\s+markets?)?|other\\s+venues?|kalshi|polymarket)";
-
-/** Wrap a clause body: anchored, tolerant of a polite prefix + trailing punctuation. */
-function clause(body: string): RegExp {
-  return new RegExp(
-    `^(?:please\\s+|can\\s+you\\s+|could\\s+you\\s+|pls\\s+|hey\\s+|just\\s+)*(?:${body})[\\s!.?]*$`,
-    "i",
-  );
-}
-
+// A clause toggles a setting when it NAMES the subject AND carries a DIRECTION — order-independent, so
+// "quips on", "turn on the quips", "turn the quips on", "use more quips", "turn up the quips slider"
+// all resolve. Each setting just declares its subject; the direction vocab is shared below.
 const SETTINGS: SettingSpec[] = [
   {
     key: "quips",
     label: "quips",
     onReply: "Quips on — I'll add a little color.",
     offReply: "Quips off — just the facts.",
-    on: clause(
-      `(?:turn(?:\\s+on)?|switch(?:\\s+on)?|flip(?:\\s+on)?|put(?:\\s+on)?|enable|activate|add|more)\\s+(?:the\\s+|some\\s+)?${QUIP}(?:\\s+on)?` +
-        `|(?:the\\s+)?${QUIP}\\s+(?:on|please|enabled?)` +
-        `|on\\s+${QUIP}`,
-    ),
-    off: clause(
-      `(?:turn(?:\\s+off)?|switch(?:\\s+off)?|flip(?:\\s+off)?|disable|deactivate|stop|kill|mute|silence|cut|drop|less|no)\\s+(?:the\\s+|those\\s+|all\\s+the\\s+)?${QUIP}(?:\\s+off)?` +
-        `|(?:the\\s+)?${QUIP}\\s+(?:off|disabled?)` +
-        `|off\\s+${QUIP}` +
-        `|no\\s+more\\s+${QUIP}`,
-    ),
+    subject: /\b(quips?|jokes?|banter|humou?r|folk[\s-]?tone|flair|flourish|sass|personality)\b/i,
   },
   {
     key: "external",
     label: "external markets",
     onReply: "External markets on — Kalshi & Polymarket included.",
     offReply: "Sawa only — external markets off.",
-    on: clause(
-      `all\\s+venues|every\\s+venue|${EXT}\\s+on` +
-        `|(?:turn\\s+on|switch\\s+on|enable|include|add|unhide)\\s+(?:the\\s+)?${EXT}`,
-    ),
-    off: clause(
-      `sawa[-\\s]?only(?:\\s+mode)?|just\\s+sawa|only\\s+sawa(?:\\s+markets?)?|${EXT}\\s+off` +
-        `|(?:turn\\s+off|switch\\s+off|disable|hide|exclude|without|no|drop)\\s+(?:the\\s+)?${EXT}`,
-    ),
+    // "sawa only" / "all venues" embed their own direction; a bare "kalshi"/"polymarket" carries no
+    // direction, so it stays a link follow-up (never a toggle) — only "kalshi off" / "include kalshi" do.
+    subject:
+      /\b(external(?:\s+markets?)?|other\s+venues?|all\s+venues|every\s+venue|sawa[-\s]?only|only\s+sawa|just\s+sawa|kalshi|polymarket)\b/i,
   },
 ];
 
 export const SETTING_KEYS: SettingKey[] = SETTINGS.map((s) => s.key);
 
+// Direction signals (order-independent). Bare on/off are allowed because the SEARCH_GUARD + subject +
+// short-clause requirements keep a phrase like "is there a market on quips" from ever reaching here.
+const TURN_OFF =
+  /\b(off|down|less|fewer|lower|quiet(?:er)?|reduce|disabled?|deactivate|stop|kill|mute|silence|cut|drop|none|no|hide|exclude|without|only)\b/i;
+const TURN_ON = /\b(on|up|more|moar|enabled?|activate|crank|boost|increase|raise|amp|louder|all|include|add|please)\b/i;
+
+// An explicit SEARCH command beats a settings toggle, so "look for quips", "is there a market on quips",
+// "odds on X" stay searches and are never swallowed. Anchored at the clause START: a toggle never opens
+// with a search verb, while a search clause does — this is what lets "external markets on" toggle even
+// though it contains the substring "markets on".
+const SEARCH_GUARD =
+  /^(?:please\s+|hey\s+)?(?:find|search(?:ing)?|look(?:ing)?(?:\s+for|\s+up)?|show me|get me|gimme|where can i|odds\s+(?:on|for|of)|markets?\s+(?:on|for|about)|predictions?\s+(?:on|for|about)|is there|are there)\b/i;
+
+const wordCount = (s: string): number => s.split(/\s+/).filter(Boolean).length;
+
 /**
- * Classify ONE clause as a setting toggle, or null. OFF is tested before ON because off-cues are the
- * more specific phrasings ("turn off …" vs a bare "… on"); a clause with a subject but no direction
- * (bare "quips", "kalshi") returns null and falls through to the search/link path.
+ * Classify ONE clause as a setting toggle, or null. A toggle clause is SHORT, is not an explicit
+ * search, names a setting subject, and carries a direction. OFF is tested before ON (off-cues like
+ * "only"/"no" are the decisive ones). A clause with a subject but no direction (bare "quips",
+ * "kalshi") returns null and falls through to the search/link path.
  */
 export function classifySettingCommand(text: string): SettingChange | null {
   const t = text.trim();
-  if (!t) return null;
+  if (!t || wordCount(t) > 9 || SEARCH_GUARD.test(t)) return null;
   for (const s of SETTINGS) {
-    if (s.off.test(t)) return { key: s.key, on: false };
-    if (s.on.test(t)) return { key: s.key, on: true };
+    if (!s.subject.test(t)) continue;
+    if (TURN_OFF.test(t)) return { key: s.key, on: false };
+    if (TURN_ON.test(t)) return { key: s.key, on: true };
   }
   return null;
 }
 
-/** Split a compound message at the first clause boundary (comma / "and" / "then" / "&"). */
+/** Split a compound at the FIRST clause boundary (comma / "and" / "then" / "&"). */
 const CLAUSE_BOUNDARY = /^(.*?)(?:\s*[,;]+\s*|\s+and\s+then\s+|\s+then\s+|\s+and\s+|\s*&\s*)(.*)$/i;
+/** Split a compound at the LAST clause boundary (greedy head) — for a TRAILING toggle. */
+const LAST_CLAUSE_BOUNDARY = /^(.*)(?:\s*[,;]+\s*|\s+and\s+then\s+|\s+then\s+|\s+and\s+|\s*&\s*)(.+)$/i;
+
+/** Strip a leading conjunction left over after peeling ("…, and look for X" → "look for X"). */
+const stripLeadingConj = (s: string): string => s.replace(/^(?:and\s+then|and|then)\s+/i, "").trim();
 
 /**
- * Peel LEADING settings clauses off `text`, returning the applied changes (in order) and the
- * remaining message. The moment a head is NOT a settings command the peel stops and the full
- * remainder is returned untouched — so a real search that merely contains "and"/"," ("find cap and
- * trade", "Switzerland, India") is never split. Bounded loop (at most one peel per setting + slack).
+ * Peel settings clauses off `text` — both LEADING ("quips on, look for X") and TRAILING ("look for X,
+ * and turn up the quips") — returning the applied changes and the remaining message to act on. The
+ * moment a candidate clause is NOT a settings command the peel on that end stops and the rest is left
+ * untouched — so a real search that merely contains "and"/"," ("find cap and trade", "Switzerland,
+ * India") is never split. Bounded loops.
  */
 export function peelSettings(text: string): { changes: SettingChange[]; rest: string } {
   const changes: SettingChange[] = [];
   let rest = text.trim();
-  for (let i = 0; i < SETTING_KEYS.length + 2 && rest; i++) {
+  const cap = SETTING_KEYS.length + 3;
+
+  for (let i = 0; i < cap && rest; i++) {
     const m = rest.match(CLAUSE_BOUNDARY);
     const head = (m ? m[1]! : rest).trim();
-    const tail = (m ? m[2]! : "").trim();
     const cmd = classifySettingCommand(head);
     if (!cmd) break;
     changes.push(cmd);
-    rest = tail;
+    rest = stripLeadingConj(m ? m[2]!.trim() : "");
   }
+
+  for (let i = 0; i < cap && rest; i++) {
+    const m = rest.match(LAST_CLAUSE_BOUNDARY);
+    if (!m) break;
+    const cmd = classifySettingCommand(m[2]!.trim());
+    if (!cmd) break;
+    changes.push(cmd);
+    rest = m[1]!.trim();
+  }
+
   return { changes, rest };
 }
 

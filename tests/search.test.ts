@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { runSearch, isBroadQuery, flattenRanked, venuesPresent } from "../src/search";
+import { runSearch, isBroadQuery, flattenRanked, venuesPresent, __setClock as __setSearchClock } from "../src/search";
 import { __clearCache, __setClock } from "../src/pmxt/discover";
 import type { SearchResults } from "../src/search";
 import type { Config, PmxtConfig } from "../src/sawa/config";
@@ -34,13 +34,14 @@ function feedRow(id: string, title: string, pools: Record<string, number>) {
 const sawaFeed = (rows: unknown[]) => ({ predictions: rows, pagination: { page: 1, limit: 100, total: rows.length, pages: 1 } });
 
 /** A pmxt market with one affirmative outcome at `price`. */
-function pmxtMarket(exchange: string, title: string, label: string, price: number, volume24h = 1) {
+function pmxtMarket(exchange: string, title: string, label: string, price: number, volume24h = 1, resolutionDate?: string) {
   return {
     marketId: `${exchange}-${label}`,
     sourceExchange: exchange,
     title,
     url: `https://${exchange}.com/${label}`,
     volume24h,
+    resolutionDate,
     outcomes: [
       { label, price },
       { label: `Not ${label}`, price: 1 - price },
@@ -75,6 +76,7 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = realFetch;
   __setClock(() => Date.now());
+  __setSearchClock(() => Date.now());
 });
 
 describe("runSearch", () => {
@@ -191,6 +193,34 @@ describe("runSearch — proper-noun entity decomposition (Issue 4)", () => {
     const r = await runSearch("FIFA World Cup", { config, pmxt });
     // "Stanley Cup" scores 1/3 < RELEVANCE_MIN against "FIFA World Cup" → filtered; World Cup kept.
     expect(r.kalshi.map((m) => m.title)).toEqual(["World Cup Winner: Brazil?"]);
+  });
+});
+
+describe("recency ranking (resolutionDate) — the Argentina miss", () => {
+  it("surfaces the SOONEST upcoming market over a higher-volume later one", async () => {
+    __setSearchClock(() => Date.parse("2026-06-25T00:00:00Z"));
+    installStub({
+      kalshi: [
+        // The live miss: Austria resolves later but had ~150x the volume → won the old tiebreak.
+        pmxtMarket("kalshi", "Argentina vs Austria Winner?", "Argentina", 0.86, 31_000_000, "2026-07-06T17:00:00Z"),
+        pmxtMarket("kalshi", "Jordan vs Argentina Winner?", "Argentina", 0.86, 207_000, "2026-06-28T02:00:00Z"),
+      ],
+    });
+    const flat = flattenRanked(await runSearch("Argentina", { config, pmxt }));
+    expect(flat[0]!.title).toBe("Jordan vs Argentina Winner?"); // soonest upcoming leads despite far less volume
+  });
+
+  it("buries an already-resolved (past) market beneath an upcoming one", async () => {
+    __setSearchClock(() => Date.parse("2026-06-25T00:00:00Z"));
+    installStub({
+      kalshi: [
+        pmxtMarket("kalshi", "Argentina past game", "Argentina", 0.8, 9_999_999, "2026-06-20T00:00:00Z"), // resolved
+        pmxtMarket("kalshi", "Argentina upcoming game", "Argentina", 0.5, 1, "2026-06-30T00:00:00Z"), // upcoming
+      ],
+    });
+    const flat = flattenRanked(await runSearch("Argentina", { config, pmxt }));
+    expect(flat[0]!.title).toBe("Argentina upcoming game");
+    expect(flat[flat.length - 1]!.title).toBe("Argentina past game");
   });
 });
 

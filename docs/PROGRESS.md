@@ -5,6 +5,44 @@ status lives in [`../AGENTS.md`](../AGENTS.md); the phased plan in [`BUILD_PLAN.
 
 ---
 
+## 2026-06-25 (live group retest) — recognizer robustness, LLM array JSON, recency ranking
+
+A second live group test (3 members, mixed iMessage/RCS, LOCAL mode) surfaced three issues; all fixed.
+`npm run typecheck` clean; `npm test` **151** (+8). Evidence came from the bot's headless log + a direct
+pmxt probe.
+
+1. **Settings recognizer was too rigid** — `turn up the quips`, `use more quips`, `turn on quips more`,
+   `turn up the quips to do more` all fell through to search/nudge (log lines 49/51/55/67). **Rewrote**
+   `classifySettingCommand` (`src/sawa/settings.ts`) from per-setting on/off regexes to a robust
+   **subject + direction-token + short-clause** model: each setting declares only its SUBJECT; a shared
+   `TURN_ON`/`TURN_OFF` vocab (on/up/more/enable… vs off/down/less/disable/only/no…) decides direction
+   order-independently, so volume-metaphor and filler phrasings all resolve. Precision is held by a
+   **`SEARCH_GUARD`** anchored at the clause start (a toggle never opens with `find`/`look for`/`odds on`/
+   `is there a market` — so `is there a market on quips` stays a search; anchoring is also what lets
+   `external markets on` toggle despite containing the substring "markets on"). `peelSettings` now also
+   **strips a leftover leading conjunction** ("…, and look for X" → "look for X") and **peels a TRAILING
+   toggle** ("find X, and turn up the quips" → applies the toggle, searches "find X").
+2. **Intent LLM returned a JSON *array*** — `body=[` (log lines 28/56): gemini-flash-lite intermittently
+   emits `[ {…} ]` despite json_object mode, which the Issue-1 object-slice couldn't parse → silent
+   regex-gate fallback that then literal-searched compounds. `parseLlmJson` (`src/sawa/intent.ts`) is now
+   **array-aware** (narrows to the first JSON value, unwraps an array to its first object); both prompts
+   say "Return a SINGLE JSON object, never an array."
+3. **Ranking ignored recency** — `look for Argentina` surfaced "Argentina vs Austria" (resolves 2026-07-06,
+   vol ≈ 31M) over the imminent "Jordan vs Argentina" (06-27 game, vol ≈ 207k); the pmxt probe confirmed
+   Austria won purely on the volume tiebreak. pmxt exposes **`resolutionDate`**, now read into
+   `VenueResult.closesAt` (Sawa `deadline` too). A shared `compareResults` comparator (`src/search.ts`,
+   injectable clock) ranks **relevance → recency (upcoming-soonest first, undated neutral, already-resolved
+   last) → interest → volume**, used by both `rankAndCap` and `flattenRanked`. Date-less markets are
+   unaffected, so prior behavior/tests are unchanged; Sawa-led topic queries still lead via the Sawa-epsilon
+   bias.
+
+**Deferred (owner docket):** not requiring a `sawa` hail on every follow-up — that is the LOCAL-mode safety
+gate (the bot reads the whole inbox, so it must be addressed each time). **Noted:** pmxt `HTTP 429` under a
+rapid manual burst (entity-decomposition fan-out × many messages) — fail-soft and self-healing in the 60s
+window; not addressed this round.
+
+---
+
 ## 2026-06-25 — Issue 5 shipped as a natural-language AGENT SETTINGS framework (quips + external; extensible)
 
 The last open search-path item (chat-toggleable quips) shipped — **generalized**, per owner direction, into an

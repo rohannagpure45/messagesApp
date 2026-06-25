@@ -34,7 +34,16 @@ interface UnifiedMarket {
   volume?: number | null;
   volume24h?: number | null;
   status?: string | null;
+  /** ISO timestamp when the market resolves — drives the recency ranking signal. */
+  resolutionDate?: string | null;
   outcomes?: UnifiedOutcome[] | null;
+}
+
+/** Parse an ISO date string to epoch ms, or undefined if absent/unparseable. */
+function parseCloseDate(s: string | null | undefined): number | undefined {
+  if (!s) return undefined;
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? undefined : t;
 }
 
 interface MarketsResponse {
@@ -112,6 +121,7 @@ function toVenueResult(m: UnifiedMarket, label: string, relevanceQuery: string):
     top: head ? { label: head.top.label, price: head.top.price } : undefined,
     runnerUp: head?.runnerUp ? { label: head.runnerUp.label, price: head.runnerUp.price } : undefined,
     relevance: scoreRelevance(m.title, relevanceQuery),
+    closesAt: parseCloseDate(m.resolutionDate),
   };
 }
 

@@ -56,6 +56,22 @@ describe("classifySettingCommand", () => {
       expect(classifySettingCommand(m)).toBeNull();
     }
   });
+
+  it("handles the natural phrasings the live test exposed (volume metaphor, filler, word order)", () => {
+    // These all fell through to search/nudge before the recognizer rewrite (log lines 49/51/55/67).
+    for (const m of ["turn up the quips", "use more quips", "turn on quips more", "turn up the quips to do more", "crank up the banter", "more jokes please"]) {
+      expect(classifySettingCommand(m)).toEqual({ key: "quips", on: true });
+    }
+    for (const m of ["turn down the quips", "fewer jokes", "less banter", "tone down the quips"]) {
+      expect(classifySettingCommand(m)).toEqual({ key: "quips", on: false });
+    }
+  });
+
+  it("never swallows an explicit search that mentions a subject (search-guard)", () => {
+    for (const m of ["is there a market on quips", "look for quips comedian", "odds on the jokes", "find me a banter market"]) {
+      expect(classifySettingCommand(m)).toBeNull();
+    }
+  });
 });
 
 describe("peelSettings (compound toggle + remainder — the Issue 5 symptom)", () => {
@@ -90,6 +106,24 @@ describe("peelSettings (compound toggle + remainder — the Issue 5 symptom)", (
     expect(peelSettings("look for player props on Raul Jimenez")).toEqual({
       changes: [],
       rest: "look for player props on Raul Jimenez",
+    });
+  });
+
+  it("strips a leftover leading conjunction from the remainder", () => {
+    expect(peelSettings("quips on, and look for bitcoin")).toEqual({
+      changes: [{ key: "quips", on: true }],
+      rest: "look for bitcoin",
+    });
+  });
+
+  it("peels a TRAILING toggle ('find X, and turn up the quips')", () => {
+    expect(peelSettings("find shark tank and turn up the quips")).toEqual({
+      changes: [{ key: "quips", on: true }],
+      rest: "find shark tank",
+    });
+    expect(peelSettings("look for the world cup, sawa only")).toEqual({
+      changes: [{ key: "external", on: false }],
+      rest: "look for the world cup",
     });
   });
 });

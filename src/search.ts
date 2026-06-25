@@ -59,6 +59,13 @@ function pickSawaOutcomes(outcomes: Outcome[]): { top?: VenueResult["top"]; runn
   };
 }
 
+/** ISO timestamp → epoch ms, or undefined if absent/unparseable. */
+function toEpoch(s?: string): number | undefined {
+  if (!s) return undefined;
+  const t = Date.parse(s);
+  return Number.isNaN(t) ? undefined : t;
+}
+
 function sawaToVenueResult(m: Market, query: string): VenueResult {
   const { top, runnerUp } = pickSawaOutcomes(m.outcomes);
   return {
@@ -70,6 +77,7 @@ function sawaToVenueResult(m: Market, query: string): VenueResult {
     top,
     runnerUp,
     relevance: scoreRelevance(m.title, query),
+    closesAt: toEpoch(m.deadline),
   };
 }
 
@@ -92,6 +100,37 @@ export function interest(r: VenueResult): number {
   return p < NEAR_LOCK ? p : Math.max(0, 1 - p);
 }
 
+/** Injectable clock so the recency ranking is deterministic in tests. */
+let clock: () => number = () => Date.now();
+export function __setClock(fn: () => number): void {
+  clock = fn;
+}
+
+/** Time-to-resolution bucket: 0 = upcoming, 1 = undated (neutral), 2 = already resolved (past). */
+function timeBucket(r: VenueResult, nowMs: number): 0 | 1 | 2 {
+  if (r.closesAt == null) return 1;
+  return r.closesAt < nowMs ? 2 : 0;
+}
+
+/**
+ * The shared cross-venue ranking comparator. Order:
+ *   relevance desc → recency (upcoming-soonest first, undated neutral, already-resolved last)
+ *   → interest desc → 24h volume desc.
+ * Recency sits AHEAD of interest/volume so an entity query ("Argentina") surfaces the NEXT upcoming
+ * market rather than a higher-volume game that already happened — the live-test miss (Austria, a
+ * later/higher-volume game, beat the imminent Jordan match purely on the volume tiebreak). Markets
+ * with no parseable date are unaffected (bucket 1), so existing date-less tests/behavior are unchanged.
+ */
+function compareResults(a: VenueResult, b: VenueResult, nowMs: number): number {
+  if (b.relevance !== a.relevance) return b.relevance - a.relevance;
+  const ba = timeBucket(a, nowMs);
+  const bb = timeBucket(b, nowMs);
+  if (ba !== bb) return ba - bb; // upcoming < undated < resolved
+  if (ba === 0 && a.closesAt !== b.closesAt) return a.closesAt! - b.closesAt!; // both upcoming → soonest first
+  if (interest(b) !== interest(a)) return interest(b) - interest(a);
+  return (b.volume24h ?? 0) - (a.volume24h ?? 0);
+}
+
 /**
  * Relevance margin an external market must beat the best Sawa match by before it is allowed to lead
  * the single conversational answer. Sawa is the only venue users can act on (and the referral/
@@ -111,8 +150,9 @@ const SAWA_LEAD_EPSILON = 0.2;
  * market leads. The remaining markets keep relevance/interest order so paging stays sensible.
  */
 export function flattenRanked(results: SearchResults): VenueResult[] {
-  const ranked = [...results.sawa, ...results.kalshi, ...results.polymarket].sort(
-    (a, b) => b.relevance - a.relevance || interest(b) - interest(a) || (b.volume24h ?? 0) - (a.volume24h ?? 0),
+  const nowMs = clock();
+  const ranked = [...results.sawa, ...results.kalshi, ...results.polymarket].sort((a, b) =>
+    compareResults(a, b, nowMs),
   );
   if (ranked.length === 0) return ranked;
   const lead = pickLead(ranked);
@@ -138,14 +178,12 @@ export function venuesPresent(results: SearchResults): Venue[] {
   return out;
 }
 
-/** Rank by relevance desc, then interest desc, then 24h volume desc; floor + cap. */
+/** Rank by relevance → recency → interest → 24h volume; floor + cap. */
 function rankAndCap(results: VenueResult[]): { rows: VenueResult[]; truncated: boolean } {
+  const nowMs = clock();
   const kept = results
     .filter((r) => r.relevance >= RELEVANCE_MIN)
-    .sort(
-      (a, b) =>
-        b.relevance - a.relevance || interest(b) - interest(a) || (b.volume24h ?? 0) - (a.volume24h ?? 0),
-    );
+    .sort((a, b) => compareResults(a, b, nowMs));
   return { rows: kept.slice(0, PER_SOURCE_CAP), truncated: kept.length > PER_SOURCE_CAP };
 }
 

@@ -27,11 +27,21 @@ per-space values. `/help` advertises the toggles.
 Recognition lives entirely in `settings.ts` and runs in `handleNatural` **before** `parseIntent` — it is
 **not** a new `IntentKind` in `intent.ts` (that path returns a single intent and can't cleanly model the
 compound "toggle + search" case below; keeping it out also leaves the cold/follow-up intent gates
-untouched). `classifySettingCommand(text)` requires **BOTH a setting subject AND an explicit direction
-token** (on/off/enable/disable/…), so an incidental mention (`comedian quips odds`, a bare `kalshi` link
-request) is never mistaken for a toggle. This is **precision over recall**, matching `NEXT_RE`'s philosophy
-in `intent.ts`: a missed toggle just gets rephrased, but a false toggle silently changes behavior. OFF is
-tested before ON because off-cues are the more specific phrasings.
+untouched). `classifySettingCommand(text)` matches on **SUBJECT + DIRECTION, order-independent**: each
+setting declares only its `subject` regex; a shared `TURN_ON` / `TURN_OFF` vocab (on/up/more/enable/crank…
+vs off/down/less/disable/only/no…) supplies the direction, so the volume-metaphor and filler phrasings the
+live test exposed — `turn up the quips`, `use more quips`, `turn on quips more`, `turn up the quips slider`
+— all resolve regardless of word order. Three guards hold **precision over recall** (matching `NEXT_RE`'s
+philosophy: a missed toggle just gets rephrased, a false toggle silently changes behavior):
+
+1. a **subject** must be present (so `world cup` is never a toggle);
+2. a **direction** must be present (so a bare `quips` / `kalshi` stays a topic/link, not a toggle);
+3. a **`SEARCH_GUARD` anchored at the clause start** — a toggle never *opens* with `find` / `look for` /
+   `odds on` / `is there a market`, so those stay searches even when they mention a subject
+   (`is there a market on quips`). Anchoring at the start is also what lets `external markets on` toggle
+   despite containing the substring "markets on".
+
+Plus a short-clause length cap. OFF is tested before ON because off-cues (`only`, `no`) are the decisive ones.
 
 ### 2. Dedicated durable per-space store
 
@@ -61,9 +71,12 @@ head is *not* a settings command — at which point it stops and returns that he
 - `quips on, sawa only, world cup` → both toggles applied, `rest:"world cup"`.
 - `find cap and trade` / `Switzerland, India` → the first head isn't a settings command, so the peel stops
   immediately and the **full** message is returned untouched (a real search is never split).
+- `find shark tank and turn up the quips` → the **trailing** clause is also peeled: `changes:[quips on]`,
+  `rest:"find shark tank"`. (A second pass peels trailing settings clauses after the leading pass.)
 
-`handleNatural` applies the peeled `changes`, sends a confirmation, and — if `rest` is non-empty — continues
-the normal flow (`parseIntent` → search/next/link) on the remainder.
+It also **strips a leftover leading conjunction** from the remainder (`quips on, and look for X` →
+`rest:"look for X"`). `handleNatural` applies the peeled `changes`, sends a confirmation, and — if `rest` is
+non-empty — continues the normal flow (`parseIntent` → search/next/link) on the remainder.
 
 ## Durability — survives restarts (days/weeks)
 
@@ -82,8 +95,9 @@ inject a fake in-memory `SettingsPersistence`, so the unit suite never touches d
 
 ## Adding a new setting
 
-1. Add the key to `SettingKey` and a `SETTINGS` entry (label, on/off regexes, confirmation copy). Keep the
-   recognizer **subject + direction** and the phrasings non-colliding with searches/venue link follow-ups.
+1. Add the key to `SettingKey` and a `SETTINGS` entry (label, **`subject` regex**, confirmation copy) — the
+   shared `TURN_ON`/`TURN_OFF` vocab handles direction, so you only declare what the setting is *about*. Keep
+   the subject non-colliding with searches / venue link follow-ups (a bare venue word stays a link).
 2. Seed its env default where `SpaceSettings` is constructed in `index.ts`.
 3. **Apply** it at the relevant reply site (e.g. `external` gates the pmxt arg to `runSearch`; `quips` sets
    `folkTone` at the `nextTurn` call sites). That's the whole change — the recognizer, peel, persistence,

@@ -187,7 +187,7 @@ const SYSTEM_PROMPT =
   'Examples: "look for player props on Mexico Raul Jimenez" -> {"kind":"search","query":"Raul Jimenez goals"}; ' +
   '"odds on the FIFA World Cup" -> {"kind":"search","query":"FIFA World Cup"}; ' +
   '"hey what is up" -> {"kind":"other","query":""}. ' +
-  'For "other", set "query" to "".';
+  'For "other", set "query" to "". Return a SINGLE JSON object, never an array.';
 
 /**
  * Extended prompt used ONLY for the ambiguous-with-active-market case: the assistant just showed a
@@ -200,7 +200,7 @@ const FOLLOWUP_SYSTEM_PROMPT =
   '"link" = the user wants the link/URL for a market; if they name a venue put it in "venue", else "". ' +
   '"search" = the user asks about a NEW topic; put the clean topic (no filler) in "query". ' +
   '"other" = greeting, small talk, account/help, or a request to CREATE a market. ' +
-  'Set every unused field to "".';
+  'Set every unused field to "". Return a SINGLE JSON object, never an array.';
 
 /** A one-line context summary fed to the LLM alongside the follow-up prompt (not a raw transcript). */
 function contextDigest(ctx: FollowupContext): string {
@@ -215,19 +215,32 @@ interface RawLlm {
 }
 
 /**
- * Pull the JSON object out of an LLM completion body that may be wrapped in ```code fences``` or
- * padded with stray prose. Strips a leading/trailing fence, then narrows to the first `{`…last `}`.
- * Falls back to the trimmed input when no braces are found, so a clean body parses unchanged. The
- * caller still guards `JSON.parse` — this only widens what parses, it never throws.
+ * Parse an LLM completion body into the intent object. Tolerates: ```code fences```, leading/trailing
+ * prose, AND — critically — an ARRAY wrapper. gemini-flash-lite intermittently returns `[ {…} ]` (or
+ * several objects on multiple lines) despite json_object mode, which broke a plain first-`{`…last-`}`
+ * slice ("Unexpected non-whitespace character after JSON"). We narrow to the first JSON value (object
+ * or array) and, for an array, take its first object. Throws on unrecoverable input — the caller
+ * catches it and falls back to the regex gate.
  */
-function extractJsonObject(content: string): string {
+function parseLlmJson(content: string): RawLlm {
   let s = content.trim();
   if (s.startsWith("```")) {
     s = s.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
   }
-  const first = s.indexOf("{");
-  const last = s.lastIndexOf("}");
-  return first !== -1 && last > first ? s.slice(first, last + 1) : s;
+  const objAt = s.indexOf("{");
+  const arrAt = s.indexOf("[");
+  let slice: string;
+  if (arrAt !== -1 && (objAt === -1 || arrAt < objAt)) {
+    slice = s.slice(arrAt, s.lastIndexOf("]") + 1); // array-wrapped: [ {…}, … ]
+  } else if (objAt !== -1) {
+    slice = s.slice(objAt, s.lastIndexOf("}") + 1); // object, possibly prose-padded
+  } else {
+    slice = s;
+  }
+  const parsed = JSON.parse(slice) as unknown;
+  const obj = Array.isArray(parsed) ? parsed[0] : parsed;
+  if (!obj || typeof obj !== "object") throw new Error("LLM JSON was not an object");
+  return obj as RawLlm;
 }
 
 /** Clamp an arbitrary LLM venue string to a known Venue, or undefined. */
@@ -299,7 +312,7 @@ async function classifyWithLlm(text: string, cfg: IntentConfig, ctx?: FollowupCo
     if (!content) return null;
     let parsed: RawLlm;
     try {
-      parsed = JSON.parse(extractJsonObject(content)) as RawLlm;
+      parsed = parseLlmJson(content);
     } catch (parseErr) {
       // Keep the raw body (truncated) so a future regression is diagnosable, then fall back.
       console.warn(

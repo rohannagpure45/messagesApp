@@ -230,6 +230,18 @@ describe("classifyWithLlm JSON robustness (Issue 1)", () => {
     expect(intent).toMatchObject({ kind: "other", via: "llm" });
   });
 
+  it("unwraps an array-wrapped object (gemini returns [ {…} ] despite json_object mode)", async () => {
+    __setClient(stubClient('[{"kind":"search","query":"Argentina"}]'));
+    const intent = await parseIntent("sawa thoughts on argentina", BOT, cfg);
+    expect(intent).toMatchObject({ kind: "search", query: "Argentina", via: "llm" });
+  });
+
+  it("unwraps a multi-line array (the live failure: body started with '[')", async () => {
+    __setClient(stubClient('[\n  {"kind": "search", "query": "World Cup"},\n  {"kind": "other"}\n]'));
+    const intent = await parseIntent("sawa hmm the cup", BOT, cfg);
+    expect(intent).toMatchObject({ kind: "search", query: "World Cup", via: "llm" });
+  });
+
   it("falls back to the regex gate (never throws) on a truncated/unparseable body", async () => {
     __setClient(stubClient('{"kind":"search","query":"World C')); // cut off mid-string
     const intent = await parseIntent("sawa some ambiguous thing", BOT, cfg);
