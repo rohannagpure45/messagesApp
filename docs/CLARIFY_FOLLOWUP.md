@@ -135,3 +135,57 @@ A 4-lens review (correctness / safety / Spectrum-API / edge-quality), each findi
 (`QUERY_ROLE_WORDS`) · `src/search.ts` (`SAWA_MIN_LEAD_RELEVANCE`) · `src/routing.ts`
 (`actionableWhenRelaxed`) · `src/index.ts` (`runConversationalSearch`, `sendClarify`, `handlePollVote`,
 the loop's `relaxed`). Spectrum poll facts: [`SPECTRUM_INTEGRATION.md`](SPECTRUM_INTEGRATION.md) §4.
+
+---
+
+# v2 — conversational rearrange (the first live group test)
+
+The first live LOCAL-mode **group** test (owner + a second member) surfaced five gaps: the clarify
+showed a **numbered list, not buttons**; some group members' handles arrived **empty** (`from=`) so
+follow-ups felt clunky; **"what game is that for"** was mis-routed into a pmxt search; a "Lionel messi"
+clarify offered **off-topic noise** ("Trump praise Messi"); and a **BTC 15-minute** market wasn't
+surfaced. Owner decisions: keep the text list in local (buttons need a cloud/dedicated line — a
+platform limit), and rearrange the flow so the LLM owns more of each turn and follow-ups key off the
+**hailing sender**. `npm test` **196** green; typecheck clean. Built behind the baseline commit so it's
+revertable.
+
+**1. Per-sender sessions.** Conversation memory is keyed by `sessionKey(spaceId, senderId)` (was
+per-space). Once a sender hails, **their** follow-ups + answers flow hail-free for the TTL; each member
+keeps their own thread; one member's hail doesn't relax the space. Settings stay per-space.
+
+**2. The `answer` action.** A new `IntentKind` `"answer"`: a question ABOUT the shown market ("what game
+is that for", "what are the odds", "is that real money") gets a **grounded one-line reply** the LLM
+writes from `cards.marketFacts` (title, headline odds, venue, money type, resolve date, link
+availability) — instead of being mis-searched. Fail-soft to the regex gate. `marketFacts` **sanitizes**
+the user-authored title before it enters the LLM context (prompt-injection defense).
+
+**3. Cleaner clarify options.** `refineClarify`'s LLM contract is now `{ambiguous, options:[{n,label}]}`:
+it **drops off-topic candidates** ("Trump praise Messi") and keeps the relevant ≤4. When it narrows to
+exactly **one** relevant market, the caller shows THAT market (`conversation.pickedAnswer`) — never
+`candidates[0]`, which could be the noise the filter just rejected.
+
+**4. Sharper search.** The cold extraction prompt **drops a trailing timeframe** ("bitcoin 15 minutes" →
+searches "bitcoin"), so the market family — incl. the 15-minute market — surfaces as a clarify option
+instead of being dropped below the relevance floor. (Exact-qualifier matching is still bounded by pmxt's
+index coverage.)
+
+## v2 safety (adversarial-review-hardened, 2nd round)
+
+A second 3-lens review confirmed 15 findings; the load-bearing fixes:
+
+- **Unknown-handle senders are NEVER relaxed.** In local groups chat.db doesn't resolve every member, so
+  they collapse to one per-space bucket; relaxing them would let an unhailed bystander ride another's
+  session. They must hail each message (safe; no hail-free follow-ups for unresolved members).
+- **Poll path now has the `pendingBy === senderId` guard** (symmetric with the text path).
+- **`refineClarify` narrowing to <2 no longer shows the rejected noise** — it returns a 1-option question
+  and the caller renders that market via `pickedAnswer`; `null` (→ top candidate) only when the model
+  keeps nothing.
+- **`marketFacts` sanitizes** user-authored titles/labels before the LLM context.
+- Stale per-space docs/tests (the `ConversationStore` contract) updated to per-sender.
+
+## Honest constraint — poll *buttons*
+
+Native iMessage Poll **buttons** render only on a **cloud or dedicated** line; LOCAL mode (the free
+group path) is text-only, so it shows the numbered list. The code already sends a real `poll()` where
+the platform supports it (`pollCapable`). Getting buttons **and** reliable groups together needs a
+dedicated Business line — deferred (owner decision).

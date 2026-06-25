@@ -1,5 +1,5 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { ConversationStore, toContext, nextTurn, clarifyState, resolveClarifyTurn, __setClock } from "../src/sawa/conversation";
+import { ConversationStore, toContext, nextTurn, clarifyState, resolveClarifyTurn, pickedAnswer, __setClock } from "../src/sawa/conversation";
 import type { ClarifyQuestion } from "../src/sawa/clarify";
 import type { ConversationState } from "../src/sawa/conversation";
 import type { Intent } from "../src/sawa/intent";
@@ -93,12 +93,17 @@ describe("ConversationStore", () => {
     expect(store.get("a")).toBeUndefined();
   });
 
-  it("shares one thread's state across senders (keyed by space, not sender)", () => {
+  it("isolates state by the opaque key — per-sender keys in one space stay distinct", () => {
+    // index.ts keys this PER (space, sender) via sessionKey(), so members don't share a cursor.
     __setClock(() => 0);
     const store = new ConversationStore();
-    const s = state();
-    store.set("group-1", s);
-    expect(store.get("group-1")).toBe(s); // any member reading the same space sees the same cursor
+    const a = state({ query: "alice topic" });
+    const b = state({ query: "bob topic" });
+    store.set("group-1 +alice", a);
+    store.set("group-1 +bob", b);
+    expect(store.get("group-1 +alice")).toBe(a); // each member's thread is independent
+    expect(store.get("group-1 +bob")).toBe(b);
+    expect(store.get("group-1")).toBeUndefined(); // a bare space id is not a per-sender session key
   });
 });
 
@@ -108,13 +113,16 @@ describe("toContext", () => {
     expect(toContext(state({ candidates: [] })).hasActiveMarket).toBe(false);
   });
 
-  it("summarizes the currently-shown market for the parser", () => {
-    expect(toContext(state({ cursor: 1 }))).toMatchObject({
+  it("summarizes the currently-shown market for the parser, incl. facts for the answer action", () => {
+    const ctx = toContext(state({ cursor: 1 }));
+    expect(ctx).toMatchObject({
       hasActiveMarket: true,
       query: "world cup",
       currentVenue: "kalshi",
       venuesPresent: ["sawa", "kalshi"],
     });
+    expect(ctx.currentMarketFacts).toContain("World Cup - Brazil?"); // the kalshiRow title, for grounding
+    expect(ctx.currentMarketFacts).toContain("venue Kalshi");
   });
 });
 
@@ -211,5 +219,14 @@ describe("clarify turns", () => {
     const out = resolveClarifyTurn(stale, question.options[0]!); // option.result is NOT in `stale.candidates`
     expect(out.body).toContain("Bitcoin dominance above 60%"); // the tapped market, not candidates[0]
     expect(out.body).not.toContain("Some other market");
+  });
+
+  it("pickedAnswer shows the LLM-chosen market (not candidates[0]) and points the cursor at it", () => {
+    // The filter narrowed to the Kalshi market; candidates[0] is the Sawa one. Show the chosen.
+    const out = pickedAnswer("bitcoin", candidates, results({ sawa: [candidates[0]!], kalshi: [candidates[1]!] }), candidates[1]!);
+    expect(out.body).toContain("Bitcoin price on Dec 31");
+    expect(out.body).not.toContain("Bitcoin dominance"); // candidates[0] was NOT shown
+    expect(out.newState.cursor).toBe(1);
+    expect(out.newState.pending).toBeUndefined();
   });
 });

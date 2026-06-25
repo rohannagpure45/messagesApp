@@ -22,7 +22,8 @@ function escapeRegex(s: string): string {
  * clarify answer is resolved by the caller BEFORE this gate, so it is unaffected.
  */
 export function actionableWhenRelaxed(intent: Intent): boolean {
-  if (intent.kind === "next" || intent.kind === "link") return true;
+  // `answer` = a grounded question about the shown market — a natural in-thread follow-up.
+  if (intent.kind === "next" || intent.kind === "link" || intent.kind === "answer") return true;
   if (intent.kind === "search") return intent.via === "regex";
   return false;
 }

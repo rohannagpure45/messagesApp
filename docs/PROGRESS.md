@@ -5,6 +5,30 @@ status lives in [`../AGENTS.md`](../AGENTS.md); the phased plan in [`BUILD_PLAN.
 
 ---
 
+## 2026-06-25 — conversational rearrange (first live group test)
+
+The first live LOCAL-mode GROUP test surfaced five gaps; the owner asked to rearrange the flow so the LLM
+owns more of each turn and follow-ups key off the hailing SENDER (full spec
+[`CLARIFY_FOLLOWUP.md`](CLARIFY_FOLLOWUP.md) §v2). Baseline committed first as a revert point. `npm test`
+**196**; typecheck clean. Built + hardened across two adversarial review rounds (11 then 15 findings).
+
+1. **Per-sender sessions** — conversation memory keyed by `sessionKey(spaceId, senderId)` (was per-space):
+   the hailing sender's follow-ups/answers flow hail-free; each member keeps their own thread; settings
+   stay per-space. UNKNOWN-handle senders (local groups where chat.db doesn't resolve a member) are never
+   relaxed (they'd share a bucket) — they re-hail each message.
+2. **`answer` action** — a question about the shown market ("what game is that for") gets a grounded
+   one-line LLM reply from `cards.marketFacts`, instead of being mis-searched. `marketFacts` sanitizes the
+   user-authored title (prompt-injection defense).
+3. **Cleaner clarify** — `refineClarify` now drops off-topic options ("Trump praise Messi" for "Lionel
+   messi"); narrowing to one relevant market shows THAT market (`pickedAnswer`), never `candidates[0]`.
+4. **Sharper search** — the cold prompt drops a trailing timeframe ("bitcoin 15 minutes" → "bitcoin") so
+   the market family surfaces as a clarify option (still bounded by pmxt index coverage).
+
+**Honest constraint:** native poll BUTTONS render only on a cloud/dedicated line; LOCAL mode shows the
+numbered text list. The code already sends a real poll where supported (`pollCapable`).
+
+---
+
 ## 2026-06-25 — clarifying questions (ask-don't-guess) + hail-free follow-ups
 
 From the first live iMessage DM session (the user bringing the bot up): four problems — (1) "find me a

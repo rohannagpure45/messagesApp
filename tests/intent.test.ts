@@ -218,6 +218,20 @@ describe("parseIntent with active-market context", () => {
     const intent = await parseIntent("find nba finals", BOT, cfg, activeCtx);
     expect(intent).toMatchObject({ kind: "search", query: "nba finals", via: "regex" });
   });
+
+  it("ANSWERS a question about the shown market via the LLM instead of searching it", async () => {
+    __setClient(stubClient('{"kind":"answer","reply":"That\'s the Lionel Messi 1+ goals prop on Kalshi.","query":"","venue":""}'));
+    const intent = await parseIntent("what game is that for", BOT, cfg, activeCtx);
+    expect(intent.kind).toBe("answer");
+    expect(intent.reply).toContain("Messi");
+    expect(intent.via).toBe("llm");
+  });
+
+  it("falls back to the gate (not an 'answer') when the LLM answer has no usable reply", async () => {
+    __setClient(stubClient('{"kind":"answer","reply":""}'));
+    const intent = await parseIntent("what game is that for", BOT, cfg, activeCtx);
+    expect(intent.kind).not.toBe("answer"); // empty reply → null → keep the regex gate's guess
+  });
 });
 
 describe("classifyWithLlm JSON robustness (Issue 1)", () => {
@@ -266,46 +280,66 @@ describe("classifyWithLlm JSON robustness (Issue 1)", () => {
   });
 });
 
-describe("refineClarify (LLM relabel / veto, fail-soft)", () => {
+describe("refineClarify (LLM drop-noise / relabel / veto, fail-soft)", () => {
   const row = (title: string): VenueResult => ({
     venue: "kalshi", sourceLabel: "Kalshi", realMoney: true, title, url: "https://k/x",
     top: { label: "Yes", price: 0.5 }, relevance: 1,
   });
+  // 3 candidates, #2 is off-topic noise (the "Lionel messi" → "Trump praise Messi" case).
   const question: ClarifyQuestion = {
-    question: 'Which "world cup" market did you mean?',
+    question: 'Which "Lionel messi" market did you mean?',
     options: [
-      { label: "Will Brazil win the World Cup?", result: row("Will Brazil win the World Cup?") },
-      { label: "Will France win the World Cup?", result: row("Will France win the World Cup?") },
+      { label: "Lionel Messi to score or assist", result: row("Lionel Messi to score or assist") },
+      { label: "Trump praise Messi", result: row("Trump praise Messi") },
+      { label: "Lionel Messi 1+ goals", result: row("Lionel Messi 1+ goals") },
     ],
   };
 
   it("VETOES when the model says these are one market's outcomes (→ answer directly)", async () => {
     __setClient(stubClient('{"ambiguous":false}'));
-    expect(await refineClarify("world cup", question, cfg)).toBeNull();
+    expect(await refineClarify("Lionel messi", question, cfg)).toBeNull();
   });
 
-  it("relabels the options in order when the model confirms ambiguity", async () => {
-    __setClient(stubClient('{"ambiguous":true,"labels":["Brazil to win","France to win"]}'));
-    const out = await refineClarify("world cup", question, cfg);
-    expect(out!.options.map((o) => o.label)).toEqual(["Brazil to win", "France to win"]);
-    expect(out!.options[0]!.result.title).toBe("Will Brazil win the World Cup?"); // result mapping preserved
+  it("keeps only the relevant options the model returns, relabeled, dropping off-topic noise", async () => {
+    // Model keeps #1 and #3 (drops #2 "Trump praise Messi"), with clean labels.
+    __setClient(stubClient('{"ambiguous":true,"options":[{"n":1,"label":"Score or assist"},{"n":3,"label":"Score 1+ goals"}]}'));
+    const out = await refineClarify("Lionel messi", question, cfg);
+    expect(out!.options.map((o) => o.label)).toEqual(["Score or assist", "Score 1+ goals"]);
+    expect(out!.options.map((o) => o.result.title)).toEqual([
+      "Lionel Messi to score or assist",
+      "Lionel Messi 1+ goals",
+    ]); // result mapping preserved; noise dropped
   });
 
-  it("keeps the deterministic question on a label-count mismatch", async () => {
-    __setClient(stubClient('{"ambiguous":true,"labels":["only one"]}'));
-    const out = await refineClarify("world cup", question, cfg);
-    expect(out!.options.map((o) => o.label)).toEqual(question.options.map((o) => o.label));
+  it("returns a SINGLE-option question when the filter narrows to one relevant market", async () => {
+    // Caller shows that one market directly (not candidates[0], which may be the rejected noise).
+    __setClient(stubClient('{"ambiguous":true,"options":[{"n":3,"label":"Score 1+ goals"}]}'));
+    const out = await refineClarify("Lionel messi", question, cfg);
+    expect(out!.options).toHaveLength(1);
+    expect(out!.options[0]!.result.title).toBe("Lionel Messi 1+ goals");
+  });
+
+  it("ignores out-of-range option numbers (never fabricates a market)", async () => {
+    __setClient(stubClient('{"ambiguous":true,"options":[{"n":1,"label":"a"},{"n":9,"label":"b"}]}'));
+    const out = await refineClarify("Lionel messi", question, cfg);
+    expect(out!.options).toHaveLength(1); // n=1 kept; n=9 dropped (never fabricated)
+    expect(out!.options[0]!.result.title).toBe("Lionel Messi to score or assist");
+  });
+
+  it("answers directly (null) only when the model keeps NO valid options", async () => {
+    __setClient(stubClient('{"ambiguous":true,"options":[{"n":9,"label":"x"}]}')); // all out of range
+    expect(await refineClarify("Lionel messi", question, cfg)).toBeNull();
   });
 
   it("is fail-soft: an unparseable body keeps the deterministic question (we still ask)", async () => {
     __setClient(stubClient("not json at all"));
-    expect(await refineClarify("world cup", question, cfg)).toBe(question);
+    expect(await refineClarify("Lionel messi", question, cfg)).toBe(question);
   });
 
   it("is fail-soft: a thrown LLM error keeps the deterministic question", async () => {
     __setClient(stubClient(() => {
       throw new Error("network down");
     }));
-    expect(await refineClarify("world cup", question, cfg)).toBe(question);
+    expect(await refineClarify("Lionel messi", question, cfg)).toBe(question);
   });
 });

@@ -34,7 +34,7 @@ import { RecentBuffer, suggestPayload } from "./sawa/suggest";
 import { parseIntent, stripAddress, refineClarify } from "./sawa/intent";
 import { runSearch, flattenRanked } from "./search";
 import { toPlainText } from "./sawa/cards";
-import { ConversationStore, toContext, nextTurn, clarifyState, resolveClarifyTurn } from "./sawa/conversation";
+import { ConversationStore, toContext, nextTurn, clarifyState, resolveClarifyTurn, pickedAnswer } from "./sawa/conversation";
 import { decideClarify, resolveAnswer, renderClarifyText, type ClarifyQuestion } from "./sawa/clarify";
 import {
   SpaceSettings,
@@ -159,7 +159,8 @@ const app = cloudImessage
 const recent = new RecentBuffer(20);
 const seen = new SeenSet(1000);
 // Per-conversation memory for the folk-style flow: the last search's ranked candidates + a cursor, so
-// follow-ups ("not that" / "send the kalshi link") resolve without re-searching. Keyed by Space.id.
+// follow-ups ("not that" / "send the kalshi link") resolve without re-searching. Keyed PER (space,
+// sender) via sessionKey() — each member keeps their own thread; one member's hail doesn't relax others.
 const convo = new ConversationStore();
 // SAWA_FOLK_TONE=1 appends a brief editorial flourish to the conversational reply (off by default;
 // factual otherwise). See cards.folkQuip — deliberately mild + category-blind for brand safety.
@@ -235,6 +236,17 @@ async function sendClarify(space: Space, question: ClarifyQuestion, platform: st
 }
 
 /**
+ * Conversation-memory key — per (space, SENDER) so the HAILING sender's follow-ups flow without a
+ * re-hail and each person keeps their own thread (settings stay per-space). When the handle is unknown
+ * (local-mode groups where chat.db doesn't resolve every member's handle, reported as "unknown") all
+ * such messages share one per-space bucket — the best we can do without a handle. space-joined so it
+ * can't collide with a raw space id.
+ */
+function sessionKey(spaceId: string, senderId: string): string {
+  return senderId && senderId !== "unknown" ? `${spaceId} ${senderId}` : spaceId;
+}
+
+/**
  * Run a fresh cross-venue search. When several DISTINCT markets match one topic (e.g. "bitcoin"), ASK
  * which one (a poll / numbered list) instead of guessing; otherwise reply with the single best market.
  * Either way the thread state is stored so follow-ups ("not that" / "send the link") resolve.
@@ -247,27 +259,36 @@ async function runConversationalSearch(
   senderId: string,
 ): Promise<void> {
   if (!config) return void (await guard("config notice", () => space.send(needsConfig())));
+  const sKey = sessionKey(spaceId, senderId);
   // Resolve agent settings for this space: "sawa only" drops external enrichment; "quips" sets the tone.
   const pmxt = settings.get(spaceId, "external") ? pmxtConfig : null;
   const folkTone = settings.get(spaceId, "quips");
   const results = await runSearch(query, { config, pmxt });
   const candidates = results.empty ? [] : flattenRanked(results);
 
-  // Ambiguous topic → ask which market. Deterministic decision; the LLM may relabel/veto if configured.
+  // Ambiguous topic → ask which market. Deterministic decision; the LLM may drop noise / narrow / veto.
   if (candidates.length > 0) {
     let question = decideClarify(candidates, query);
     if (question && intentConfig) question = await refineClarify(query, question, intentConfig);
-    if (question) {
+    if (question && question.options.length >= 2) {
       // Bind the pending question to the asker so only THEY can answer it with unhailed text.
-      convo.set(spaceId, clarifyState(query, candidates, results, question, senderId));
+      convo.set(sKey, clarifyState(query, candidates, results, question, senderId));
       await sendClarify(space, question, platform);
+      return;
+    }
+    if (question && question.options.length === 1) {
+      // The LLM filtered down to ONE relevant market → show THAT one (not candidates[0], which may be
+      // the off-topic noise the filter just rejected).
+      const outcome = pickedAnswer(query, candidates, results, question.options[0]!.result, { folkTone });
+      convo.set(sKey, outcome.newState);
+      await sendBody(space, outcome.body);
       return;
     }
   }
 
   // Single best answer (the folk-style one-liner) or the graceful empty-state — via the pure reducer.
   const outcome = nextTurn(null, { kind: "search", query, via: "regex" }, results, { folkTone });
-  convo.set(spaceId, outcome.newState);
+  convo.set(sKey, outcome.newState);
   await sendBody(space, outcome.body);
 }
 
@@ -329,7 +350,8 @@ async function handleNatural(
   senderId: string,
 ): Promise<void> {
   const spaceId = space.id;
-  let state = convo.get(spaceId) ?? null;
+  const sKey = sessionKey(spaceId, senderId);
+  let state = convo.get(sKey) ?? null;
   const addressed = stripAddress(body, botName);
 
   // A pending clarify ("which market?") answer on the TEXT path (poll taps resolve in the loop). Bound
@@ -339,13 +361,13 @@ async function handleNatural(
     const opt = resolveAnswer(state.pending, addressed);
     if (opt) {
       const outcome = resolveClarifyTurn(state, opt, { folkTone: settings.get(spaceId, "quips") });
-      convo.set(spaceId, outcome.newState);
+      convo.set(sKey, outcome.newState);
       await sendBody(space, outcome.body);
       return;
     }
     // The asker said something that isn't an answer → drop the pending and treat it as a fresh intent.
     state = { ...state, pending: undefined, pendingBy: undefined };
-    convo.set(spaceId, state);
+    convo.set(sKey, state);
   }
 
   // Agent settings ("quips off", "sawa only", "settings") — resolved BEFORE search so a toggle phrase
@@ -374,9 +396,16 @@ async function handleNatural(
     await runConversationalSearch(space, spaceId, intent.query, platform, senderId);
     return;
   }
+  if (intent.kind === "answer" && intent.reply) {
+    // The LLM answered a question about the shown market from facts — no search, no state change.
+    // Re-persist (unchanged) so the session TTL refreshes while the user is in a Q&A about it.
+    if (state) convo.set(sKey, state);
+    await sendBody(space, intent.reply);
+    return;
+  }
   if (intent.kind === "next" || intent.kind === "link") {
     const outcome = nextTurn(state, intent, null, { folkTone: settings.get(spaceId, "quips") });
-    convo.set(spaceId, outcome.newState);
+    convo.set(sKey, outcome.newState);
     await sendBody(space, outcome.body);
     return;
   }
@@ -394,12 +423,11 @@ function normTitle(s: string): string {
 }
 
 /**
- * A native poll vote (`poll_option`) — the answer to a clarifying "which market?" poll. Correlate to
- * the space's `pending` question by TITLE (no poll id is delivered inbound — see SPECTRUM_INTEGRATION
- * §4) and resolve the tapped option to a market. A poll tap needs NO "sawa" hail and is NOT bound to
- * the asker the way a text answer is: it's a deliberate, visible tap on OUR own poll bubble, so any
- * participant tapping it is unambiguously addressing the bot. Polls also never reach LOCAL mode (the
- * whole-inbox path), so the relaxed-text safety concern doesn't apply. Idempotent on the vote id.
+ * A native poll vote (`poll_option`) — the answer to a clarifying "which market?" poll. It needs NO
+ * "sawa" hail (a deliberate tap on OUR poll bubble), and resolves against the VOTER's OWN session: the
+ * pending question lives in the asker's per-sender session, so a tap only resolves the tapper's own
+ * question (consistent with the text path). Correlated by TITLE (no poll id is delivered inbound — see
+ * SPECTRUM_INTEGRATION §4) and idempotent on the vote id. Polls never reach LOCAL mode anyway.
  *
  * Known edge (title-only correlation): if the SAME query is re-asked before this vote lands, both polls
  * share a title but the new `pending` has different options — a stale tap then fails `resolveAnswer` and
@@ -411,14 +439,17 @@ async function handlePollVote(space: Space, message: Message): Promise<void> {
   if (!message.content.selected) return; // act on a selection, not a deselect
   if (isFromSelf(message)) return;
   const spaceId = space.id;
-  const state = convo.get(spaceId);
+  const senderId = normalizeHandle(message.sender?.id || "unknown");
+  const sKey = sessionKey(spaceId, senderId);
+  const state = convo.get(sKey);
   if (!state?.pending) return;
+  if (state.pendingBy !== senderId) return; // only the asker resolves their own poll (symmetric w/ text)
   if (normTitle(message.content.poll.title) !== normTitle(state.pending.question)) return; // not our poll
   if (seen.seen(message.id)) return; // at-least-once delivery → never resolve the same vote twice
   const opt = resolveAnswer(state.pending, message.content.option.title);
   if (!opt) return;
   const outcome = resolveClarifyTurn(state, opt, { folkTone: settings.get(spaceId, "quips") });
-  convo.set(spaceId, outcome.newState);
+  convo.set(sKey, outcome.newState);
   await sendBody(space, outcome.body);
 }
 
@@ -496,7 +527,9 @@ for await (const [space, message] of app.messages) {
 
   const body = message.content.text.trim();
   if (!body) continue;
-  const senderId = normalizeHandle(message.sender?.id ?? "unknown");
+  // `||` (not `??`) so an EMPTY handle — local-mode groups don't resolve every member's chat.db handle —
+  // collapses to "unknown" and keys consistently (see sessionKey), rather than forking "" vs undefined.
+  const senderId = normalizeHandle(message.sender?.id || "unknown");
   const isSlash = body.startsWith("/");
   const isGroup = isGroupSpace(space, message);
 
@@ -508,11 +541,15 @@ for await (const [space, message] of app.messages) {
   // In local mode the bot reads the Mac's whole inbox, so require an explicit "sawa …" hail everywhere
   // (treat like a group) — otherwise it would auto-reply to every DM this Apple ID receives.
   const hailed = shouldHandle({ isGroup: isGroup || localImessage, isSlash, body, botName });
-  // Relaxed follow-up: a non-hailed message is still handled WHEN there's an active thread in this space
-  // (within TTL) — so a poll/clarify answer ("2"), "send the kalshi link", or "find a market on X" work
-  // without re-hailing. handleNatural gates it to thread follow-ups + explicit searches and stays silent
-  // otherwise, so overheard inbox chatter never gets a reply.
-  const relaxed = !hailed && convo.get(space.id) !== undefined;
+  // Relaxed follow-up: a non-hailed message is still handled WHEN the SENDER has an active session in
+  // this space (within TTL) — so THEIR poll/clarify answer ("2"), "send the kalshi link", a question
+  // about the shown market, or "find a market on X" work without re-hailing. Keyed by (space, sender),
+  // so one member hailing does NOT relax the whole space. handleNatural still gates it to follow-ups +
+  // explicit searches, staying silent on overheard chatter.
+  // UNKNOWN-handle senders (local-mode groups where chat.db doesn't resolve a member) are NEVER relaxed:
+  // they'd share one per-space bucket, so an unhailed bystander could ride another's session. They must
+  // hail each message — safe, at the cost of no hail-free follow-ups for unresolved members.
+  const relaxed = !hailed && senderId !== "unknown" && convo.get(sessionKey(space.id, senderId)) !== undefined;
   if (!hailed && !relaxed) {
     // Bystander chatter (not addressed, no active thread) — feed the buffer for future suggestions, no reply.
     console.warn(

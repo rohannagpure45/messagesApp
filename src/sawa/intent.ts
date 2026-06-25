@@ -15,7 +15,7 @@
 import OpenAI from "openai";
 import type { IntentConfig } from "./config";
 import type { Venue } from "../venue";
-import type { ClarifyQuestion } from "./clarify";
+import type { ClarifyQuestion, ClarifyOption } from "./clarify";
 
 /**
  * `search` (new topic) and `other` (greeting/create/account/help) are the cold-start kinds. `next`
@@ -23,7 +23,7 @@ import type { ClarifyQuestion } from "./clarify";
  *   - `next`  — "not that" / "another" / "more": page to the next-best candidate.
  *   - `link`  — "send the kalshi link" / bare "kalshi": surface a market's link (venue-scoped or current).
  */
-export type IntentKind = "search" | "next" | "link" | "other";
+export type IntentKind = "search" | "next" | "link" | "answer" | "other";
 
 export interface Intent {
   kind: IntentKind;
@@ -31,6 +31,12 @@ export interface Intent {
   query?: string;
   /** Which venue a `link` follow-up targets (undefined = the currently-shown market / generic). */
   venue?: Venue;
+  /**
+   * A short, grounded reply the LLM wrote for `answer` — the user asked a QUESTION about the
+   * currently-shown market ("what game is that for", "what are the odds", "is that real money") and
+   * the model answered from the market facts instead of triggering a fresh search.
+   */
+  reply?: string;
   /** Which stage decided this — useful for analytics/debugging. */
   via: "regex" | "llm" | "fallback";
 }
@@ -49,6 +55,12 @@ export interface FollowupContext {
   currentVenue?: Venue;
   /** Which venues returned a market this search — so a "kalshi link" with no Kalshi match degrades gracefully. */
   venuesPresent: Venue[];
+  /**
+   * A one-line factual digest of the currently-shown market (title, headline odds, venue, money type,
+   * resolve date, link availability) — the grounding the LLM uses to ANSWER a question about it
+   * ("what game is that for") instead of mis-searching the question. Built by `conversation.toContext`.
+   */
+  currentMarketFacts?: string;
 }
 
 const MAX_QUERY_LEN = 120;
@@ -197,8 +209,12 @@ const SYSTEM_PROMPT =
   "team, player, event, or asset the market is about. Strip filler and role words: " +
   '"sawa", "find", "look for", "where can I bet on", "odds on", "markets for", "player props on", ' +
   '"lines for", surrounding team-context words, and trailing punctuation. ' +
+  "DROP a trailing TIMEFRAME qualifier (e.g. \"15 minutes\", \"this week\", \"today\", \"end of year\") and " +
+  "keep just the core asset/entity — the search surfaces the whole family of that market and the user " +
+  "picks the specific one next. " +
   'Examples: "look for player props on Mexico Raul Jimenez" -> {"kind":"search","query":"Raul Jimenez goals"}; ' +
   '"odds on the FIFA World Cup" -> {"kind":"search","query":"FIFA World Cup"}; ' +
+  '"bitcoin 15 minutes" -> {"kind":"search","query":"bitcoin"}; ' +
   '"hey what is up" -> {"kind":"other","query":""}. ' +
   'For "other", set "query" to "". Return a SINGLE JSON object, never an array.';
 
@@ -207,24 +223,30 @@ const SYSTEM_PROMPT =
  * market, so the same message could be a follow-up (next/link) or a brand-new search.
  */
 const FOLLOWUP_SYSTEM_PROMPT =
-  "You classify ONE chat message to a prediction-market assistant that just showed the user a market. " +
-  'Return ONLY JSON: {"kind":"search"|"next"|"link"|"other","query":string,"venue":"sawa"|"kalshi"|"polymarket"|""}. ' +
+  "You handle ONE chat message to a prediction-market assistant that just showed the user a market. " +
+  'Return ONLY JSON: {"kind":"search"|"next"|"link"|"answer"|"other","query":string,"venue":"sawa"|"kalshi"|"polymarket"|"","reply":string}. ' +
   '"next" = the user rejects the shown market or wants a different/next one ("not that","another","more"). ' +
   '"link" = the user wants the link/URL for a market; if they name a venue put it in "venue", else "". ' +
-  '"search" = the user asks about a NEW topic; put the clean topic (no filler) in "query". ' +
+  '"answer" = the user asks a QUESTION about the CURRENTLY-SHOWN market (what game/match/event it is, ' +
+  'what the odds/price/return are, when it resolves, whether it is real money) — write a SHORT (1 sentence) ' +
+  'reply in "reply" using ONLY the facts in the context line; if a fact is not given, say you don\'t have it ' +
+  '(do NOT invent fixtures, odds, or links). ' +
+  '"search" = the user asks about a genuinely NEW topic; put the clean topic (no filler) in "query". ' +
   '"other" = greeting, small talk, account/help, or a request to CREATE a market. ' +
   'Set every unused field to "". Return a SINGLE JSON object, never an array.';
 
 /** A one-line context summary fed to the LLM alongside the follow-up prompt (not a raw transcript). */
 function contextDigest(ctx: FollowupContext): string {
   const venues = ctx.venuesPresent.length ? ctx.venuesPresent.join(", ") : "none";
-  return `Context: currently showing a ${ctx.currentVenue ?? "?"} market for "${ctx.query ?? ""}". Venues with a match: ${venues}.`;
+  const facts = ctx.currentMarketFacts ? ` Current market: ${ctx.currentMarketFacts}.` : "";
+  return `Context: currently showing a ${ctx.currentVenue ?? "?"} market for "${ctx.query ?? ""}". Venues with a match: ${venues}.${facts}`;
 }
 
 interface RawLlm {
   kind?: unknown;
   query?: unknown;
   venue?: unknown;
+  reply?: unknown;
 }
 
 /**
@@ -273,13 +295,18 @@ function interpretColdLlm(parsed: RawLlm): Intent | null {
   return { kind: "search", query, via: "llm" };
 }
 
-/** Interpret a follow-up LLM result (search/next/link/other + venue), strictly clamped. */
+/** Interpret a follow-up LLM result (search/next/link/answer/other + venue/reply), strictly clamped. */
 function interpretFollowupLlm(parsed: RawLlm): Intent | null {
   switch (parsed.kind) {
     case "next":
       return { kind: "next", via: "llm" };
     case "link":
       return { kind: "link", venue: clampVenue(parsed.venue), via: "llm" };
+    case "answer": {
+      // A grounded reply about the current market. Require a usable reply, else fall back to the gate.
+      const reply = typeof parsed.reply === "string" ? parsed.reply.trim() : "";
+      return reply.length >= 2 ? { kind: "answer", reply: reply.slice(0, 320), via: "llm" } : null;
+    }
     case "search": {
       const query = typeof parsed.query === "string" ? cleanQuery(parsed.query) : "";
       return query.length >= 2 ? { kind: "search", query, via: "llm" } : null;
@@ -348,20 +375,34 @@ async function classifyWithLlm(text: string, cfg: IntentConfig, ctx?: FollowupCo
  * fail-soft: any error / unusable shape returns the deterministic question UNCHANGED (we still ask).
  */
 const CLARIFY_SYSTEM_PROMPT =
-  "You help a prediction-market assistant decide whether to ask the user a clarifying question. " +
-  "You are given a topic and a numbered list of candidate market titles the search found. Decide if " +
-  "these are GENUINELY DIFFERENT markets the user must choose between (different questions, targets, " +
-  "timeframes, or player props) OR merely outcomes/variants of ONE market (e.g. different teams to win " +
-  'the SAME event). Return ONLY JSON: {"ambiguous":boolean,"labels":[string,...]}. Set ambiguous=false ' +
-  "when they are one market's outcomes (the assistant will just show the favorite). When ambiguous=true, " +
-  "return one SHORT (under 6 words) human label per market, in the SAME ORDER as given. " +
+  "You help a prediction-market assistant ask a GOOD clarifying question. You are given a topic and a " +
+  "numbered list of candidate market titles the search found. Keep only the candidates that are " +
+  "genuinely DIFFERENT, RELEVANT markets the user might mean. " +
+  'Return ONLY JSON: {"ambiguous":boolean,"options":[{"n":number,"label":string}]}. ' +
+  "RULES: DROP any candidate that is OFF-TOPIC or not really about the topic (noise — e.g. a market " +
+  "about a different subject that merely shares a name word). DROP duplicates that are the same market " +
+  'or outcomes of ONE event (keep the favorite). "n" is the candidate NUMBER from the list; "label" ' +
+  "is a SHORT (under 6 words) human label. Keep at most 4, in priority order. " +
+  "Set ambiguous=false (options may be empty) when the candidates are really one market's outcomes, OR " +
+  "only ONE is relevant — the assistant then just shows the best market. " +
   "Return a SINGLE JSON object, never an array.";
 
+interface RawClarifyOption {
+  n?: unknown;
+  label?: unknown;
+}
 interface RawClarifyLlm {
   ambiguous?: unknown;
-  labels?: unknown;
+  options?: unknown;
 }
 
+/**
+ * Optional LLM refinement for a clarifying question. The deterministic `clarify.decideClarify` decided
+ * these candidates are ambiguous; this lets the model (a) VETO that (`ambiguous:false` → answer
+ * directly), (b) DROP off-topic noise (e.g. "Trump praise Messi" from a "Lionel Messi" search), and
+ * (c) relabel. Returns a question with the RELEVANT subset (≥2 options) to ask, or `null` to answer
+ * directly (veto, or fewer than 2 relevant survive). Strictly fail-soft → the deterministic question.
+ */
 export async function refineClarify(
   query: string,
   question: ClarifyQuestion,
@@ -392,17 +433,22 @@ export async function refineClarify(
     }
     // VETO: the model says these are one market's outcomes → don't ask, answer directly.
     if (parsed.ambiguous === false || parsed.ambiguous === "false" || parsed.ambiguous === 0) return null;
-    // Relabel from the model only when the array shape matches 1:1; else keep our deterministic labels.
-    if (Array.isArray(parsed.labels) && parsed.labels.length === question.options.length) {
-      const labels = parsed.labels;
-      const options = question.options.map((o, i) => {
-        const v = labels[i];
-        // Keep labels short — they render as iMessage poll options (and a numbered list elsewhere).
-        return typeof v === "string" && v.trim() ? { ...o, label: v.trim().slice(0, 44) } : o;
-      });
-      return { ...question, options };
+    if (!Array.isArray(parsed.options)) return question; // unexpected shape → keep deterministic question
+    // Map each {n,label} back to the ORIGINAL option's market (n is 1-based), dropping noise + dupes.
+    const kept: ClarifyOption[] = [];
+    for (const raw of parsed.options as RawClarifyOption[]) {
+      const n = typeof raw?.n === "number" ? raw.n : Number(raw?.n);
+      const idx = Number.isFinite(n) ? n - 1 : -1;
+      const orig = idx >= 0 && idx < question.options.length ? question.options[idx] : undefined;
+      if (!orig || kept.some((k) => k.result === orig.result)) continue;
+      const label =
+        typeof raw?.label === "string" && raw.label.trim() ? raw.label.trim().slice(0, 44) : orig.label;
+      kept.push({ label, result: orig.result });
+      if (kept.length >= 4) break;
     }
-    return question;
+    // Return the RELEVANT subset (1 = answer with that market; ≥2 = ask). The caller distinguishes by
+    // length. `null` ONLY when the model dropped everything → fall back to the top candidate.
+    return kept.length >= 1 ? { ...question, options: kept } : null;
   } catch (err) {
     console.warn(`[clarify] LLM refine failed — using deterministic question. ${(err as Error).message}`);
     return question;

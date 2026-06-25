@@ -16,7 +16,7 @@ import type { Venue, VenueResult } from "../venue";
 import type { Intent, FollowupContext } from "./intent";
 import { type SearchResults, flattenRanked, venuesPresent } from "../search";
 import type { ClarifyQuestion, ClarifyOption } from "./clarify";
-import { renderOne, renderLink, renderExhausted, renderNoVenue, emptyReply } from "./cards";
+import { renderOne, renderLink, renderExhausted, renderNoVenue, emptyReply, marketFacts } from "./cards";
 
 export interface ConversationState {
   /** The active search subject (cleaned). */
@@ -68,9 +68,11 @@ export function __setClock(fn: () => number): void {
 }
 
 /**
- * Bounded LRU + TTL store of per-conversation state, keyed by `Space.id`. Lazy TTL (evict-on-read)
- * plus an LRU touch on read and a FIFO eviction past `max` keep memory flat without a timer. Keyed by
- * conversation, NOT sender, so group members share one thread's cursor (the v1 invariant).
+ * Bounded LRU + TTL store of per-conversation state, keyed by an OPAQUE string the caller supplies.
+ * Lazy TTL (evict-on-read) plus an LRU touch on read and a FIFO eviction past `max` keep memory flat
+ * without a timer. The key is generic; `index.ts` keys it PER (space, sender) via `sessionKey()` — so
+ * each member keeps their own thread/cursor and a hail by one member doesn't relax the whole space.
+ * (Originally per-`Space.id`; the per-sender keying landed with the conversational rearrange.)
  */
 export class ConversationStore {
   private readonly map = new Map<string, ConversationState>();
@@ -129,11 +131,13 @@ export function toContext(state: ConversationState | null | undefined): Followup
   if (!state || state.candidates.length === 0) {
     return { hasActiveMarket: false, venuesPresent: state?.venuesPresent ?? [] };
   }
+  const current = state.candidates[clampCursor(state)];
   return {
     hasActiveMarket: true,
     query: state.query,
-    currentVenue: state.candidates[clampCursor(state)]?.venue,
+    currentVenue: current?.venue,
     venuesPresent: state.venuesPresent,
+    currentMarketFacts: current ? marketFacts(current) : undefined,
   };
 }
 
@@ -265,6 +269,34 @@ export function clarifyState(
     pending: question,
     pendingBy,
     updatedAt: 0,
+  };
+}
+
+/**
+ * Show a single chosen market as the fresh answer (no pending question) — used when the LLM clarify
+ * filter narrows the candidates down to ONE genuinely-relevant market, so we answer with THAT market
+ * rather than falling back to `candidates[0]` (which could be the noise the filter just rejected). The
+ * cursor points at the chosen market so "another" / "send the link" continue from there.
+ */
+export function pickedAnswer(
+  query: string,
+  candidates: VenueResult[],
+  results: SearchResults,
+  chosen: VenueResult,
+  opts: NextTurnOptions = {},
+): TurnOutcome {
+  const idx = Math.max(0, candidates.indexOf(chosen));
+  return {
+    body: renderOne(candidates[idx] ?? chosen, opts),
+    newState: {
+      query,
+      candidates,
+      cursor: idx,
+      linkedVenues: new Set(),
+      venuesPresent: venuesPresent(results),
+      externalUnavailable: results.externalUnavailable,
+      updatedAt: 0,
+    },
   };
 }
 

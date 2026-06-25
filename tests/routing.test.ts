@@ -44,9 +44,10 @@ describe("shouldHandle", () => {
 describe("actionableWhenRelaxed", () => {
   const intent = (over: Partial<Intent>): Intent => ({ kind: "search", via: "regex", ...over });
 
-  it("continues a thread follow-up (next/link) without a re-hail", () => {
+  it("continues a thread follow-up (next/link/answer) without a re-hail", () => {
     expect(actionableWhenRelaxed(intent({ kind: "next" }))).toBe(true);
     expect(actionableWhenRelaxed(intent({ kind: "link", venue: "kalshi" }))).toBe(true);
+    expect(actionableWhenRelaxed(intent({ kind: "answer", reply: "it's a Messi prop" }))).toBe(true);
   });
 
   it("honors an EXPLICIT search (regex trigger) but not a bare-topic or LLM guess", () => {

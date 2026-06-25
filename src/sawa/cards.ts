@@ -98,6 +98,36 @@ export function renderOne(r: VenueResult, opts: RenderOneOptions = {}): string {
 }
 
 /**
+ * A compact, factual one-liner about a market — the grounding the intent LLM uses to ANSWER a question
+ * about the currently-shown market ("what game is that for", "what are the odds"). NOT user-facing: it
+ * lists only what we actually know (title, headline odds, venue, money type, resolve date, whether a
+ * link exists) so the model can answer from facts and say "I don't have that" for anything absent
+ * (notably the exact fixture — pmxt gives us the market title, not always the match it's tied to).
+ */
+/**
+ * Neutralize a user-authored string (market title / outcome label) before it is embedded in the LLM
+ * context — strip newlines, JSON/markdown structural chars, and braces so a crafted market title can't
+ * break out of the facts line to inject instructions. Collapses whitespace and clamps length.
+ */
+function sanitizeForPrompt(s: string, max = 100): string {
+  return s
+    .replace(/[`{}\[\]<>\\]/g, " ")
+    .replace(/["']/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
+}
+
+export function marketFacts(r: VenueResult): string {
+  const parts = [`title ${sanitizeForPrompt(r.title)}`, `headline ${sanitizeForPrompt(outcomeChunk(r), 60)}`,
+    `venue ${sanitizeForPrompt(r.sourceLabel, 20)}`];
+  parts.push(r.realMoney ? "real-money market" : "virtual Sawa-coin market");
+  if (r.closesAt != null) parts.push(`resolves ${new Date(r.closesAt).toISOString().slice(0, 10)}`);
+  parts.push(r.url ? "a link is available on request" : "no link available");
+  return parts.join("; ");
+}
+
+/**
  * Reply to a "send the link" follow-up: a bare, tappable URL (cloud iMessage auto-renders a rich
  * preview for it; local/terminal shows it plain). Assumes `r.url` is present — the caller falls back
  * to `renderNoVenue` when it isn't.
