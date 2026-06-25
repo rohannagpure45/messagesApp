@@ -53,7 +53,7 @@ export interface FollowupContext {
 const MAX_QUERY_LEN = 120;
 
 /** Leading address tokens to strip: "sawa", "@sawa", "hey sawa,", "sawa:" … */
-function stripAddress(text: string, botName: string): string {
+export function stripAddress(text: string, botName: string): string {
   const name = botName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   // Optional greeting + optional @ + bot name + optional punctuation, at the very start.
   const re = new RegExp(`^\\s*(?:hey|hi|hello|yo|ok|okay)?[\\s,]*@?${name}[\\s,:;-]*`, "i");

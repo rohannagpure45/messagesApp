@@ -1,9 +1,9 @@
 # Conversational Search — reliability + matching fixes (implementation spec)
 
-**Status:** Issues **1–4 IMPLEMENTED 24-Jun** (typecheck clean; `npm test` 126 green). Issue **5 (quips
-chat-toggle) DEFERRED** — scoped out of this `/goal` as a feature (not a reliability bug); spec retained
-below for the follow-up. Found 24-Jun during the first live LOCAL-mode group test. Each item has
-**symptom → evidence → root cause → fix → acceptance**.
+**Status:** ALL FIVE IMPLEMENTED. Issues **1–4** shipped 24-Jun; Issue **5 shipped 25-Jun, generalized into a
+natural-language AGENT SETTINGS framework** (not just quips). Typecheck clean; `npm test` 141 green. Found
+24-Jun during the first live LOCAL-mode group test. Each item has **symptom → evidence → root cause → fix →
+acceptance**.
 
 **What shipped (1–4):** `max_tokens 80→256` + defensive JSON extraction (fences/prose/first-`{`-to-last-`}`)
 in `classifyWithLlm`; `look for`/`search for`/`find me`/`look up for` added to the regex `SEARCH_TRIGGERS`;
@@ -148,7 +148,34 @@ filtered downstream, not at expansion time.
 
 ---
 
-## Issue 5 — Quips (`SAWA_FOLK_TONE`) are not user-editable; "turn on the quips" is swallowed into the search ⏸ DEFERRED
+## Issue 5 — Quips (`SAWA_FOLK_TONE`) are not user-editable; "turn on the quips" is swallowed into the search ✅ DONE (generalized)
+
+**Shipped as a general settings framework, not a one-off.** Per owner direction ("it's more than just quips —
+make other agent settings toggleable via natural language, the same way markets are searched"), Issue 5 was
+implemented as an extensible **agent-settings** layer (`src/sawa/settings.ts`):
+
+- **Registry of settings**, each owning its on/off NL phrasings + confirmation copy. Two ship today: **`quips`**
+  (the `SAWA_FOLK_TONE` flourish — Issue 5 proper) and **`external`** (`"sawa only"` / `"all venues"` — drops
+  pmxt enrichment for a Sawa-only reply). Adding a setting = one registry entry + one apply site.
+- **Recognizer requires BOTH a subject AND a direction** (`classifySettingCommand`), so an incidental mention
+  ("odds on a comedian's quips") is never a toggle — precision over recall, matching `NEXT_RE`'s philosophy.
+- **Compound symptom fixed** (the headline one the adversarial review flagged): `peelSettings` consumes
+  *leading* settings clauses off a compound message (`"turn on the quips, look for X"`), applies them, and
+  returns the remainder to be searched — so the toggle phrase is applied and **never searched**. A head that
+  isn't a settings command stops the peel, so `"find cap and trade"` / `"Switzerland, India"` never split.
+- **Sticky per-space store** (`SpaceSettings`): in-memory `Map<spaceId, …>`, **no TTL** (a preference must not
+  silently revert mid-session, unlike a stale candidate list), LRU-bounded; seeded from env defaults (quips ←
+  `SAWA_FOLK_TONE`, external ← pmxt-configured). It does NOT live on `ConversationState` (which `onSearch`
+  rebuilds every search) nor in the TTL'd `ConversationStore` — both would wipe the preference. Resolved at the
+  two `nextTurn` call sites + the `runSearch` pmxt arg in `index.ts`; a restart reverts to env (no DB — the
+  Sawa no-writes invariant). A **read** command (`"settings"`) reports the current per-space values.
+
+Feasibility was identical for LOCAL mode (today) and a future builder/dedicated line — the feature is 100%
+in-process and keys on the already-stable `space.id`; the builder plan only makes group toggles reachable on a
+non-shared line. Tests: `tests/settings.test.ts` (recognizer on/off + null, compound peel, store
+round-trip/independence/eviction, read reply). 15 new tests.
+
+### Original spec (retained for reference)
 
 **Symptom.** `Sawa turn on the quips, look for player props …` searched the literal text
 `"turn on the quips, look for player props …"` (→ empty). The folk-tone flourish can only be set via the
@@ -190,13 +217,14 @@ reply after `quips on` includes the flourish, after `quips off` does not. **Live
 - [x] **3** pmxt timeout 9s + one retry on transient (abort/network) errors; HTTP-status errors not retried.
 - [x] **4** `expandQueries` emits proper-noun entity sub-queries (capped); compound + player-prop queries surface
       the existing entity market (relevance vs the original query); sharper LLM extraction prompt.
-- [ ] **5** Chat-toggleable quips (`quips on/off` / `turn on/off the quips`), sticky per-space, default
-      `SAWA_FOLK_TONE`; the toggle phrase is never searched. **DEFERRED** — feature, not a reliability bug
-      (out of this `/goal` per the owner's framing); spec above is ready for the follow-up.
-- [x] `npm run typecheck` clean; `npm test` green (126) with new unit tests for items 1–4.
+- [x] **5** Chat-toggleable quips — shipped as a **general agent-settings framework** (`quips` + `external`,
+      extensible), sticky per-space (no TTL), default from env; the toggle phrase is never searched, and a
+      compound `"turn on the quips, look for X"` applies the toggle then searches the remainder. `"settings"`
+      reads current values.
+- [x] `npm run typecheck` clean; `npm test` green (141) with new unit tests for items 1–5.
 - [ ] **Live group re-test** (pending hardware): World Cup (Sawa lead), `look for Czechia` (Kalshi),
-      `look for player props on Raul Jimenez` (Kalshi goals market), link follow-up. _(Quips toggle drops off
-      this list until Issue 5 ships.)_
+      `look for player props on Raul Jimenez` (Kalshi goals market), `quips off`/`sawa only`/`settings`
+      toggles, link follow-up.
 - [x] Update [`PROGRESS.md`](PROGRESS.md) + [`AGENTS.md`](../AGENTS.md) status.
 
 ## Notes / out of scope

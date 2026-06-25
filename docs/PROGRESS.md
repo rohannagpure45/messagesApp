@@ -5,6 +5,35 @@ status lives in [`../AGENTS.md`](../AGENTS.md); the phased plan in [`BUILD_PLAN.
 
 ---
 
+## 2026-06-25 — Issue 5 shipped as a natural-language AGENT SETTINGS framework (quips + external; extensible)
+
+The last open search-path item (chat-toggleable quips) shipped — **generalized**, per owner direction, into an
+extensible **agent-settings** layer so other settings are toggleable by chat the same way markets are searched.
+`npm run typecheck` clean; `npm test` **141** (+15). New module `src/sawa/settings.ts`.
+
+- **Registry** (`SETTINGS`): each setting owns its on/off natural-language phrasings + confirmation copy. Two
+  today — **`quips`** (the `SAWA_FOLK_TONE` flourish) and **`external`** (`"sawa only"` / `"all venues"` →
+  drop pmxt enrichment for a Sawa-only reply). Adding one = a registry entry + an apply site.
+- **Recognizer** (`classifySettingCommand`) requires BOTH a subject AND a direction, so an incidental mention
+  ("comedian quips odds") is never a toggle. **`peelSettings`** strips LEADING settings clauses off a compound
+  message (`"turn on the quips, look for X"`) and returns the remainder — applying the toggle and never
+  searching it (closes the documented Issue-5 symptom the adversarial review flagged). A non-command head
+  stops the peel, so `"find cap and trade"` / `"Switzerland, India"` never split.
+- **Sticky per-space store** (`SpaceSettings`): in-memory, **no TTL** (a preference must not revert
+  mid-session), LRU-bounded, seeded from env defaults (quips ← `SAWA_FOLK_TONE`, external ← pmxt-configured).
+  Deliberately NOT on `ConversationState` (rebuilt every search) nor the TTL'd `ConversationStore` — both
+  would wipe it. Resolved per-space at the two `nextTurn` call sites + the `runSearch` pmxt arg in `index.ts`.
+  A restart reverts to env (no DB — the Sawa no-writes invariant). A **read** command (`"settings"`) reports
+  current values; `/help` advertises the toggles.
+- **Feasibility was identical for LOCAL (today) and a future builder/dedicated line** — 100% in-process,
+  keyed on the already-stable `space.id`; the builder plan only makes group toggles reachable on a non-shared
+  line, changing nothing about the design. Scoped via a 6-agent workflow (4 readers → synth → adversarial
+  critic); the critic caught the compound-symptom gap, which this implementation closes.
+
+**Still open:** a live iMessage group re-test of all five (search fixes + the new toggles).
+
+---
+
 ## 2026-06-24 (search hardening) — 4 of 5 search-path issues fixed (intent JSON, triggers, pmxt retry, entity matching)
 
 Implemented issues **1–4** of [`SEARCH_FIXES.md`](SEARCH_FIXES.md) (the work-list from the live group test).

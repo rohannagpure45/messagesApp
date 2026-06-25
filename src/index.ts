@@ -30,10 +30,17 @@ import { listMarkets, getMarket } from "./sawa/read";
 import { formatList, formatMarket } from "./sawa/format";
 import { stubCreate } from "./sawa/createStub";
 import { RecentBuffer, suggestPayload } from "./sawa/suggest";
-import { parseIntent } from "./sawa/intent";
+import { parseIntent, stripAddress } from "./sawa/intent";
 import { runSearch } from "./search";
 import { toPlainText } from "./sawa/cards";
 import { ConversationStore, toContext, nextTurn } from "./sawa/conversation";
+import {
+  SpaceSettings,
+  peelSettings,
+  isSettingsQuery,
+  confirmChanges,
+  describeSettings,
+} from "./sawa/settings";
 import { shouldHandle, SeenSet, normalizeHandle } from "./routing";
 
 // Single-instance lock (a localhost mutex, NOT a network server). Two bot processes on one Photon
@@ -79,6 +86,7 @@ console.warn(
 const HELP = [
   `Sawa bot — find prediction markets across Sawa, Kalshi & Polymarket.`,
   `Just ask: "${botName} FIFA World Cup"  or  "${botName} where can I bet on the election"`,
+  `Settings: "${botName} quips off"  ·  "${botName} sawa only"  ·  "${botName} settings"`,
   ``,
   `Slash commands:`,
   `/search <topic>   cross-venue search (Sawa + Kalshi + Polymarket)`,
@@ -153,6 +161,10 @@ const convo = new ConversationStore();
 // SAWA_FOLK_TONE=1 appends a brief editorial flourish to the conversational reply (off by default;
 // factual otherwise). See cards.folkQuip — deliberately mild + category-blind for brand safety.
 const folkTone = process.env.SAWA_FOLK_TONE === "1" || process.env.SAWA_FOLK_TONE === "true";
+// Agent settings the user can toggle from chat ("quips off", "sawa only", "settings"). Sticky per
+// space, in-memory, seeded from env defaults: quips from SAWA_FOLK_TONE, external markets on whenever
+// pmxt is configured. A restart reverts to these defaults by design. See src/sawa/settings.ts.
+const settings = new SpaceSettings({ quips: folkTone, external: pmxtConfig !== null });
 
 function needsConfig(): string {
   return "Sawa isn't configured yet (set SAWA_API_BASE_URL).";
@@ -194,8 +206,12 @@ async function sendBody(space: Space, body: string): Promise<void> {
 /** Run a fresh cross-venue search, reply with the single best market, and store the thread state. */
 async function runConversationalSearch(space: Space, spaceId: string, query: string): Promise<void> {
   if (!config) return void (await guard("config notice", () => space.send(needsConfig())));
-  const results = await runSearch(query, { config, pmxt: pmxtConfig });
-  const outcome = nextTurn(null, { kind: "search", query, via: "regex" }, results, { folkTone });
+  // Resolve agent settings for this space: "sawa only" drops external enrichment; "quips" sets the tone.
+  const pmxt = settings.get(spaceId, "external") ? pmxtConfig : null;
+  const results = await runSearch(query, { config, pmxt });
+  const outcome = nextTurn(null, { kind: "search", query, via: "regex" }, results, {
+    folkTone: settings.get(spaceId, "quips"),
+  });
   convo.set(spaceId, outcome.newState);
   await sendBody(space, outcome.body);
 }
@@ -249,6 +265,23 @@ async function handleSlash(space: Space, cmd: string, arg: string): Promise<void
 async function handleNatural(space: Space, body: string): Promise<void> {
   const spaceId = space.id;
   const state = convo.get(spaceId) ?? null;
+
+  // Agent settings, addressed in natural language ("quips off", "sawa only", "settings") — resolved
+  // BEFORE search so a toggle phrase is applied, never searched. `peelSettings` also strips a LEADING
+  // toggle off a compound message ("turn on the quips, look for X") and hands back the remainder.
+  const addressed = stripAddress(body, botName);
+  if (isSettingsQuery(addressed)) {
+    await sendBody(space, describeSettings(settings.resolved(spaceId)));
+    return;
+  }
+  const { changes, rest } = peelSettings(addressed);
+  if (changes.length) {
+    for (const c of changes) settings.set(spaceId, c.key, c.on);
+    await sendBody(space, confirmChanges(changes));
+    if (!rest) return; // pure toggle — nothing left to do
+    body = rest; // continue with the remainder of the compound (address already stripped)
+  }
+
   const intent = await parseIntent(body, botName, intentConfig, toContext(state));
 
   if (intent.kind === "search" && intent.query) {
@@ -256,7 +289,7 @@ async function handleNatural(space: Space, body: string): Promise<void> {
     return;
   }
   if (intent.kind === "next" || intent.kind === "link") {
-    const outcome = nextTurn(state, intent, null, { folkTone });
+    const outcome = nextTurn(state, intent, null, { folkTone: settings.get(spaceId, "quips") });
     convo.set(spaceId, outcome.newState);
     await sendBody(space, outcome.body);
     return;
