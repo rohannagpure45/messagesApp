@@ -8,7 +8,8 @@
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc",
-    "test": "vitest run"
+    "test": "vitest run",
+    "postinstall": "patch-package"
   },
   "dependencies": {
     "openai": "^4.104.0",
@@ -16,6 +17,7 @@
   },
   "devDependencies": {
     "@types/node": "^22",
+    "patch-package": "^8",
     "tsx": "^4",
     "typescript": "^5",
     "vitest": "^4"

@@ -1,0 +1,13 @@
+diff --git a/node_modules/@photon-ai/imessage-kit/dist/index.js b/node_modules/@photon-ai/imessage-kit/dist/index.js
+index 184d04c..9ca2c43 100644
+--- a/node_modules/@photon-ai/imessage-kit/dist/index.js
++++ b/node_modules/@photon-ai/imessage-kit/dist/index.js
+@@ -413,7 +413,7 @@ var MESSAGE_FIELDS = [
+   "message.expressive_send_style_id",
+   "message.balloon_bundle_id",
+   "message.destination_caller_id",
+-  "message.ck_chat_id as ck_chat_id",
++  "NULL as ck_chat_id",
+   "message.was_detonated",
+   "message.expire_state",
+   "message.share_status",
