@@ -5,6 +5,37 @@ status lives in [`../AGENTS.md`](../AGENTS.md); the phased plan in [`BUILD_PLAN.
 
 ---
 
+## 2026-06-24 (live group test) — LOCAL-mode group send fixed (mixed iMessage/RCS); 5 search issues spec'd
+
+**The conversational reply now delivers live in an iMessage group** (LOCAL mode), and a 5-person test surfaced
+five search-path issues to fix next.
+
+**Group-send fix (shipped).** LOCAL-mode replies to the test group failed with AppleScript `-1728` (`Can't get
+chat id "iMessage;+;chat419…"`). Root-caused via `chat.db`: the room is a **mixed iMessage + RCS conversation**,
+and macOS Messages exposes only **one** AppleScript-addressable chat per conversation — the RCS one
+(`RCS;+;chat419…`, which resolves and is sendable; this Mac's account already sends RCS there). imessage-kit
+derived the reply target from the latest inbound's chat id (`iMessage;+;chat419…`), which Messages can't
+resolve. **Fix:** patched `imessage-kit`'s group-send AppleScript (`buildSendScript`) to try the exact chat id,
+then fall back to matching the `;+;<room-id>` suffix across `chats` and send to whatever Messages exposes
+(`patches/@photon-ai+imessage-kit+3.0.0.patch`, now ck_chat_id + this). Validated read-only
+(`iMessage;+;chat419… → RCS;+;chat419…`) and confirmed live (replies + the link follow-up delivered). Worth
+upstreaming to Photon (`npx patch-package @photon-ai/imessage-kit --create-issue`).
+
+**Five search issues found in the same test → spec in [`SEARCH_FIXES.md`](SEARCH_FIXES.md) (TODO, to be done via `/goal`):**
+1. Intent LLM returns multi-line JSON truncated at `max_tokens: 80` → `Unterminated string` → silent regex fallback.
+2. `"look for X"` isn't a `SEARCH_TRIGGER` (only `"look up"`) → routes to the LLM; on failure the bad query
+   (`"look for …"`) degrades the search.
+3. pmxt `failed (error)` = the 6s `AbortController` timeout firing under burst → external venues silently dropped.
+4. Compound / player-prop queries miss markets that exist (`Mexico Raul Jimenez player props` → 0, but
+   `Raul Jimenez` → `Raul Jimenez: 1+ goals` on Kalshi) — `expandQueries` never decomposes a space-joined
+   compound into entities.
+5. Quips (`SAWA_FOLK_TONE`) aren't user-editable — `"turn on the quips"` got swallowed into the search text;
+   needs a chat toggle (sticky per-space, default the env value).
+
+Full symptom→evidence→root-cause→fix→acceptance for each is in `SEARCH_FIXES.md`.
+
+---
+
 ## 2026-06-24 (cont.) — Conversational redesign: card → single-market folk reply; disclaimer removed
 
 **The verbose 3×3 cross-venue card (the entry below) was replaced with a folk-style, conversational
