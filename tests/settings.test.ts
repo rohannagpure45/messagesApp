@@ -7,6 +7,8 @@ import {
   confirmChanges,
   describeSettings,
   SETTING_KEYS,
+  type SettingsSnapshot,
+  type SettingsPersistence,
 } from "../src/sawa/settings";
 
 describe("classifySettingCommand", () => {
@@ -122,7 +124,7 @@ describe("SpaceSettings", () => {
   });
 
   it("LRU-evicts the oldest space past the cap (memory hygiene, no TTL revert)", () => {
-    const s = new SpaceSettings({ quips: false, external: true }, 2);
+    const s = new SpaceSettings({ quips: false, external: true }, { max: 2 });
     s.set("A", "quips", true);
     s.set("B", "quips", true);
     s.set("C", "quips", true); // A is the oldest → evicted
@@ -134,6 +136,41 @@ describe("SpaceSettings", () => {
     const s = new SpaceSettings({ quips: true, external: false });
     expect(s.resolved("A")).toEqual({ quips: true, external: false });
     expect(SETTING_KEYS).toEqual(["quips", "external"]);
+  });
+});
+
+describe("SpaceSettings durability (survives 'restart')", () => {
+  /** An in-memory fake of the file persistence adapter. */
+  function fakeDisk(seed: SettingsSnapshot | null = null) {
+    let data: SettingsSnapshot | null = seed;
+    const persist: SettingsPersistence = {
+      load: () => data,
+      save: (d) => {
+        data = JSON.parse(JSON.stringify(d)) as SettingsSnapshot; // copy, like a real write
+      },
+    };
+    return { persist, peek: () => data };
+  }
+
+  it("writes through on set and rehydrates a fresh store from the same backing", () => {
+    const disk = fakeDisk();
+    const a = new SpaceSettings({ quips: false, external: true }, { persist: disk.persist });
+    a.set("G", "quips", true);
+    a.set("G", "external", false);
+    expect(disk.peek()).toEqual({ G: { quips: true, external: false } });
+
+    // A brand-new store (a "restart") reading the same backing sees the saved values, NOT the defaults.
+    const b = new SpaceSettings({ quips: false, external: true }, { persist: disk.persist });
+    expect(b.get("G", "quips")).toBe(true);
+    expect(b.get("G", "external")).toBe(false);
+    expect(b.get("OTHER", "quips")).toBe(false); // a never-set space still falls back to the env default
+  });
+
+  it("ignores unknown/removed keys in the persisted snapshot (forward/backward compatible)", () => {
+    const disk = fakeDisk({ G: { quips: true, legacyFlag: true } as Record<string, boolean> });
+    const s = new SpaceSettings({ quips: false, external: true }, { persist: disk.persist });
+    expect(s.get("G", "quips")).toBe(true);
+    expect(s.resolved("G")).toEqual({ quips: true, external: true }); // legacyFlag dropped; external→default
   });
 });
 

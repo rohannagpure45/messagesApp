@@ -15,6 +15,9 @@
  *    the documented Issue-5 symptom (SEARCH_FIXES.md §5), not just the standalone case.
  */
 
+import fs from "node:fs";
+import path from "node:path";
+
 /** The agent settings that can be toggled by chat. Add a key + a SETTINGS entry + an apply site. */
 export type SettingKey = "quips" | "external";
 
@@ -132,20 +135,89 @@ export function isSettingsQuery(text: string): boolean {
   return SETTINGS_QUERY.test(text.trim());
 }
 
-// --- per-space store --------------------------------------------------------------------------
+// --- durable per-space store ------------------------------------------------------------------
+
+/** On-disk shape: spaceId -> { setting -> bool }. Unknown/removed keys are ignored on load. */
+export type SettingsSnapshot = Record<string, Partial<Record<SettingKey, boolean>>>;
+
+/** Pluggable persistence so the store survives restarts (and so tests can inject a fake). */
+export interface SettingsPersistence {
+  load(): SettingsSnapshot | null;
+  save(data: SettingsSnapshot): void;
+}
 
 /**
- * Sticky per-space setting overrides. In-memory only (mirrors ConversationStore / SeenSet; the Sawa
- * no-writes invariant forbids a DB), so a restart reverts every space to the env defaults — the
- * spec'd behavior. NO TTL (a preference must not silently revert mid-session, unlike a stale candidate
- * list); LRU-bounded purely for memory hygiene under a long-running daemon.
+ * JSON-file persistence. This is BOT-LOCAL state (the bot's own UX preferences on the host's disk) —
+ * NOT a Sawa write: the no-writes invariant governs the Sawa Postgres / bot API, not a local
+ * preference file. Writes are atomic (temp file + rename) and fully fail-soft: a read/write error
+ * degrades to in-memory (or env defaults) and never crashes the bot.
+ */
+export function fileSettingsPersistence(filePath: string): SettingsPersistence {
+  return {
+    load() {
+      try {
+        return JSON.parse(fs.readFileSync(filePath, "utf8")) as SettingsSnapshot;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+          console.warn(`[settings] could not read ${filePath} (${(err as Error).message}) — using env defaults.`);
+        }
+        return null; // missing file on first run is normal
+      }
+    },
+    save(data) {
+      try {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        const tmp = `${filePath}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+        fs.renameSync(tmp, filePath); // atomic replace
+      } catch (err) {
+        console.warn(`[settings] could not persist ${filePath} (${(err as Error).message}) — change kept in memory only.`);
+      }
+    },
+  };
+}
+
+/**
+ * Sticky per-space setting overrides. DURABLE: with a `persist` adapter the per-space values are
+ * written through to disk on every change and rehydrated on startup, so a toggle in a group sticks
+ * for days/weeks until changed again — surviving restarts (Spectrum offers no server-side state, but
+ * the bot owns its host's filesystem). The env defaults only seed a space that has NEVER been set.
+ * NO TTL (a preference must not silently revert mid-session, unlike a stale candidate list); a high
+ * LRU cap is a pure runaway backstop (eviction never fires at real scale, so persisted prefs stay).
+ * Without a `persist` adapter it is a plain in-memory store (used by unit tests).
  */
 export class SpaceSettings {
   private store = new Map<string, Map<SettingKey, boolean>>();
+  private max: number;
+  private persist?: SettingsPersistence;
+
   constructor(
     private defaults: Record<SettingKey, boolean>,
-    private max = 2000,
-  ) {}
+    opts: { max?: number; persist?: SettingsPersistence } = {},
+  ) {
+    this.max = opts.max ?? 50_000;
+    this.persist = opts.persist;
+    const loaded = this.persist?.load();
+    if (loaded) this.hydrate(loaded);
+  }
+
+  private hydrate(snap: SettingsSnapshot): void {
+    for (const [spaceId, vals] of Object.entries(snap)) {
+      const m = new Map<SettingKey, boolean>();
+      for (const k of SETTING_KEYS) if (typeof vals[k] === "boolean") m.set(k, vals[k]!);
+      if (m.size) this.store.set(spaceId, m);
+    }
+  }
+
+  private serialize(): SettingsSnapshot {
+    const out: SettingsSnapshot = {};
+    for (const [spaceId, m] of this.store) {
+      const o: Partial<Record<SettingKey, boolean>> = {};
+      for (const [k, v] of m) o[k] = v;
+      out[spaceId] = o;
+    }
+    return out;
+  }
 
   get(spaceId: string, key: SettingKey): boolean {
     return this.store.get(spaceId)?.get(key) ?? this.defaults[key];
@@ -164,6 +236,7 @@ export class SpaceSettings {
     }
     m.set(key, on);
     this.store.set(spaceId, m);
+    this.persist?.save(this.serialize()); // write through so the change survives a restart
   }
 
   /** The resolved view (override ?? default) of every setting for a space — for the READ reply. */

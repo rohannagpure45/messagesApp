@@ -152,28 +152,35 @@ filtered downstream, not at expansion time.
 
 **Shipped as a general settings framework, not a one-off.** Per owner direction ("it's more than just quips —
 make other agent settings toggleable via natural language, the same way markets are searched"), Issue 5 was
-implemented as an extensible **agent-settings** layer (`src/sawa/settings.ts`):
+implemented as an extensible **agent-settings** layer (`src/sawa/settings.ts`). **Full design doc:
+[`AGENT_SETTINGS.md`](AGENT_SETTINGS.md).** Summary:
 
 - **Registry of settings**, each owning its on/off NL phrasings + confirmation copy. Two ship today: **`quips`**
   (the `SAWA_FOLK_TONE` flourish — Issue 5 proper) and **`external`** (`"sawa only"` / `"all venues"` — drops
   pmxt enrichment for a Sawa-only reply). Adding a setting = one registry entry + one apply site.
 - **Recognizer requires BOTH a subject AND a direction** (`classifySettingCommand`), so an incidental mention
   ("odds on a comedian's quips") is never a toggle — precision over recall, matching `NEXT_RE`'s philosophy.
-- **Compound symptom fixed** (the headline one the adversarial review flagged): `peelSettings` consumes
-  *leading* settings clauses off a compound message (`"turn on the quips, look for X"`), applies them, and
-  returns the remainder to be searched — so the toggle phrase is applied and **never searched**. A head that
-  isn't a settings command stops the peel, so `"find cap and trade"` / `"Switzerland, India"` never split.
-- **Sticky per-space store** (`SpaceSettings`): in-memory `Map<spaceId, …>`, **no TTL** (a preference must not
-  silently revert mid-session, unlike a stale candidate list), LRU-bounded; seeded from env defaults (quips ←
-  `SAWA_FOLK_TONE`, external ← pmxt-configured). It does NOT live on `ConversationState` (which `onSearch`
-  rebuilds every search) nor in the TTL'd `ConversationStore` — both would wipe the preference. Resolved at the
-  two `nextTurn` call sites + the `runSearch` pmxt arg in `index.ts`; a restart reverts to env (no DB — the
-  Sawa no-writes invariant). A **read** command (`"settings"`) reports the current per-space values.
+- **Compound symptom fixed — Solution B** (the headline one the adversarial review flagged; the review framed
+  it as A = standalone-only vs B = compound-aware, and we shipped **B**): `peelSettings` **strips the leading
+  settings clause, applies the toggle, then re-runs intent on the remainder.** So `"turn on the quips, look
+  for X"` applies the toggle and searches `"X"` — the toggle phrase is **never searched**. A head that isn't a
+  settings command stops the peel, so `"find cap and trade"` / `"Switzerland, India"` never split.
+- **Sticky per-space store** (`SpaceSettings`) — **DURABLE**: written through to a bot-local JSON file
+  (`.sawa/settings.json`, gitignored; override `SAWA_SETTINGS_FILE`) on every change and rehydrated on
+  startup, so a toggle **persists for days/weeks across restarts until changed again** — NOT in-memory-only.
+  Spectrum has no server-side state on any tier, but the bot owns its host's filesystem; this is bot-local UX
+  state, **not** a Sawa DB write (the no-writes invariant governs the Sawa Postgres / bot API, not a local
+  preference file). **No TTL** (a preference must not revert mid-session); the env defaults (quips ←
+  `SAWA_FOLK_TONE`, external ← pmxt-configured) only seed a never-set space. It does NOT live on
+  `ConversationState` (which `onSearch` rebuilds every search) nor in the TTL'd `ConversationStore` — both
+  would wipe the preference. Resolved at the two `nextTurn` call sites + the `runSearch` pmxt arg in
+  `index.ts`. A **read** command (`"settings"`) reports the current per-space values.
 
 Feasibility was identical for LOCAL mode (today) and a future builder/dedicated line — the feature is 100%
-in-process and keys on the already-stable `space.id`; the builder plan only makes group toggles reachable on a
-non-shared line. Tests: `tests/settings.test.ts` (recognizer on/off + null, compound peel, store
-round-trip/independence/eviction, read reply). 15 new tests.
+in-process (durability is a local file either way) and keys on the already-stable `space.id`; the builder plan
+only makes group toggles reachable on a non-shared line. Tests: `tests/settings.test.ts` (recognizer on/off +
+null, compound peel, store round-trip/independence/eviction, **durable persistence round-trip + legacy-key
+tolerance**, read reply). 17 new tests.
 
 ### Original spec (retained for reference)
 

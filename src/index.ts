@@ -12,6 +12,7 @@
 import "./env"; // MUST be first: loads ./.env into process.env before anything reads it.
 
 import net from "node:net";
+import path from "node:path";
 import { Spectrum, text, markdown, richlink } from "spectrum-ts";
 import { imessage } from "spectrum-ts/providers/imessage";
 import { terminal } from "spectrum-ts/providers/terminal";
@@ -36,6 +37,7 @@ import { toPlainText } from "./sawa/cards";
 import { ConversationStore, toContext, nextTurn } from "./sawa/conversation";
 import {
   SpaceSettings,
+  fileSettingsPersistence,
   peelSettings,
   isSettingsQuery,
   confirmChanges,
@@ -162,9 +164,16 @@ const convo = new ConversationStore();
 // factual otherwise). See cards.folkQuip — deliberately mild + category-blind for brand safety.
 const folkTone = process.env.SAWA_FOLK_TONE === "1" || process.env.SAWA_FOLK_TONE === "true";
 // Agent settings the user can toggle from chat ("quips off", "sawa only", "settings"). Sticky per
-// space, in-memory, seeded from env defaults: quips from SAWA_FOLK_TONE, external markets on whenever
-// pmxt is configured. A restart reverts to these defaults by design. See src/sawa/settings.ts.
-const settings = new SpaceSettings({ quips: folkTone, external: pmxtConfig !== null });
+// space and DURABLE: written through to a bot-local JSON file (gitignored .sawa/, override via
+// SAWA_SETTINGS_FILE) so a toggle persists for days/weeks across restarts until changed again. The
+// env defaults (quips ← SAWA_FOLK_TONE, external ← pmxt configured) only seed a never-set space. This
+// is bot-local UX state, NOT a Sawa DB write. See src/sawa/settings.ts + docs/AGENT_SETTINGS.md.
+const settingsFile = process.env.SAWA_SETTINGS_FILE || path.join(process.cwd(), ".sawa", "settings.json");
+const settings = new SpaceSettings(
+  { quips: folkTone, external: pmxtConfig !== null },
+  { persist: fileSettingsPersistence(settingsFile) },
+);
+console.warn(`[sawa] agent settings: persisting per-space toggles to ${settingsFile} (survives restart).`);
 
 function needsConfig(): string {
   return "Sawa isn't configured yet (set SAWA_API_BASE_URL).";
