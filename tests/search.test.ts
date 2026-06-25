@@ -155,6 +155,45 @@ describe("runSearch", () => {
   });
 });
 
+/** A query-aware pmxt stub: the handler decides each response from the `q` sub-query + venue. */
+function installQueryStub(handler: (q: string, kalshi: boolean) => unknown[]) {
+  globalThis.fetch = ((url: string | URL) => {
+    const u = String(url);
+    if (u.includes("/api/predictions")) return Promise.resolve(res(sawaFeed([])));
+    if (u.includes("api.pmxt.dev")) {
+      const q = decodeURIComponent(new URL(u).searchParams.get("q") ?? "");
+      return Promise.resolve(res({ data: handler(q, u.includes("sourceExchange=kalshi")), meta: {} }));
+    }
+    return Promise.resolve(res({}, 404));
+  }) as typeof fetch;
+}
+
+describe("runSearch — proper-noun entity decomposition (Issue 4)", () => {
+  it("surfaces an entity market a compound query only reaches via decomposition", async () => {
+    // pmxt matches titles by phrase: the full compound returns nothing; only "Raul Jimenez" hits.
+    installQueryStub((q, kalshi) =>
+      kalshi && q === "Raul Jimenez" ? [pmxtMarket("kalshi", "Raul Jimenez: 1+ goals", "Yes", 0.3)] : [],
+    );
+    const r = await runSearch("Mexico Raul Jimenez player props", { config, pmxt });
+    expect(r.kalshi.map((m) => m.title)).toEqual(["Raul Jimenez: 1+ goals"]);
+    expect(r.empty).toBe(false);
+  });
+
+  it("drops decomposition noise via the ORIGINAL-query relevance floor", async () => {
+    // The broad "Cup" sub-query pulls an unrelated "Stanley Cup" market; the real World Cup market
+    // comes from the full query / "World Cup" bigram. Both are fetched; only the relevant one stays.
+    installQueryStub((q, kalshi) => {
+      if (!kalshi) return [];
+      if (q === "Cup") return [pmxtMarket("kalshi", "Stanley Cup Winner", "Panthers", 0.5)];
+      if (q === "FIFA World Cup" || q === "World Cup") return [pmxtMarket("kalshi", "World Cup Winner: Brazil?", "Brazil", 0.22)];
+      return [];
+    });
+    const r = await runSearch("FIFA World Cup", { config, pmxt });
+    // "Stanley Cup" scores 1/3 < RELEVANCE_MIN against "FIFA World Cup" → filtered; World Cup kept.
+    expect(r.kalshi.map((m) => m.title)).toEqual(["World Cup Winner: Brazil?"]);
+  });
+});
+
 describe("flattenRanked", () => {
   it("leads with the Sawa market when one is relevant, then pages cross-venue", async () => {
     installStub({

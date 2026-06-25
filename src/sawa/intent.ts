@@ -69,9 +69,13 @@ const CREATE_RE = /\b(make|create|start|open|set up|new)\s+(a\s+|an\s+|the\s+)?(
 const ACCOUNT_RE = /\b(my )?(balance|wallet|coins|portfolio|positions?|my bets?|leaderboard|rank|profile|watchlist)\b/i;
 const HELP_RE = /^\/?\s*(help|commands?|what can you do|how does this work)\b/i;
 
-// Explicit search triggers + the phrase to peel off to get the subject.
+// Explicit search triggers + the phrase to peel off to get the subject. The first entry's
+// alternation is ordered LONGEST-FIRST ("look up for" before "look up", "find me" before "find",
+// "search for" before "search") so the most specific phrasing wins and the whole trigger is
+// stripped — "look for X" / "search for X" / "find me X" must resolve here, not leak to the LLM.
+const SEARCH_VERBS = "search for|find me|look up for|look for|look up|lookup|find|search|show me|show|get me";
 const SEARCH_TRIGGERS: { re: RegExp; strip: RegExp }[] = [
-  { re: /^(find|search|lookup|look up|show me|show|get me)\b/i, strip: /^(find|search|lookup|look up|show me|show|get me)\b\s*/i },
+  { re: new RegExp(`^(${SEARCH_VERBS})\\b`, "i"), strip: new RegExp(`^(${SEARCH_VERBS})\\b\\s*`, "i") },
   { re: /\bwhere can i (bet|trade|wager)( on)?\b/i, strip: /^.*\bwhere can i (bet|trade|wager)( on)?\b\s*/i },
   { re: /\b(bet|trade|wager) on\b/i, strip: /^.*\b(bet|trade|wager) on\b\s*/i },
   { re: /\bodds (on|for|of)\b/i, strip: /^.*\bodds (on|for|of)\b\s*/i },
@@ -176,8 +180,13 @@ const SYSTEM_PROMPT =
   'Return ONLY JSON: {"kind":"search"|"other","query":string}. ' +
   '"search" = the user wants to find/see prediction markets or odds on a topic. ' +
   '"other" = greeting, small talk, account/balance, help, or a request to CREATE a market. ' +
-  'For "search", set "query" to the clean topic only — strip filler like "sawa", "find", ' +
-  '"where can I bet on", "odds on", "markets for", and trailing punctuation. ' +
+  'For "search", set "query" to the SEARCHABLE ENTITY (and a one-word prop if present) — the ' +
+  "team, player, event, or asset the market is about. Strip filler and role words: " +
+  '"sawa", "find", "look for", "where can I bet on", "odds on", "markets for", "player props on", ' +
+  '"lines for", surrounding team-context words, and trailing punctuation. ' +
+  'Examples: "look for player props on Mexico Raul Jimenez" -> {"kind":"search","query":"Raul Jimenez goals"}; ' +
+  '"odds on the FIFA World Cup" -> {"kind":"search","query":"FIFA World Cup"}; ' +
+  '"hey what is up" -> {"kind":"other","query":""}. ' +
   'For "other", set "query" to "".';
 
 /**
@@ -203,6 +212,22 @@ interface RawLlm {
   kind?: unknown;
   query?: unknown;
   venue?: unknown;
+}
+
+/**
+ * Pull the JSON object out of an LLM completion body that may be wrapped in ```code fences``` or
+ * padded with stray prose. Strips a leading/trailing fence, then narrows to the first `{`…last `}`.
+ * Falls back to the trimmed input when no braces are found, so a clean body parses unchanged. The
+ * caller still guards `JSON.parse` — this only widens what parses, it never throws.
+ */
+function extractJsonObject(content: string): string {
+  let s = content.trim();
+  if (s.startsWith("```")) {
+    s = s.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  }
+  const first = s.indexOf("{");
+  const last = s.lastIndexOf("}");
+  return first !== -1 && last > first ? s.slice(first, last + 1) : s;
 }
 
 /** Clamp an arbitrary LLM venue string to a known Venue, or undefined. */
@@ -264,12 +289,24 @@ async function classifyWithLlm(text: string, cfg: IntentConfig, ctx?: FollowupCo
           { role: "user" as const, content: text.slice(0, 400) },
         ];
     const resp = await getClient(cfg).chat.completions.create(
-      { model: cfg.model, temperature: 0, max_tokens: 80, response_format: { type: "json_object" }, messages },
+      // 256 (was 80): the JSON schema is tiny, but the model occasionally pretty-prints multi-line
+      // JSON that overran an 80-token cap → truncated mid-string → `Unterminated string` → silent
+      // regex fallback. 256 removes truncation for any reasonable body.
+      { model: cfg.model, temperature: 0, max_tokens: 256, response_format: { type: "json_object" }, messages },
       { timeout: 6_000 },
     );
     const content = resp.choices[0]?.message?.content;
     if (!content) return null;
-    const parsed = JSON.parse(content) as RawLlm;
+    let parsed: RawLlm;
+    try {
+      parsed = JSON.parse(extractJsonObject(content)) as RawLlm;
+    } catch (parseErr) {
+      // Keep the raw body (truncated) so a future regression is diagnosable, then fall back.
+      console.warn(
+        `[intent] LLM returned unparseable JSON — using regex gate. ${(parseErr as Error).message}; body=${content.slice(0, 200)}`,
+      );
+      return null;
+    }
     return useCtx ? interpretFollowupLlm(parsed) : interpretColdLlm(parsed);
   } catch (err) {
     console.warn(`[intent] LLM classify failed — using regex gate. ${(err as Error).message}`);

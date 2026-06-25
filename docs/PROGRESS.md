@@ -5,6 +5,38 @@ status lives in [`../AGENTS.md`](../AGENTS.md); the phased plan in [`BUILD_PLAN.
 
 ---
 
+## 2026-06-24 (search hardening) — 4 of 5 search-path issues fixed (intent JSON, triggers, pmxt retry, entity matching)
+
+Implemented issues **1–4** of [`SEARCH_FIXES.md`](SEARCH_FIXES.md) (the work-list from the live group test).
+Issue **5** (chat-toggleable quips) was scoped out as a feature, not a reliability bug — spec retained for a
+follow-up. `npm run typecheck` clean; `npm test` **126/126** (+13 new unit tests).
+
+1. **Intent LLM JSON truncation → fixed.** `classifyWithLlm` (`src/sawa/intent.ts`) raised `max_tokens`
+   `80 → 256` and now extracts the JSON object defensively before `JSON.parse` (strips ```` ```json ````
+   fences, narrows to first-`{`…last-`}`), logging the raw body on a parse miss before the regex fallback.
+   The model's occasional multi-line/pretty-printed JSON no longer truncates into `Unterminated string`.
+2. **`look for` / `search for` / `find me` triggers → added.** The first `SEARCH_TRIGGERS` entry now resolves
+   these (plus `look up for`) at the zero-cost regex gate with the subject stripped (longest-first alternation
+   so the bare verbs still work) — no LLM dependency, so an LLM hiccup can't degrade a `"look for …"` query.
+3. **pmxt 6s timeout dropping venues → fixed.** `getJson` (`src/pmxt/http.ts`) default timeout `6s → 9s` plus
+   **one** retry on a *transient* failure only (timeout `AbortError` / network `TypeError`) with a short
+   backoff — an HTTP status (`PmxtError`, any 4xx/5xx) is definitive and never retried. The `discover.ts`
+   warn log now distinguishes `timeout` / `network` / `HTTP <status>`. Stays fully fail-soft.
+4. **Compound / player-prop queries missing existing markets → fixed (the important one).** `expandQueries`
+   (`src/pmxt/discover.ts`) now decomposes a space-joined proper-noun compound into entity sub-queries
+   (individual capitalized words → adjacent bigrams → the whole span, deduped, cap raised `4 → 6`), so
+   `"Mexico Raul Jimenez player props"` reaches `"Raul Jimenez"` (which has a Kalshi `1+ goals` market) and
+   `"Czechia Mexico"` reaches each country. The enabler: `searchVenue` takes a `relevanceQuery` and
+   `searchExternal` passes the **original** query, so rows fetched via a broad sub-query are ranked against the
+   user's full intent and the existing `RELEVANCE_MIN` floor drops decomposition noise (`"Stanley Cup"` from a
+   `"Cup"` sub-query scores 1/3 < floor). The cold `SYSTEM_PROMPT` was also sharpened to extract the
+   searchable entity+prop (with few-shot examples). Old `expandQueries` unit assertions for `"FIFA World Cup"`
+   / `"Switzerland vs Canada"` were updated to the new (intentional) decomposed behavior.
+
+**Still open:** Issue 5 (quips chat-toggle) and a live iMessage group re-test of the four fixes.
+
+---
+
 ## 2026-06-24 (live group test) — LOCAL-mode group send fixed (mixed iMessage/RCS); 5 search issues spec'd
 
 **The conversational reply now delivers live in an iMessage group** (LOCAL mode), and a 5-person test surfaced

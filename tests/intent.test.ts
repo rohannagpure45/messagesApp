@@ -21,6 +21,22 @@ function stubClient(content: string | (() => never), onCall?: () => void) {
   } as unknown as Parameters<typeof __setClient>[0];
 }
 
+/** Like `stubClient` but records the args each `create` call is invoked with (to assert params). */
+function capturingStub(content: string) {
+  const calls: Record<string, unknown>[] = [];
+  const client = {
+    chat: {
+      completions: {
+        create: async (args: Record<string, unknown>) => {
+          calls.push(args);
+          return { choices: [{ message: { content } }] };
+        },
+      },
+    },
+  } as unknown as Parameters<typeof __setClient>[0];
+  return { client, calls };
+}
+
 afterEach(() => __setClient(null));
 
 describe("classify (regex-first gate)", () => {
@@ -51,6 +67,25 @@ describe("classify (regex-first gate)", () => {
     expect(c.query).toBe("world cup");
     expect(c.confident).toBe(false);
     expect(c.via).toBe("fallback");
+  });
+
+  it("resolves 'look for' / 'search for' / 'find me' phrasings at the regex gate (no LLM)", () => {
+    expect(classify("look for Czechia Mexico", BOT)).toMatchObject({
+      kind: "search",
+      query: "Czechia Mexico",
+      confident: true,
+      via: "regex",
+    });
+    expect(classify("search for bitcoin", BOT)).toMatchObject({ kind: "search", query: "bitcoin", confident: true });
+    expect(classify("find me the world cup", BOT)).toMatchObject({ kind: "search", query: "world cup", confident: true });
+    expect(classify("sawa look for player props on Raul Jimenez", BOT)).toMatchObject({
+      kind: "search",
+      query: "player props on Raul Jimenez",
+      confident: true,
+      via: "regex",
+    });
+    // The bare verb "find" still works (longest-first alternation never swallows the subject).
+    expect(classify("find world cup", BOT)).toMatchObject({ kind: "search", query: "world cup" });
   });
 });
 
@@ -166,5 +201,39 @@ describe("parseIntent with active-market context", () => {
   it("still treats a confident new-search trigger as a search mid-thread", async () => {
     const intent = await parseIntent("find nba finals", BOT, cfg, activeCtx);
     expect(intent).toMatchObject({ kind: "search", query: "nba finals", via: "regex" });
+  });
+});
+
+describe("classifyWithLlm JSON robustness (Issue 1)", () => {
+  it("requests max_tokens 256 (was 80 — the truncation cause)", async () => {
+    const { client, calls } = capturingStub('{"kind":"search","query":"bitcoin"}');
+    __setClient(client);
+    await parseIntent("sawa hmm thoughts on btc", BOT, cfg);
+    expect(calls[0]!.max_tokens).toBe(256);
+  });
+
+  it("parses multi-line / pretty-printed JSON (the live failure shape)", async () => {
+    __setClient(stubClient('{\n  "kind": "search",\n  "query": "World Cup"\n}'));
+    const intent = await parseIntent("sawa thoughts on the cup", BOT, cfg);
+    expect(intent).toMatchObject({ kind: "search", query: "World Cup", via: "llm" });
+  });
+
+  it("parses a ```json fenced body", async () => {
+    __setClient(stubClient('```json\n{"kind":"search","query":"Bitcoin"}\n```'));
+    const intent = await parseIntent("sawa thoughts on btc", BOT, cfg);
+    expect(intent).toMatchObject({ kind: "search", query: "Bitcoin", via: "llm" });
+  });
+
+  it("parses a body with leading prose around the object", async () => {
+    __setClient(stubClient('Sure! Here you go: {"kind":"other","query":""} hope that helps'));
+    const intent = await parseIntent("sawa what do you reckon", BOT, cfg);
+    expect(intent).toMatchObject({ kind: "other", via: "llm" });
+  });
+
+  it("falls back to the regex gate (never throws) on a truncated/unparseable body", async () => {
+    __setClient(stubClient('{"kind":"search","query":"World C')); // cut off mid-string
+    const intent = await parseIntent("sawa some ambiguous thing", BOT, cfg);
+    expect(intent.via).toBe("fallback");
+    expect(intent).toMatchObject({ kind: "search", query: "some ambiguous thing" });
   });
 });

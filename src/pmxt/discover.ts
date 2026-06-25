@@ -98,7 +98,7 @@ function headlineOutcomes(outcomes: UnifiedOutcome[] | null | undefined): {
   };
 }
 
-function toVenueResult(m: UnifiedMarket, label: string, query: string): VenueResult {
+function toVenueResult(m: UnifiedMarket, label: string, relevanceQuery: string): VenueResult {
   const head = headlineOutcomes(m.outcomes);
   const venue = (m.sourceExchange as Exclude<Venue, "sawa">) ?? label.toLowerCase();
   return {
@@ -111,21 +111,30 @@ function toVenueResult(m: UnifiedMarket, label: string, query: string): VenueRes
     volume24h: m.volume24h ?? m.volume ?? undefined,
     top: head ? { label: head.top.label, price: head.top.price } : undefined,
     runnerUp: head?.runnerUp ? { label: head.runnerUp.label, price: head.runnerUp.price } : undefined,
-    relevance: scoreRelevance(m.title, query),
+    relevance: scoreRelevance(m.title, relevanceQuery),
   };
 }
 
-/** Search one venue's open markets for `query`. Cached; throws PmxtError on an upstream failure. */
+/**
+ * Search one venue's open markets for `query`. Cached; throws PmxtError on an upstream failure.
+ *
+ * `relevanceQuery` (defaults to `query`) is what rows are scored against — NOT necessarily the
+ * fetch term. `searchExternal` passes the ORIGINAL user query here while fetching with a narrower
+ * entity sub-query, so a row found via a decomposed sub-query (`"Cup"`) is still ranked against the
+ * user's full intent (`"FIFA World Cup"`); the `RELEVANCE_MIN` floor in search.ts then drops
+ * decomposition noise (`"Stanley Cup"` scores 1/3 < floor) while keeping the real entity market.
+ */
 export async function searchVenue(
   cfg: PmxtConfig,
   venue: Exclude<Venue, "sawa">,
   label: string,
   query: string,
   limit = 6,
+  relevanceQuery: string = query,
 ): Promise<VenueResult[]> {
   const key = cacheKey(venue, query);
   const hit = cache.get(key);
-  if (hit && now() - hit.at < CACHE_TTL_MS) return hit.results;
+  if (hit && now() - hit.at < CACHE_TTL_MS) return rescore(hit.results, relevanceQuery);
 
   const url = new URL(`${cfg.baseUrl}/v0/markets`);
   url.searchParams.set("q", query); // verified: `q`, not `query`
@@ -134,38 +143,94 @@ export async function searchVenue(
   url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 50))));
 
   const res = await getJson<MarketsResponse>(url, cfg.apiKey);
-  const results = (res.data ?? []).map((m) => toVenueResult(m, label, query));
+  const results = (res.data ?? []).map((m) => toVenueResult(m, label, relevanceQuery));
   cache.set(key, { at: now(), results });
   return results;
 }
 
+/**
+ * Re-score cached rows against `relevanceQuery`. The cache is keyed by (venue, fetch-query) but the
+ * SAME fetch sub-query can be reached from different original queries, so relevance (which depends
+ * on the original) must be recomputed on a cache hit rather than served stale.
+ */
+function rescore(rows: VenueResult[], relevanceQuery: string): VenueResult[] {
+  return rows.map((r) => ({ ...r, relevance: scoreRelevance(r.title, relevanceQuery) }));
+}
+
 /** Cap on distinct sub-queries per venue (full query + entities) — bounds API calls/credits. */
-const MAX_SUBQUERIES = 4;
+const MAX_SUBQUERIES = 6;
+
+/** A "Capitalized" or ALL-CAPS word (e.g. "Mexico", "Jimenez", "FIFA", "BTC") — a proper-noun token. */
+const PROPER_WORD = /^[A-Z][\w''-]*$/;
 
 /**
- * Expand a query into the sub-queries to actually search pmxt with: the FULL query plus each
- * list-entity. pmxt's `q` is a phrase/title match, so a multi-entity list like "Switzerland, India"
- * matches NOTHING (no single market title contains both) even though each entity has 20+ markets —
- * verified live. We split ONLY on unambiguous list separators (comma, semicolon, slash, ampersand,
- * " and ") — never on "vs"/"or"/spaces — and keep the full query too, so genuine phrases ("FIFA
- * World Cup", "Switzerland vs Canada", "cap and trade") still match while each entity also surfaces
- * its own markets. Single-entity queries (no separator) reduce to just the original — unchanged.
+ * Maximal runs of consecutive proper-noun words in `query` (e.g. "Mexico Raul Jimenez player props"
+ * → ["Mexico Raul Jimenez"]; "Switzerland vs Canada" → ["Switzerland", "Canada"], since lowercase
+ * "vs" breaks the run). Lowercase tails like "player props"/"goals"/"odds" are naturally excluded —
+ * they are not proper nouns. These spans are the entities a compound query is really about.
+ */
+function properNounSpans(query: string): string[] {
+  const spans: string[] = [];
+  let run: string[] = [];
+  for (const tok of query.split(/\s+/)) {
+    if (PROPER_WORD.test(tok)) {
+      run.push(tok);
+    } else {
+      if (run.length) spans.push(run.join(" "));
+      run = [];
+    }
+  }
+  if (run.length) spans.push(run.join(" "));
+  return spans;
+}
+
+/**
+ * Expand a query into the sub-queries to actually search pmxt with. pmxt's `q` is a phrase/title
+ * match, so a compound natural-language query ("Mexico Raul Jimenez player props", "Switzerland,
+ * India") matches NOTHING even though each entity has its own market — verified live. We therefore
+ * emit, in priority order (deduped, capped):
+ *   1. the FULL query (genuine phrases like "FIFA World Cup" still match a single title);
+ *   2. list-separator entities (comma / semicolon / slash / ampersand / " and ");
+ *   3. proper-noun entities — individual Capitalized words, then adjacent Capitalized bigrams, then
+ *      the whole multi-word span — so "Mexico Raul Jimenez" reaches "Raul Jimenez" (the entity that
+ *      actually has a market). Words come before bigrams so single entities survive the cap.
+ * Relevance for every row is scored against the ORIGINAL query (see `searchVenue`), so a broad
+ * decomposition (e.g. "Cup") never leaks noise past the `RELEVANCE_MIN` floor. Single proper nouns
+ * and plain lowercase queries ("world cup") reduce to just the original — unchanged.
  */
 export function expandQueries(query: string): string[] {
   const full = query.trim();
-  const parts = full
-    .split(/\s*(?:,|;|\/|&|\band\b)\s*/i)
-    .map((s) => s.trim())
-    .filter((s) => s.length >= 2);
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const q of [full, ...parts]) {
-    const k = q.toLowerCase();
-    if (q.length >= 2 && !seen.has(k)) {
+  const add = (q: string) => {
+    const t = q.trim();
+    const k = t.toLowerCase();
+    if (t.length >= 2 && !seen.has(k)) {
       seen.add(k);
-      out.push(q);
+      out.push(t);
     }
+  };
+
+  add(full);
+  // 2. List-separator entities.
+  for (const part of full.split(/\s*(?:,|;|\/|&|\band\b)\s*/i)) add(part);
+  // 3. Proper-noun entities: words first (cheap, high-value), then bigrams, then the whole span.
+  const spans = properNounSpans(full);
+  const words: string[] = [];
+  const bigrams: string[] = [];
+  for (const span of spans) {
+    const toks = span.split(/\s+/);
+    if (toks.length === 1) {
+      words.push(span);
+      continue;
+    }
+    for (const w of toks) words.push(w);
+    for (let i = 0; i + 1 < toks.length; i++) bigrams.push(`${toks[i]} ${toks[i + 1]}`);
   }
+  for (const w of words) add(w);
+  for (const b of bigrams) add(b);
+  for (const span of spans) if (span.includes(" ")) add(span);
+
   return out.slice(0, MAX_SUBQUERIES);
 }
 
@@ -183,7 +248,8 @@ export async function searchExternal(
   const subqueries = expandQueries(query);
   const tasks = EXCHANGES.flatMap((e) => subqueries.map((q) => ({ e, q })));
   const settled = await Promise.allSettled(
-    tasks.map(({ e, q }) => searchVenue(cfg, e.venue, e.label, q, limitPerVenue)),
+    // Fetch with the (narrow) sub-query, but score relevance against the ORIGINAL `query`.
+    tasks.map(({ e, q }) => searchVenue(cfg, e.venue, e.label, q, limitPerVenue, query)),
   );
   const out: ExternalResults = { kalshi: [], polymarket: [] };
   const seen: Record<string, Set<string>> = { kalshi: new Set(), polymarket: new Set() };
@@ -198,7 +264,14 @@ export async function searchExternal(
         }
       }
     } else {
-      const detail = r.reason instanceof PmxtError ? `${r.reason.status}` : "error";
+      // Distinguish the failure class so logs aren't ambiguous: a real HTTP status (definitive),
+      // a timeout (AbortError, after the retry), or a network error.
+      const reason = r.reason as Error | undefined;
+      const detail = r.reason instanceof PmxtError
+        ? `HTTP ${r.reason.status}`
+        : reason?.name === "AbortError"
+          ? "timeout"
+          : "network";
       console.warn(`[pmxt] ${e.venue} search "${q}" failed (${detail}) — degrading to without it.`);
     }
   });

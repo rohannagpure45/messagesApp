@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { searchVenue, searchExternal, expandQueries, __setClock, __clearCache } from "../src/pmxt/discover";
+import { PmxtError, __setRetryBackoffMs } from "../src/pmxt/http";
 import type { PmxtConfig } from "../src/sawa/config";
 
 const cfg: PmxtConfig = { apiKey: "test-key", baseUrl: "https://api.pmxt.dev", builderMode: false };
@@ -44,10 +45,12 @@ const resp = (markets: unknown[]) => ({ data: markets, meta: { count: markets.le
 beforeEach(() => {
   __clearCache();
   __setClock(() => 0);
+  __setRetryBackoffMs(0); // don't actually sleep during retry tests
 });
 afterEach(() => {
   globalThis.fetch = realFetch;
   __setClock(() => Date.now());
+  __setRetryBackoffMs(250);
 });
 
 describe("searchVenue", () => {
@@ -110,7 +113,7 @@ describe("searchVenue", () => {
   });
 });
 
-describe("expandQueries (multi-entity list splitting)", () => {
+describe("expandQueries (list + proper-noun entity decomposition)", () => {
   it("keeps the full query AND splits list separators into entities", () => {
     // The full query stays (genuine phrases still match), plus each list-entity is searched on its own.
     expect(expandQueries("Switzerland, India")).toEqual(["Switzerland, India", "Switzerland", "India"]);
@@ -119,14 +122,74 @@ describe("expandQueries (multi-entity list splitting)", () => {
     expect(expandQueries("cap and trade")).toEqual(["cap and trade", "cap", "trade"]);
   });
 
-  it("leaves single-entity / phrase queries unchanged (spaces and 'vs' are NOT separators)", () => {
+  it("decomposes a space-joined proper-noun compound into the entity that has a market", () => {
+    // "Mexico Raul Jimenez player props" matches no title as a phrase; "Raul Jimenez" does.
+    const xs = expandQueries("Mexico Raul Jimenez player props");
+    expect(xs).toContain("Mexico Raul Jimenez player props"); // full query kept
+    expect(xs).toContain("Raul Jimenez"); // the entity sub-query (adjacent proper-noun bigram)
+    expect(xs).toContain("Mexico");
+    expect(xs).not.toContain("player"); // lowercase tails are not entities
+    expect(xs.length).toBeLessThanOrEqual(6);
+  });
+
+  it("splits a two-entity compound ('Czechia Mexico') into each country", () => {
+    expect(expandQueries("Czechia Mexico")).toEqual(["Czechia Mexico", "Czechia", "Mexico"]);
+  });
+
+  it("leaves a single proper noun and plain lowercase queries unchanged", () => {
+    expect(expandQueries("Czechia")).toEqual(["Czechia"]);
     expect(expandQueries("world cup")).toEqual(["world cup"]);
-    expect(expandQueries("FIFA World Cup")).toEqual(["FIFA World Cup"]);
-    expect(expandQueries("Switzerland vs Canada")).toEqual(["Switzerland vs Canada"]);
+    expect(expandQueries("bitcoin")).toEqual(["bitcoin"]);
   });
 
   it("caps the number of sub-queries to bound pmxt calls/credits", () => {
-    expect(expandQueries("a1, b2, c3, d4, e5").length).toBeLessThanOrEqual(4);
+    expect(expandQueries("a1, b2, c3, d4, e5").length).toBeLessThanOrEqual(6);
+    expect(expandQueries("Alpha Bravo Charlie Delta Echo Foxtrot").length).toBeLessThanOrEqual(6);
+  });
+});
+
+describe("getJson transient retry (via searchVenue)", () => {
+  it("retries once on a transient error (timeout/network) and returns rows on the second try", async () => {
+    let n = 0;
+    globalThis.fetch = (() => {
+      n += 1;
+      if (n === 1) {
+        const e = new Error("The operation was aborted");
+        e.name = "AbortError"; // what an AbortController timeout throws
+        return Promise.reject(e);
+      }
+      return Promise.resolve(res(resp([market()])));
+    }) as typeof fetch;
+    const rows = await searchVenue(cfg, "kalshi", "Kalshi", "la mayor", 20);
+    expect(n).toBe(2); // one retry
+    expect(rows).toHaveLength(1);
+  });
+
+  it("does NOT retry a definitive HTTP error (e.g. 429) — it is a real answer, not transient", async () => {
+    let n = 0;
+    globalThis.fetch = (() => {
+      n += 1;
+      return Promise.resolve(res({ error: "rate limited" }, 429));
+    }) as typeof fetch;
+    await expect(searchVenue(cfg, "kalshi", "Kalshi", "x", 20)).rejects.toBeInstanceOf(PmxtError);
+    expect(n).toBe(1); // no retry
+  });
+});
+
+describe("searchExternal relevance is scored against the ORIGINAL query", () => {
+  it("ranks a row found via a narrow sub-query against the user's full query", async () => {
+    stub((url) => {
+      const q = decodeURIComponent(new URL(url).searchParams.get("q") ?? "");
+      if (url.includes("sourceExchange=kalshi") && q === "Raul Jimenez") {
+        return res(resp([market({ title: "Raul Jimenez: 1+ goals", outcomes: [{ label: "Yes", price: 0.3 }] })]));
+      }
+      return res(resp([]));
+    });
+    const out = await searchExternal(cfg, "Mexico Raul Jimenez player props", 20);
+    expect(out.kalshi).toHaveLength(1);
+    // 2 of the 5 original-query tokens (raul, jimenez) ≈ 0.4 — NOT 1.0 (which scoring vs the
+    // sub-query "Raul Jimenez" would give). This is what lets the RELEVANCE_MIN floor pass it.
+    expect(out.kalshi[0]!.relevance).toBeCloseTo(0.4, 2);
   });
 });
 

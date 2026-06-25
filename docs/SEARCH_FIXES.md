@@ -1,9 +1,17 @@
 # Conversational Search — reliability + matching fixes (implementation spec)
 
-**Status:** SPEC / TODO (found 24-Jun during the first live LOCAL-mode group test; not yet implemented).
-This document is the authoritative work-list for a `/goal` run. Each item has **symptom → evidence →
-root cause → fix → acceptance**. Implement all five. Keep `npm run typecheck` + `npm test` green and add
-unit tests per item.
+**Status:** Issues **1–4 IMPLEMENTED 24-Jun** (typecheck clean; `npm test` 126 green). Issue **5 (quips
+chat-toggle) DEFERRED** — scoped out of this `/goal` as a feature (not a reliability bug); spec retained
+below for the follow-up. Found 24-Jun during the first live LOCAL-mode group test. Each item has
+**symptom → evidence → root cause → fix → acceptance**.
+
+**What shipped (1–4):** `max_tokens 80→256` + defensive JSON extraction (fences/prose/first-`{`-to-last-`}`)
+in `classifyWithLlm`; `look for`/`search for`/`find me`/`look up for` added to the regex `SEARCH_TRIGGERS`;
+pmxt timeout `6s→9s` + one transient-only retry (abort/network, never an HTTP status) with a class-aware
+warn log; and proper-noun **entity decomposition** in `expandQueries` (words → adjacent bigrams → whole
+span, capped at 6) made safe by scoring external rows against the **ORIGINAL** query (new `relevanceQuery`
+arg on `searchVenue`) so the `RELEVANCE_MIN` floor drops decomposition noise. Plus a sharper cold
+`SYSTEM_PROMPT` (entity+prop extraction, few-shot). See the per-issue ✅ notes below.
 
 **Context.** The folk-style conversational SEARCH reply ([`src/sawa/cards.ts`](../src/sawa/cards.ts) `renderOne`)
 + history-aware follow-ups ([`src/sawa/conversation.ts`](../src/sawa/conversation.ts)) are live in iMessage
@@ -13,7 +21,7 @@ real intent-LLM + pmxt (`gemini-3.1-flash-lite`, `api.pmxt.dev`) on 24-Jun.
 
 ---
 
-## Issue 1 — Intent LLM returns truncated JSON → silent regex fallback
+## Issue 1 — Intent LLM returns truncated JSON → silent regex fallback ✅ DONE
 
 **Symptom.** Log: `[intent] LLM classify failed — using regex gate. Unterminated string in JSON at position
 184 (line 11 column 23)`. Intermittent; degrades intent quality (see Issue 2).
@@ -41,7 +49,7 @@ body, a code-fenced body, and a body with leading prose — all parse to the cor
 
 ---
 
-## Issue 2 — `"look for X"` is not a search trigger → always hits the LLM, then degrades on failure
+## Issue 2 — `"look for X"` is not a search trigger → always hits the LLM, then degrades on failure ✅ DONE
 
 **Symptom.** `Sawa look for Czechia Mexico` → empty-state, while `Sawa look for Czechia` sometimes worked.
 `look for player props on …` consistently empty.
@@ -66,7 +74,7 @@ green.
 
 ---
 
-## Issue 3 — pmxt `failed (error)` = 6-second timeout drops external venues
+## Issue 3 — pmxt `failed (error)` = 6-second timeout drops external venues ✅ DONE
 
 **Symptom.** Log: `[pmxt] kalshi search "World Cup" failed (error) — degrading to without it.` (and Czechia /
 Mexico Raul Jimenez …). Intermittent; silently loses Kalshi/Polymarket results, so a reply that should show an
@@ -90,7 +98,7 @@ green.
 
 ---
 
-## Issue 4 — Compound / player-prop queries miss markets that exist (the important one)
+## Issue 4 — Compound / player-prop queries miss markets that exist (the important one) ✅ DONE
 
 **Symptom.** `look for player props on Mexico Raul Jimenez` → empty-state, even though a matching market
 exists. `Czechia Mexico` → empty while `Czechia` → `Czechia vs Mexico Winner? — Mexico 44¢ (2.3×) on Kalshi`.
@@ -126,9 +134,21 @@ and `"Mexico"` (and the full); `"Czechia Mexico"` includes `"Czechia"` and `"Mex
 `Raul Jimenez: 1+ goals` only for the `q=Raul Jimenez` call) proves the compound query surfaces that market.
 **Live re-test:** `sawa look for player props on Raul Jimenez` → `Raul Jimenez: 1+ goals … on Kalshi.`
 
+**Implementation note (as shipped).** The deterministic expansion emits, deduped + capped at 6:
+individual capitalized words first (cheap, high-value), then adjacent capitalized **bigrams** (so a
+3-word span like `"Mexico Raul Jimenez"` yields the real entity `"Raul Jimenez"`), then the whole
+multi-word span. The linchpin that makes liberal decomposition **safe** is that `searchVenue` now takes a
+`relevanceQuery` (defaulting to the fetch query); `searchExternal` passes the **original** user query, so a
+row fetched via a broad sub-query (`"Cup"`) is scored against the full intent (`"FIFA World Cup"`) and the
+existing `RELEVANCE_MIN = 0.34` floor drops the noise (`"Stanley Cup"` → 1/3 < floor) while keeping the
+real market. Cached rows are re-scored on a cache hit (same fetch query, different original). Consequence:
+`expandQueries("FIFA World Cup")` / `("Switzerland vs Canada")` now also emit their entity sub-queries
+(the old "left unchanged" unit assertions were updated to the new intentional behavior) — the noise is
+filtered downstream, not at expansion time.
+
 ---
 
-## Issue 5 — Quips (`SAWA_FOLK_TONE`) are not user-editable; "turn on the quips" is swallowed into the search
+## Issue 5 — Quips (`SAWA_FOLK_TONE`) are not user-editable; "turn on the quips" is swallowed into the search ⏸ DEFERRED
 
 **Symptom.** `Sawa turn on the quips, look for player props …` searched the literal text
 `"turn on the quips, look for player props …"` (→ empty). The folk-tone flourish can only be set via the
@@ -165,17 +185,19 @@ reply after `quips on` includes the flourish, after `quips off` does not. **Live
 
 ## Consolidated acceptance (for the `/goal`)
 
-- [ ] **1** `max_tokens: 256` + defensive JSON extraction; truncated/fenced/prose bodies no longer break intent.
-- [ ] **2** `look for` / `search for` / `find me` resolve at the regex gate with the subject stripped.
-- [ ] **3** pmxt timeout 9s + one retry on transient (abort/network) errors; HTTP-status errors not retried.
-- [ ] **4** `expandQueries` emits proper-noun entity sub-queries (capped); compound + player-prop queries surface
-      the existing entity market; sharper LLM extraction prompt.
+- [x] **1** `max_tokens: 256` + defensive JSON extraction; truncated/fenced/prose bodies no longer break intent.
+- [x] **2** `look for` / `search for` / `find me` resolve at the regex gate with the subject stripped.
+- [x] **3** pmxt timeout 9s + one retry on transient (abort/network) errors; HTTP-status errors not retried.
+- [x] **4** `expandQueries` emits proper-noun entity sub-queries (capped); compound + player-prop queries surface
+      the existing entity market (relevance vs the original query); sharper LLM extraction prompt.
 - [ ] **5** Chat-toggleable quips (`quips on/off` / `turn on/off the quips`), sticky per-space, default
-      `SAWA_FOLK_TONE`; the toggle phrase is never searched.
-- [ ] `npm run typecheck` clean; `npm test` green with new unit tests for each item.
-- [ ] Live group re-test passes: World Cup (Sawa lead), `look for Czechia` (Kalshi), `look for player props on
-      Raul Jimenez` (Kalshi goals market), `quips on/off` toggle, link follow-up.
-- [ ] Update [`PROGRESS.md`](PROGRESS.md) (and [`AGENTS.md`](../AGENTS.md) status) when shipped.
+      `SAWA_FOLK_TONE`; the toggle phrase is never searched. **DEFERRED** — feature, not a reliability bug
+      (out of this `/goal` per the owner's framing); spec above is ready for the follow-up.
+- [x] `npm run typecheck` clean; `npm test` green (126) with new unit tests for items 1–4.
+- [ ] **Live group re-test** (pending hardware): World Cup (Sawa lead), `look for Czechia` (Kalshi),
+      `look for player props on Raul Jimenez` (Kalshi goals market), link follow-up. _(Quips toggle drops off
+      this list until Issue 5 ships.)_
+- [x] Update [`PROGRESS.md`](PROGRESS.md) + [`AGENTS.md`](../AGENTS.md) status.
 
 ## Notes / out of scope
 - pmxt remains **fail-soft and read-only**; never block the Sawa reply or trade. The disclaimer stays removed
