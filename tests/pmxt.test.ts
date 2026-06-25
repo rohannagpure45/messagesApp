@@ -178,6 +178,40 @@ describe("getJson transient retry (via searchVenue)", () => {
   });
 });
 
+describe("searchExternal staged fan-out (bounds the 429 risk)", () => {
+  it("stops after the full query when it matches — no entity fan-out (2 calls, not 12)", async () => {
+    stub((url) => {
+      const q = decodeURIComponent(new URL(url).searchParams.get("q") ?? "");
+      return res(resp(q === "FIFA World Cup" && url.includes("sourceExchange=kalshi") ? [market({ title: "World Cup Winner" })] : []));
+    });
+    const out = await searchExternal(cfg, "FIFA World Cup", 20);
+    expect(out.errored).toBe(false);
+    expect(out.kalshi).toHaveLength(1);
+    expect(calls.length).toBe(2); // full query × 2 venues only — the decomposed fan-out never runs
+  });
+
+  it("falls back to entity sub-queries only when the full query is empty", async () => {
+    stub((url) => {
+      const q = decodeURIComponent(new URL(url).searchParams.get("q") ?? "");
+      return res(resp(q === "Raul Jimenez" && url.includes("sourceExchange=kalshi") ? [market({ title: "Raul Jimenez: 1+ goals" })] : []));
+    });
+    const out = await searchExternal(cfg, "Mexico Raul Jimenez player props", 20);
+    expect(out.kalshi).toHaveLength(1); // reached only via the entity sub-query
+    expect(calls.length).toBeGreaterThan(2); // stage 1 (2) + stage 2 entities
+  });
+
+  it("flags errored=true when a venue 429s (so the reply can say 'couldn't check')", async () => {
+    stub((url) =>
+      url.includes("sourceExchange=kalshi")
+        ? res({ error: "rate limited" }, 429)
+        : res(resp([market({ sourceExchange: "polymarket", title: "Poly bitcoin market" })])),
+    );
+    const out = await searchExternal(cfg, "bitcoin", 20);
+    expect(out.errored).toBe(true);
+    expect(out.polymarket).toHaveLength(1);
+  });
+});
+
 describe("searchExternal relevance is scored against the ORIGINAL query", () => {
   it("ranks a row found via a narrow sub-query against the user's full query", async () => {
     stub((url) => {

@@ -137,6 +137,13 @@ describe("emptyReply", () => {
     expect(out.toLowerCase()).toContain("coming soon");
     expect(out.toLowerCase()).not.toContain("no cash value");
   });
+
+  it("says it couldn't reach the venues (not 'no markets') when the external lookup errored", () => {
+    const out = emptyReply("bitcoin", true);
+    expect(out).toContain("bitcoin");
+    expect(out.toLowerCase()).toMatch(/couldn't reach|rate-limit/);
+    expect(out.toLowerCase()).not.toContain("no live markets"); // don't imply the market is absent
+  });
 });
 
 describe("toPlainText", () => {

@@ -147,6 +147,14 @@ describe("runSearch", () => {
     expect(r.kalshi).toEqual([]);
     expect(r.polymarket).toEqual([]);
     expect(r.empty).toBe(false);
+    expect(r.externalErrored).toBe(true); // the 429 is recorded, even though Sawa carried the reply
+  });
+
+  it("flags externalErrored (rate-limited) rather than implying the market is absent", async () => {
+    installStub({ sawa: [], pmxtError: true }); // pmxt 429s, Sawa empty → empty result, but it's a rate-limit
+    const r = await runSearch("bitcoin", { config, pmxt });
+    expect(r.empty).toBe(true);
+    expect(r.externalErrored).toBe(true);
   });
 
   it("carries a runner-up outcome for a two-sided market (folk two-sided line)", async () => {
@@ -254,6 +262,7 @@ describe("flattenRanked", () => {
       empty: true,
       truncated: false,
       externalUnavailable: false,
+      externalErrored: false,
     };
     expect(flattenRanked(empty)).toEqual([]);
   });

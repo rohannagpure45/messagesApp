@@ -5,6 +5,37 @@ status lives in [`../AGENTS.md`](../AGENTS.md); the phased plan in [`BUILD_PLAN.
 
 ---
 
+## 2026-06-25 (live group retest #2) — pmxt 429 root-caused; staged fan-out + graceful empty-state
+
+A third live test reported "bitcoin returns nothing" and "wrong player-prop market/link". The headless log
+showed the real cause: **every pmxt call in the session returned `HTTP 429`** — the entity-decomposition
+fan-out (Fix 4) makes up to **12 calls per search** (6 sub-queries × 2 venues), and a burst of ~10 messages
+blew past the free tier's 60 req/min. A direct probe confirmed bitcoin markets DO exist in pmxt (Kalshi
+"Bitcoin price on Jun 21…", Polymarket "What price will Bitcoin hit in June…"), so the empties were purely
+rate-limiting. `npm test` **156** (+5); typecheck clean.
+
+1. **Staged fan-out** (`src/pmxt/discover.ts`): `searchExternal` now runs in two stages — the **full query**
+   on both venues first (2 calls); the entity sub-queries fire **only if stage 1 found nothing**. Most
+   queries ("bitcoin", "world cup", "argentina") resolve in stage 1, cutting the typical search from up to
+   12 calls to **2**. (Bonus: decomposition noise like "Stanley Cup" off a "FIFA World Cup" search is never
+   even fetched now.)
+2. **Concurrency cap** (`PMXT_CONCURRENCY = 4`, `runLimited`): a fan-out can no longer fire all calls at once
+   — the burst that trips pmxt's 429 is smoothed into a small queue.
+3. **Graceful empty-state** (`src/search.ts` `externalErrored` → `src/sawa/cards.ts` `emptyReply`): when a
+   pmxt lookup ERRORS (429/timeout) and nothing else matched, the reply now says *"Sawa has nothing on X, and
+   I couldn't reach Kalshi or Polymarket just now (usually a brief rate-limit) — try again in a few seconds"*
+   instead of the misleading *"No live markets for X"*. So a rate-limit no longer reads as "the market
+   doesn't exist."
+
+**Player-prop finding (investigated; not a code bug — a pmxt data/granularity limit):** the probe showed
+pmxt's `url` is the **event page** (`kalshi.com/events/KX…`), with the specific market only in `slug`/ticker.
+So the deep player-prop link the user wanted (`…/markets/…?op_market_ticker=…`) is **not in pmxt's data** —
+we can only surface the event page. And a name search ("Tahith Chong") matches several props (score /
+first-goalscorer / 2+ goals); ranking picks one, so narrowing the query is needed for a specific prop.
+Deep-linking + prop-precision are deferred product calls (venue-specific URL construction).
+
+---
+
 ## 2026-06-25 (live group retest) — recognizer robustness, LLM array JSON, recency ranking
 
 A second live group test (3 members, mixed iMessage/RCS, LOCAL mode) surfaced three issues; all fixed.

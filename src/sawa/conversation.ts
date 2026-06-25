@@ -170,7 +170,7 @@ function onSearch(intent: Intent, results: SearchResults | null, opts: NextTurnO
   const candidates = results && !results.empty ? flattenRanked(results) : [];
   if (!results || results.empty || candidates.length === 0) {
     return {
-      body: emptyReply(query),
+      body: emptyReply(query, results?.externalErrored ?? false),
       newState: {
         ...emptyState(query),
         venuesPresent: results ? venuesPresent(results) : [],

@@ -45,6 +45,7 @@ const results = (over: Partial<SearchResults> = {}): SearchResults => ({
   empty: false,
   truncated: false,
   externalUnavailable: false,
+  externalErrored: false,
   ...over,
 });
 

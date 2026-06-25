@@ -8,9 +8,10 @@
  * filter; the older `query`/`exchange` names are silently ignored.) Betting stays 100% on Sawa;
  * pmxt is read-only enrichment and a pmxt error/timeout must NEVER block the Sawa reply.
  *
- * Cost control (PMXT_INTEGRATION §5): results are cached per (venue, query) with a TTL. The free
- * tier is 25k credits/mo @ 60 req/min — two cached GETs per search stays well within (a probe burst
- * can 429; the client treats that as just another fail-soft empty venue).
+ * Cost control (PMXT_INTEGRATION §5): the free tier is 25k credits/mo @ 60 req/min — bursting a whole
+ * entity-decomposition fan-out at once is what tripped `429` live. We bound calls three ways: a per
+ * (venue, query) cache, a STAGED fan-out (full query first; entities only if it found nothing), and a
+ * concurrency cap. A 429/timeout is fail-soft (an empty venue) and flagged via `errored`.
  */
 import { getJson, PmxtError } from "./http";
 import type { PmxtConfig } from "../sawa/config";
@@ -60,6 +61,10 @@ const EXCHANGES: { venue: Exclude<Venue, "sawa">; label: string }[] = [
 export interface ExternalResults {
   kalshi: VenueResult[];
   polymarket: VenueResult[];
+  /** True when ≥1 venue lookup ERRORED (429 rate-limit / timeout / network) — lets the caller tell
+   *  "nothing matched" apart from "couldn't check", so the reply doesn't claim a market is absent
+   *  when pmxt was merely rate-limited. */
+  errored: boolean;
 }
 
 interface CacheEntry {
@@ -245,47 +250,110 @@ export function expandQueries(query: string): string[] {
 }
 
 /**
- * Search Kalshi + Polymarket in parallel, fail-soft. Each venue is searched for every sub-query
- * (`expandQueries` — full query + list-entities) and the rows are merged + de-duped per venue, so a
- * multi-entity query surfaces all of them. A venue/sub-query that errors (pmxt down / a 429) yields
- * nothing for that slice and is logged — it never throws, so the Sawa reply proceeds regardless.
+ * Cap on concurrent pmxt requests. The free tier is 60 req/min and rejects bursts with `429`; firing a
+ * whole fan-out at once (an entity-decomposed query is up to MAX_SUBQUERIES × 2 venues) is exactly what
+ * tripped it in the live test. A small cap smooths the burst — excess calls queue behind it.
+ */
+const PMXT_CONCURRENCY = 4;
+
+/** Run thunks with a concurrency cap, returning settled results IN ORDER (never throws). */
+async function runLimited<T>(thunks: (() => Promise<T>)[], limit: number): Promise<PromiseSettledResult<T>[]> {
+  const results = new Array<PromiseSettledResult<T>>(thunks.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < thunks.length) {
+      const i = next++;
+      try {
+        results[i] = { status: "fulfilled", value: await thunks[i]!() };
+      } catch (reason) {
+        results[i] = { status: "rejected", reason };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, thunks.length) }, worker));
+  return results;
+}
+
+interface Accumulator {
+  out: { kalshi: VenueResult[]; polymarket: VenueResult[] };
+  seen: { kalshi: Set<string>; polymarket: Set<string> };
+}
+
+/**
+ * Run `subqueries` across both venues (concurrency-capped), merging + de-duping per venue into `acc`.
+ * Returns whether any slice ERRORED, so the caller can surface "couldn't check" vs "nothing matched".
+ */
+async function searchSubqueries(
+  cfg: PmxtConfig,
+  subqueries: string[],
+  originalQuery: string,
+  limitPerVenue: number,
+  acc: Accumulator,
+): Promise<boolean> {
+  const tasks = EXCHANGES.flatMap((e) => subqueries.map((q) => ({ e, q })));
+  const settled = await runLimited(
+    // Fetch with the (narrow) sub-query, but score relevance against the ORIGINAL query.
+    tasks.map(({ e, q }) => () => searchVenue(cfg, e.venue, e.label, q, limitPerVenue, originalQuery)),
+    PMXT_CONCURRENCY,
+  );
+  let errored = false;
+  settled.forEach((r, i) => {
+    const { e, q } = tasks[i]!;
+    if (r.status === "fulfilled") {
+      for (const row of r.value) {
+        const dedupeKey = `${row.title} ${row.url ?? ""}`.toLowerCase();
+        if (!acc.seen[e.venue].has(dedupeKey)) {
+          acc.seen[e.venue].add(dedupeKey);
+          acc.out[e.venue].push(row);
+        }
+      }
+    } else {
+      errored = true;
+      // Distinguish the failure class: a real HTTP status (definitive), a timeout, or a network error.
+      const reason = r.reason as Error | undefined;
+      const detail =
+        r.reason instanceof PmxtError
+          ? `HTTP ${r.reason.status}`
+          : reason?.name === "AbortError"
+            ? "timeout"
+            : "network";
+      console.warn(`[pmxt] ${e.venue} search "${q}" failed (${detail}) — degrading to without it.`);
+    }
+  });
+  return errored;
+}
+
+/**
+ * Search Kalshi + Polymarket, fail-soft, in TWO STAGES to bound credits and avoid `429`s:
+ *   1. the FULL query on both venues (2 calls) — most queries ("bitcoin", "world cup") resolve here;
+ *   2. ONLY if stage 1 found nothing, fan out to the entity sub-queries (`expandQueries`) so a
+ *      compound that matches no single title ("Mexico Raul Jimenez player props") still reaches its
+ *      entity. This cuts the typical search from up to 12 calls to 2.
+ * A venue/sub-query that errors (a 429 / timeout) yields nothing for that slice, is logged, and sets
+ * `errored` — it never throws, so the Sawa reply proceeds regardless.
  */
 export async function searchExternal(
   cfg: PmxtConfig,
   query: string,
   limitPerVenue = 6,
 ): Promise<ExternalResults> {
-  const subqueries = expandQueries(query);
-  const tasks = EXCHANGES.flatMap((e) => subqueries.map((q) => ({ e, q })));
-  const settled = await Promise.allSettled(
-    // Fetch with the (narrow) sub-query, but score relevance against the ORIGINAL `query`.
-    tasks.map(({ e, q }) => searchVenue(cfg, e.venue, e.label, q, limitPerVenue, query)),
-  );
-  const out: ExternalResults = { kalshi: [], polymarket: [] };
-  const seen: Record<string, Set<string>> = { kalshi: new Set(), polymarket: new Set() };
-  settled.forEach((r, i) => {
-    const { e, q } = tasks[i]!;
-    if (r.status === "fulfilled") {
-      for (const row of r.value) {
-        const dedupeKey = `${row.title} ${row.url ?? ""}`.toLowerCase();
-        if (!seen[e.venue]!.has(dedupeKey)) {
-          seen[e.venue]!.add(dedupeKey);
-          out[e.venue].push(row);
-        }
-      }
-    } else {
-      // Distinguish the failure class so logs aren't ambiguous: a real HTTP status (definitive),
-      // a timeout (AbortError, after the retry), or a network error.
-      const reason = r.reason as Error | undefined;
-      const detail = r.reason instanceof PmxtError
-        ? `HTTP ${r.reason.status}`
-        : reason?.name === "AbortError"
-          ? "timeout"
-          : "network";
-      console.warn(`[pmxt] ${e.venue} search "${q}" failed (${detail}) — degrading to without it.`);
+  const full = query.trim();
+  const acc: Accumulator = {
+    out: { kalshi: [], polymarket: [] },
+    seen: { kalshi: new Set(), polymarket: new Set() },
+  };
+
+  // Stage 1: the full query (cheap — 2 calls). Stage 2: entities, ONLY when stage 1 came back empty.
+  let errored = await searchSubqueries(cfg, [full], query, limitPerVenue, acc);
+  const stage1Empty = acc.out.kalshi.length === 0 && acc.out.polymarket.length === 0;
+  if (stage1Empty) {
+    const entities = expandQueries(query).filter((q) => q.toLowerCase() !== full.toLowerCase());
+    if (entities.length) {
+      errored = (await searchSubqueries(cfg, entities, query, limitPerVenue, acc)) || errored;
     }
-  });
-  return out;
+  }
+
+  return { kalshi: acc.out.kalshi, polymarket: acc.out.polymarket, errored };
 }
 
 /** Test helper: clear the per-query cache between cases. */

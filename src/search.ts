@@ -41,6 +41,9 @@ export interface SearchResults {
   truncated: boolean;
   /** True when pmxt enrichment was unavailable (no key) — the reply is Sawa-only by design. */
   externalUnavailable: boolean;
+  /** True when a pmxt lookup ERRORED (429 rate-limit / timeout) — so an empty reply can say "couldn't
+   *  reach Kalshi/Polymarket" instead of falsely claiming no market exists. */
+  externalErrored: boolean;
 }
 
 /**
@@ -220,13 +223,17 @@ export async function runSearch(
 
   let kalshi: VenueResult[] = [];
   let polymarket: VenueResult[] = [];
+  let externalErrored = false;
   if (externalSettled.status === "fulfilled" && externalSettled.value) {
-    const k = rankAndCap(externalSettled.value.kalshi);
-    const p = rankAndCap(externalSettled.value.polymarket);
+    const ext = externalSettled.value;
+    externalErrored = ext.errored;
+    const k = rankAndCap(ext.kalshi);
+    const p = rankAndCap(ext.polymarket);
     kalshi = k.rows;
     polymarket = p.rows;
     truncated ||= k.truncated || p.truncated;
   } else if (externalSettled.status === "rejected") {
+    externalErrored = true; // searchExternal is fail-soft, but a throw here still means "couldn't check"
     console.warn(`[search] external enrichment failed: ${(externalSettled.reason as Error)?.message}`);
   }
 
@@ -238,6 +245,7 @@ export async function runSearch(
     empty: sawa.length === 0 && kalshi.length === 0 && polymarket.length === 0,
     truncated,
     externalUnavailable,
+    externalErrored,
   };
 }
 

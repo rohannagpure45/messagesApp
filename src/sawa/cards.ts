@@ -122,9 +122,19 @@ export function renderNoVenue(venue: Venue, query: string): string {
   return `I don't have a ${venueLabel(venue)} market for ${q} right now.`;
 }
 
-/** Empty-state copy: no match anywhere → gentle nudge + tease create (not built yet). */
-export function emptyReply(query: string): string {
+/**
+ * Empty-state copy. When the external lookup ERRORED (a 429 rate-limit / timeout — not a real "no
+ * match"), say so instead of claiming the market doesn't exist: the live test surfaced "bitcoin" being
+ * reported as absent when pmxt had simply rate-limited us. Otherwise a gentle nudge + tease create.
+ */
+export function emptyReply(query: string, externalErrored = false): string {
   const q = query ? `"${query}"` : "that";
+  if (externalErrored) {
+    return (
+      `Sawa has nothing on ${q}, and I couldn't reach Kalshi or Polymarket just now ` +
+      `(usually a brief rate-limit). Try again in a few seconds.`
+    );
+  }
   return (
     `No live markets for ${q} on Sawa, Kalshi, or Polymarket yet.\n` +
     `Try a broader term — or want me to spin up a market on Sawa? (creating markets is coming soon)`
