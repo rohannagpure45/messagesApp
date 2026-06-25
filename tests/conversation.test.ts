@@ -127,6 +127,14 @@ describe("nextTurn", () => {
     expect(out.body.toLowerCase()).not.toContain("no cash value");
   });
 
+  it("search with no Sawa market but an external match → leads with that venue, not empty-state", () => {
+    const out = nextTurn(null, searchIntent(), results({ sawa: [], kalshi: [kalshiRow()] }));
+    expect(out.body.toLowerCase()).not.toContain("no live markets");
+    expect(out.body).toContain("on Kalshi");
+    expect(out.newState.candidates).toHaveLength(1);
+    expect(out.newState.candidates[0]!.venue).toBe("kalshi");
+  });
+
   it("search with empty results → empty-state reply + minimal state (a follow-up stays graceful)", () => {
     const out = nextTurn(null, searchIntent("dogecoin"), results({ empty: true, sawa: [], query: "dogecoin" }));
     expect(out.body.toLowerCase()).toContain("no live markets");
