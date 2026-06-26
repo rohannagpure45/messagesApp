@@ -209,6 +209,47 @@ function properNounSpans(query: string): string[] {
 }
 
 /**
+ * Low-signal tokens dropped when decomposing a LOWERCASE multi-word query to its salient content words.
+ * Numbers/timeframes/units carry no topic (a market's title frames the timeframe its own way — "10 year
+ * treasury" misses "10-Year Treasury Yield" on the hyphen, "s&p price range today at 4pm" misses "S&P 500
+ * above X at 4pm"), so we strip them and search the bare entity ("treasury", "bitcoin"), letting the
+ * relevance floor (scored vs the ORIGINAL query) keep only on-topic rows. Not used for proper nouns.
+ */
+const DECOMP_STOPWORDS = new Set([
+  "the", "a", "an", "of", "on", "in", "to", "for", "and", "or", "at", "by", "this", "next", "last",
+  "today", "tonight", "tomorrow", "yesterday", "week", "weekly", "month", "monthly", "year", "yearly",
+  "annual", "annually", "day", "daily", "minute", "minutes", "min", "mins", "hour", "hours", "hr", "hrs",
+  "am", "pm", "eod", "close", "open", "above", "below", "over", "under",
+  // Pure market-framing / quantity words: never the entity, and as a bare sub-query they match a huge
+  // noise set ("price" → every price market) that the relevance floor then drops — so skip them and
+  // search the real entity instead (the salient noun remains: "bitcoin price" → "bitcoin").
+  "price", "prices", "range", "value", "values", "level", "levels", "odds", "line", "lines", "high", "low",
+]);
+
+/**
+ * Salient lowercase CONTENT words of a multi-word query, longest-first (most specific = most likely the
+ * entity). Proper nouns are handled separately (`properNounSpans`); this catches the all-lowercase case
+ * the proper-noun path misses — "10 year treasury" → ["treasury"], "fed rate decision" → ["decision",
+ * "rate", "fed"]. Drops `DECOMP_STOPWORDS`, pure numbers and number-led units ("10", "4pm", "2026"),
+ * proper-noun tokens (those already decompose), and tokens shorter than 3 chars. Empty for a single-word
+ * query (it's already the entity) or one with no lowercase content (handled by the proper-noun path).
+ */
+function contentWords(query: string): string[] {
+  const toks = query.split(/\s+/);
+  if (toks.length < 2) return [];
+  const words = toks
+    .map((t) => t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "")) // strip surrounding punctuation ("Switzerland," → "Switzerland")
+    .filter(
+      (t) =>
+        t.length >= 3 &&
+        !/^\d/.test(t) && // pure numbers + number-led units ("10", "4pm", "2026")
+        !PROPER_WORD.test(t) && // proper nouns already decompose via properNounSpans
+        !DECOMP_STOPWORDS.has(t.toLowerCase()),
+    );
+  return [...new Set(words)].sort((a, b) => b.length - a.length);
+}
+
+/**
  * Expand a query into the sub-queries to actually search pmxt with. pmxt's `q` is a phrase/title
  * match, so a compound natural-language query ("Mexico Raul Jimenez player props", "Switzerland,
  * India") matches NOTHING even though each entity has its own market — verified live. We therefore
@@ -218,9 +259,12 @@ function properNounSpans(query: string): string[] {
  *   3. proper-noun entities — individual Capitalized words, then adjacent Capitalized bigrams, then
  *      the whole multi-word span — so "Mexico Raul Jimenez" reaches "Raul Jimenez" (the entity that
  *      actually has a market). Words come before bigrams so single entities survive the cap.
+ *   4. lowercase CONTENT words (longest-first) for an all-lowercase compound the proper-noun path
+ *      misses — "10 year treasury" → "treasury", "fed rate decision" → "decision"/"rate"/"fed" — so the
+ *      bare entity is searched (pmxt's substring match misses "10 year treasury" → "10-Year Treasury").
  * Relevance for every row is scored against the ORIGINAL query (see `searchVenue`), so a broad
- * decomposition (e.g. "Cup") never leaks noise past the `RELEVANCE_MIN` floor. Single proper nouns
- * and plain lowercase queries ("world cup") reduce to just the original — unchanged.
+ * decomposition (e.g. "Cup"/"treasury") never leaks noise past the `RELEVANCE_MIN` floor. Single-word
+ * queries ("world cup" is two words but both lowercase) reduce to the original + content words.
  */
 export function expandQueries(query: string): string[] {
   const full = query.trim();
@@ -254,6 +298,8 @@ export function expandQueries(query: string): string[] {
   for (const w of words) add(w);
   for (const b of bigrams) add(b);
   for (const span of spans) if (span.includes(" ")) add(span);
+  // 4. Lowercase content words (longest-first) — the all-lowercase compound case.
+  for (const w of contentWords(full)) add(w);
 
   return out.slice(0, MAX_SUBQUERIES);
 }

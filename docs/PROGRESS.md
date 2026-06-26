@@ -5,6 +5,34 @@ status lives in [`../AGENTS.md`](../AGENTS.md); the phased plan in [`BUILD_PLAN.
 
 ---
 
+## 2026-06-26 — dropped DM refinement + lowercase-compound recall (Issues 11–12)
+
+A live clarify/refine test exposed two more bugs (the owner: *"it bounces from my number to unknown and
+doesn't respond to my follow up… that is an error which should have been fixed"*). `npm test` **215** (+2);
+typecheck clean; LOCAL headless bot restarted. Detail in `docs/SEARCH_FIXES.md` Issues 11–12.
+
+1. **Unhailed bare-topic refinement in a DM silently dropped** (`src/routing.ts` + `src/index.ts`). After a
+   clarify, the owner replied (no "sawa") "No I meant s&p price range today at 4pm" → no response. The Issue-10
+   DM fix correctly made it `relaxed` (it reached `handleNatural` despite `from=unknown`), but the relaxed gate
+   `actionableWhenRelaxed` only honored a `search` with `via:"regex"` → the LLM-classified refinement
+   (`via:"llm"`) was dropped. Fix: a **DM honors ANY search** (an active 1:1 session is a deliberate bot thread,
+   every message is bot-directed), a **group** still requires the explicit regex trigger; and a reply to a
+   pending clarify (`repliedToPending`) bypasses the gate. `other`/small-talk still ignored, so "ok"/"thanks"
+   don't reply.
+
+2. **All-lowercase compound queries never reached their entity** (`src/pmxt/discover.ts`). "10 year treasury" →
+   empty, because pmxt substring-misses "10-Year Treasury Yield" (hyphen) and `expandQueries` only decomposed
+   proper nouns — an all-lowercase query produced no entity sub-query. Probe: `q="10 year treasury"`→0 but
+   `q="treasury"`→20. Fix: a 4th decomposition step — lowercase **content words** (`contentWords`, longest-first),
+   dropping numbers/number-led units, timeframe words, pure framing/quantity words ("price"/"range"/"value"),
+   proper nouns, and <3-char tokens — so "10 year treasury" → "treasury". Stage-2-only + scored vs the original
+   query, so the floor keeps the 10-year market (1.0) and drops the 30Y (0.33). Verified live via `runSearch`:
+   "10 year treasury" → the 10-Year Treasury Yield Kalshi market; "cpi inflation rate" → the CPI market. Honest
+   limit: "s&p price range today at 4pm" is a semantic gap (markets framed "S&P above X"), now answers
+   cleanly-empty rather than going silent; "S&P 500" finds them.
+
+---
+
 ## 2026-06-26 — pmxt is concurrency-fragile (serialize) + LOCAL-DM follow-ups dropped (Issues 9–10)
 
 Two live tests (the owner's "you created problems instead of solutions" + a follow-up "this fix was bad")

@@ -14,17 +14,23 @@ function escapeRegex(s: string): string {
 }
 
 /**
- * When a message is NOT hailed but there's an active thread in the space (the "relaxed" path — so
- * follow-ups and poll answers work without re-typing "sawa"), decide whether it's safe to act on the
- * parsed intent. We continue the thread (`next`/`link`) or honor an EXPLICIT search request (a regex
- * trigger like "find a market on X" / "odds on Y") — but NEVER a bare-topic guess (`via` !== "regex")
- * or small talk, so the bot stays silent on inbox bystander chatter it merely overheard. A pending
- * clarify answer is resolved by the caller BEFORE this gate, so it is unaffected.
+ * When a message is NOT hailed but there's an active thread (the "relaxed" path — so follow-ups and
+ * poll answers work without re-typing "sawa"), decide whether it's safe to act on the parsed intent.
+ *
+ * `next`/`link`/`answer` are always honored (they're meaningless except as in-thread follow-ups). For a
+ * `search` the bar depends on the space:
+ *   - **DM** — an active session only exists because this person deliberately hailed the bot in a 1:1
+ *     thread, and every message in that thread is to the bot. So honor ANY search, including a bare
+ *     topic / a refinement the LLM classified ("No I meant s&p price range") — this is the fix for the
+ *     dropped follow-up. `other` (greeting/small talk) is still ignored, so "ok"/"thanks" won't reply.
+ *   - **GROUP** — bystanders are really talking to each other, so require an EXPLICIT regex trigger
+ *     ("find a market on X" / "odds on Y") and stay silent on a bare-topic guess (`via` !== "regex").
+ * A reply to a pending clarify the bot asked is handled by the caller BEFORE this gate (it is a direct
+ * answer to our question), so it is honored in either space regardless of this.
  */
-export function actionableWhenRelaxed(intent: Intent): boolean {
-  // `answer` = a grounded question about the shown market — a natural in-thread follow-up.
+export function actionableWhenRelaxed(intent: Intent, isGroup: boolean): boolean {
   if (intent.kind === "next" || intent.kind === "link" || intent.kind === "answer") return true;
-  if (intent.kind === "search") return intent.via === "regex";
+  if (intent.kind === "search") return !isGroup || intent.via === "regex";
   return false;
 }
 

@@ -1,14 +1,16 @@
 # Conversational Search — reliability + matching fixes (implementation spec)
 
-**Status:** ALL TEN IMPLEMENTED. Issues **1–4** shipped 24-Jun; Issue **5 shipped 25-Jun, generalized into a
+**Status:** ALL TWELVE IMPLEMENTED. Issues **1–4** shipped 24-Jun; Issue **5 shipped 25-Jun, generalized into a
 natural-language AGENT SETTINGS framework** (not just quips). Issues **6–8 shipped 26-Jun** from later live
 tests — a pmxt **429 storm** (client-side rate guard), a Gemini **follow-up off-schema `{error}`
 hallucination** (prompt hardening), and **accented-name empties + an over-aggressive 429 pause** (Unicode
-decomposition + a gentler circuit breaker). Issues **9–10 shipped 26-Jun** from a live DM/clarify test that
-exposed the **previous round's 429 fix as the actual culprit** — pmxt's free tier emits **transient
-header-less 429s** that the code wrongly treated as definitive (now retried), and **LOCAL-mode DM follow-ups
-were silently dropped** because the sender handle flaps `+1…` ↔ `unknown` (DM threads now bind to the space).
-Typecheck clean; `npm test` 213 green. Each item has **symptom → evidence → root cause → fix → acceptance**.
+decomposition + a gentler circuit breaker). Issues **9–10 shipped 26-Jun** — **pmxt can't take concurrency**
+(serialize: `PMXT_CONCURRENCY=1`, the real fix behind the false "couldn't reach" + 12s hangs) and **LOCAL-mode
+DM follow-ups dropped** by sender-handle flapping (DM threads bind to the space). Issues **11–12 shipped 26-Jun**
+from a live clarify/refine test — an **unhailed bare-topic refinement in a DM was silently dropped** (DM relaxed
+mode now honors any search + a clarify-reply bypass), and **all-lowercase compound queries never reached their
+entity** ("10 year treasury" → 0; `expandQueries` now decomposes lowercase content words).
+Typecheck clean; `npm test` 215 green. Each item has **symptom → evidence → root cause → fix → acceptance**.
 
 **What shipped (1–4):** `max_tokens 80→256` + defensive JSON extraction (fences/prose/first-`{`-to-last-`}`)
 in `classifyWithLlm`; `look for`/`search for`/`find me`/`look up for` added to the regex `SEARCH_TRIGGERS`;
@@ -443,6 +445,68 @@ by `tests/routing.test.ts` › "cloud / business-line compatibility". 213 green.
 
 ---
 
+## Issue 11 — an unhailed bare-topic REFINEMENT in a DM is silently dropped ✅ DONE
+
+**Symptom.** After the bot asked a clarify, the owner replied (no "sawa") *"No I meant s&p price range today at
+4pm"* — and the bot **said nothing**. The owner: *"it bounces from my number to unknown and doesn't respond to
+my follow up… that is an error which should have been fixed."*
+
+**Evidence.** The Issue-10 DM fix *did* work — the message now reaches `handleNatural` even with the flapped
+`from=unknown` (`relaxed === true`). It dies one step later: the reply isn't a matching clarify option →
+`pending` is cleared → `parseIntent` (no regex trigger) routes to the LLM, which returns
+`{kind:"search", via:"llm"}` → the relaxed gate `actionableWhenRelaxed` only honored a `search` when
+`via === "regex"` → **silent return.** So a bare-topic refinement in an active thread was dropped because it
+wasn't an explicit regex trigger.
+
+**Root cause.** The strict "relaxed search must be a regex trigger" rule exists to avoid acting on *overheard
+group chatter*. But it was applied to DMs too, where it's wrong: a DM with an active session exists only because
+the person deliberately hailed the bot, and **every message in a 1:1 thread is to the bot**. And a reply to a
+clarify *we asked* is a direct answer, never overheard.
+
+**Fix** (`src/routing.ts` + `src/index.ts`):
+- `actionableWhenRelaxed(intent, isGroup)` now honors **any** `search` in a **DM** (`!isGroup || via==="regex"`);
+  a **group** still requires the explicit regex trigger. `other` (greeting/small talk) is still ignored in both,
+  so "ok"/"thanks" won't trigger a reply.
+- A reply to a pending clarify the bot asked (`repliedToPending`) **bypasses** the gate entirely (DM *or* group)
+  — the user is answering our own question, so the refined topic is searched.
+
+**Acceptance.** `tests/routing.test.ts` › "actionableWhenRelaxed": a DM honors a `via:"llm"`/`"fallback"` search;
+a group does not; `other` is silent in both. Verified live: the unhailed *"No I meant …"* refinement now replies.
+
+---
+
+## Issue 12 — all-lowercase compound queries never reach their entity ("10 year treasury" → 0) ✅ DONE
+
+**Symptom.** Owner hypothesis: *"maybe it can not identify live markets on kalshi like the 10 year treasury or
+15 minute bitcoin ones."* Indeed `"Sawa 10 year treasury"` → empty.
+
+**Evidence.** A probe shows the markets **exist** — the *phrasing* misses them: `q="10 year treasury"` → **0**,
+but `q="treasury"` → **20** ("…10-Year Treasury Yield…"), `q="10-year treasury yield"` → 14. pmxt's `q` is a
+substring/ILIKE title match, so "10 **year** treasury" never matches "10-**Year** Treasury" (hyphen) or "30Y
+Treasury". And `expandQueries` only decomposed **proper nouns** — an all-lowercase query ("10 year treasury")
+produced no entity sub-query, so only the (missing) full phrase was searched.
+
+**Root cause.** `expandQueries`'s decomposition was proper-noun-only (`PROPER_WORD`). Common entities are
+lowercase nouns ("treasury", "inflation", "bitcoin"), which were never emitted.
+
+**Fix** (`src/pmxt/discover.ts`): add a 4th decomposition step — **lowercase content words** (`contentWords`,
+longest-first). It drops numbers/number-led units ("10", "4pm"), timeframe words ("year", "minutes", "today"),
+pure market-framing/quantity words ("price", "range", "value", "level", "odds"), proper nouns (handled
+separately) and <3-char tokens, leaving the salient entity. "10 year treasury" → `["10 year treasury",
+"treasury"]`; "bitcoin price 15 minutes" → `["…", "bitcoin"]`. Stage 2 only runs when the full phrase found
+nothing, and every row is scored against the **original** query, so the `RELEVANCE_MIN` floor keeps the on-topic
+10-year market (1.0) and drops the 30Y one (0.33). Bounded by `MAX_SUBQUERIES` (proper-noun sub-queries, when
+present, take the cap first — so existing player-prop decomposition is unchanged).
+
+**Acceptance.** `tests/pmxt.test.ts`: `expandQueries("10 year treasury")` → `["10 year treasury", "treasury"]`;
+framing/number/timeframe words dropped. Verified live via the full `runSearch` path: `"10 year treasury"` →
+*"Will the yield of 10-year U.S. treasury notes be… 79¢ on Kalshi"*; `"cpi inflation rate"` → the CPI market —
+both were empty before. (Genuine limit kept honest: `"s&p price range today at 4pm"` is a semantic gap — the
+markets are framed "S&P above X at 4pm", which token-overlap can't reach from "price range" — but it now answers
+cleanly instead of going silent; `"S&P 500"` finds them.) `npm test` 215 green.
+
+---
+
 ## Consolidated acceptance (for the `/goal`)
 
 - [x] **1** `max_tokens: 256` + defensive JSON extraction; truncated/fenced/prose bodies no longer break intent.
@@ -472,7 +536,13 @@ by `tests/routing.test.ts` › "cloud / business-line compatibility". 213 green.
 - [x] **10** **LOCAL-mode DM follow-ups fixed** — DM threads bind to the space (`threadOwner`/`sessionKey`/
       `canRelaxSender` in `routing.ts`), immune to chat.db handle flapping; the `"2"` clarify answer and hail-free
       follow-ups now resolve in a DM even when the inbound's handle didn't resolve. Group behavior unchanged.
-- [x] `npm run typecheck` clean; `npm test` green (213) with new unit tests for items 1–10 (incl. cloud/business-line compatibility).
+- [x] **11** **Unhailed DM refinement honored** — `actionableWhenRelaxed(intent, isGroup)`: a DM honors ANY
+      search (not just regex), a group stays strict; a reply to a pending clarify bypasses the gate
+      (`repliedToPending`). Fixes the silently-dropped "No I meant …" refinement.
+- [x] **12** **Lowercase-compound recall** — `expandQueries` decomposes lowercase content words (`contentWords`),
+      so "10 year treasury" → "treasury" etc. reach the entity (number/timeframe/framing words dropped;
+      relevance-floored vs the original query). Verified live: treasury/CPI markets now surface.
+- [x] `npm run typecheck` clean; `npm test` green (215) with new unit tests for items 1–12 (incl. cloud/business-line compatibility).
 - [ ] **Live group re-test** (pending hardware): World Cup (Sawa lead), `look for Czechia` (Kalshi),
       `look for player props on Raul Jimenez` (Kalshi goals market), `quips off`/`sawa only`/`settings`
       toggles, link follow-up.

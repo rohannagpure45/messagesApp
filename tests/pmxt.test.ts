@@ -162,10 +162,20 @@ describe("expandQueries (list + proper-noun entity decomposition)", () => {
     expect(expandQueries("Müller Germany")).toEqual(expect.arrayContaining(["Müller", "Germany"]));
   });
 
-  it("leaves a single proper noun and plain lowercase queries unchanged", () => {
+  it("leaves a single-word query unchanged (it is already the entity)", () => {
     expect(expandQueries("Czechia")).toEqual(["Czechia"]);
-    expect(expandQueries("world cup")).toEqual(["world cup"]);
     expect(expandQueries("bitcoin")).toEqual(["bitcoin"]);
+  });
+
+  it("decomposes an all-lowercase compound into its content words (the '10 year treasury' recall bug)", () => {
+    // pmxt substring-misses "10 year treasury" → "10-Year Treasury Yield"; the bare entity "treasury"
+    // hits. Numbers + timeframe words are dropped; the salient noun is searched (relevance-floored vs the
+    // original query, so generic content words that match nothing on-topic are dropped downstream).
+    expect(expandQueries("10 year treasury")).toEqual(["10 year treasury", "treasury"]);
+    // Numbers, timeframes ("15 minutes") AND framing words ("price") are dropped → just the entity.
+    expect(expandQueries("bitcoin price 15 minutes")).toEqual(["bitcoin price 15 minutes", "bitcoin"]);
+    // A plain two-word lowercase query also emits its words (only USED if the full phrase finds nothing).
+    expect(expandQueries("world cup")).toEqual(["world cup", "world", "cup"]);
   });
 
   it("caps the number of sub-queries to bound pmxt calls/credits", () => {

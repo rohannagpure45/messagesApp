@@ -112,21 +112,32 @@ describe("cloud / business-line compatibility (the helpers key only on isGroup +
 
 describe("actionableWhenRelaxed", () => {
   const intent = (over: Partial<Intent>): Intent => ({ kind: "search", via: "regex", ...over });
+  const DM = false;
+  const GROUP = true;
 
-  it("continues a thread follow-up (next/link/answer) without a re-hail", () => {
-    expect(actionableWhenRelaxed(intent({ kind: "next" }))).toBe(true);
-    expect(actionableWhenRelaxed(intent({ kind: "link", venue: "kalshi" }))).toBe(true);
-    expect(actionableWhenRelaxed(intent({ kind: "answer", reply: "it's a Messi prop" }))).toBe(true);
+  it("continues a thread follow-up (next/link/answer) without a re-hail, in any space", () => {
+    for (const g of [DM, GROUP]) {
+      expect(actionableWhenRelaxed(intent({ kind: "next" }), g)).toBe(true);
+      expect(actionableWhenRelaxed(intent({ kind: "link", venue: "kalshi" }), g)).toBe(true);
+      expect(actionableWhenRelaxed(intent({ kind: "answer", reply: "it's a Messi prop" }), g)).toBe(true);
+    }
   });
 
-  it("honors an EXPLICIT search (regex trigger) but not a bare-topic or LLM guess", () => {
-    expect(actionableWhenRelaxed(intent({ kind: "search", query: "oil prices", via: "regex" }))).toBe(true);
-    expect(actionableWhenRelaxed(intent({ kind: "search", query: "argentina", via: "fallback" }))).toBe(false);
-    expect(actionableWhenRelaxed(intent({ kind: "search", query: "argentina", via: "llm" }))).toBe(false);
+  it("in a GROUP honors only an EXPLICIT search (regex trigger), not a bare-topic / LLM guess", () => {
+    expect(actionableWhenRelaxed(intent({ kind: "search", query: "oil prices", via: "regex" }), GROUP)).toBe(true);
+    expect(actionableWhenRelaxed(intent({ kind: "search", query: "argentina", via: "fallback" }), GROUP)).toBe(false);
+    expect(actionableWhenRelaxed(intent({ kind: "search", query: "argentina", via: "llm" }), GROUP)).toBe(false);
   });
 
-  it("stays silent on small talk / non-search intents overheard in a thread", () => {
-    expect(actionableWhenRelaxed(intent({ kind: "other" }))).toBe(false);
+  it("in a DM honors ANY search — a bare topic / LLM refinement IS a bot-directed message (the dropped-follow-up fix)", () => {
+    expect(actionableWhenRelaxed(intent({ kind: "search", query: "oil prices", via: "regex" }), DM)).toBe(true);
+    expect(actionableWhenRelaxed(intent({ kind: "search", query: "s&p price range", via: "llm" }), DM)).toBe(true);
+    expect(actionableWhenRelaxed(intent({ kind: "search", query: "argentina", via: "fallback" }), DM)).toBe(true);
+  });
+
+  it("stays silent on small talk / non-search intents overheard in a thread (DM and group)", () => {
+    expect(actionableWhenRelaxed(intent({ kind: "other" }), DM)).toBe(false);
+    expect(actionableWhenRelaxed(intent({ kind: "other" }), GROUP)).toBe(false);
   });
 });
 

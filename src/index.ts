@@ -385,6 +385,7 @@ async function handleNatural(
   // A pending clarify ("which market?") answer on the TEXT path (poll taps resolve in the loop). Bound
   // to the thread OWNER: in a group a bystander's "2" is NOT their answer to give; in a DM the owner is
   // the space, so the answer resolves even when this inbound's handle didn't resolve (local flapping).
+  let repliedToPending = false;
   if (state?.pending && state.pendingBy === owner) {
     const opt = resolveAnswer(state.pending, addressed);
     if (opt) {
@@ -393,7 +394,11 @@ async function handleNatural(
       await sendBody(space, outcome.body);
       return;
     }
-    // The asker said something that isn't an answer → drop the pending and treat it as a fresh intent.
+    // The asker replied to OUR question but it wasn't a listed option ("no, I meant <refined topic>").
+    // It's still a direct reply addressed to us, so drop the pending, mark it, and treat the refinement
+    // as a fresh intent that bypasses the relaxed-actionability gate below (else a non-regex refinement
+    // would be silently dropped — the live "No I meant s&p price range today at 4pm" bug).
+    repliedToPending = true;
     state = { ...state, pending: undefined, pendingBy: undefined };
     convo.set(sKey, state);
   }
@@ -417,8 +422,10 @@ async function handleNatural(
 
   const intent = await parseIntent(body, botName, intentConfig, toContext(state));
 
-  // Relaxed (overheard, active thread): only act on a thread follow-up or an EXPLICIT search request.
-  if (relaxed && !actionableWhenRelaxed(intent)) return;
+  // Relaxed (overheard, active thread): act on a thread follow-up, a DM search, or a group's EXPLICIT
+  // search request (`actionableWhenRelaxed`) — UNLESS this is a direct reply to a clarify we asked
+  // (`repliedToPending`), which is always honored since the user is answering our own question.
+  if (relaxed && !repliedToPending && !actionableWhenRelaxed(intent, isGroup)) return;
 
   if (intent.kind === "search" && intent.query) {
     await runConversationalSearch(space, spaceId, intent.query, platform, senderId, isGroup);
