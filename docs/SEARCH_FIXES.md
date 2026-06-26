@@ -9,8 +9,11 @@ decomposition + a gentler circuit breaker). Issues **9–10 shipped 26-Jun** —
 DM follow-ups dropped** by sender-handle flapping (DM threads bind to the space). Issues **11–12 shipped 26-Jun**
 from a live clarify/refine test — an **unhailed bare-topic refinement in a DM was silently dropped** (DM relaxed
 mode now honors any search + a clarify-reply bypass), and **all-lowercase compound queries never reached their
-entity** ("10 year treasury" → 0; `expandQueries` now decomposes lowercase content words).
-Typecheck clean; `npm test` 215 green. Each item has **symptom → evidence → root cause → fix → acceptance**.
+entity** ("10 year treasury" → 0; `expandQueries` now decomposes lowercase content words). Issue **13 shipped
+26-Jun** — **resolved/settled markets surfaced** (a finalized "BTC up in 15 mins?" at 100¢) and **"June"
+decomposed into a copper market**: now filter resolved-status + decided real-money (≥97¢) markets, and exclude
+month/weekday names from decomposition.
+Typecheck clean; `npm test` 217 green. Each item has **symptom → evidence → root cause → fix → acceptance**.
 
 **What shipped (1–4):** `max_tokens 80→256` + defensive JSON extraction (fences/prose/first-`{`-to-last-`}`)
 in `classifyWithLlm`; `look for`/`search for`/`find me`/`look up for` added to the regex `SEARCH_TRIGGERS`;
@@ -507,6 +510,61 @@ cleanly instead of going silent; `"S&P 500"` finds them.) `npm test` 215 green.
 
 ---
 
+## Issue 13 — resolved / settled markets surfaced; "June" decomposed → copper for a bitcoin query ✅ DONE
+
+**Symptom.** A live "btc 15 min" session showed *"BTC price up in next 15 mins? — Target Price: $63,514.93 100¢
+(1×) on Kalshi"* (a **settled** market — 100¢ = $1.00, already resolved). Then a clarify answered with a date
+(*"June 26 2026, 1:30 pm cdt"*, which matched no option) returned a **copper** market for a bitcoin search. The
+owner: *"live markets are having difficulty being tracked."*
+
+**Evidence.** A raw-field probe of pmxt:
+```
+status=finalized  topPrice=0.999  "BTC price up in next 15 mins?"   ← RESOLVED, returned despite closed=false
+status=active     topPrice=0.992  "BTC price up in next 15 mins?"   ← active but decided (near-1.0)
+q="June" → "…Fed decision in June", "Drake #1…", "copper above 6.14 on June"   ← "June" matches any June market
+```
+So **(a)** pmxt returns `status=finalized` markets even with `closed=false`, and many intraday markets sit at
+0.99–1.0 (settled) while still `status=active`; **(b)** `expandQueries` decomposed the capitalized month **"June"**
+as a proper-noun entity, which substring-matched every market resolving in June (Fed/Drake/copper). (The link URL
+was a red herring — pmxt returns the correct `/events/KXBTC15M-…`; "kalshi.com" is just Kalshi's weak OG preview.)
+
+**Fix:**
+- **Drop resolved markets** (`src/pmxt/discover.ts` `isResolvedStatus`): filter rows whose `status` is
+  finalized/settled/resolved/closed/determined/inactive/expired/void/cancel(l)ed, before caching.
+- **Drop decided real-money markets** (`src/search.ts` `isLiveDiscoverable`, in `rankAndCap`): a HARD filter on
+  real-money favorites **≥ 0.97** (catches the active-but-near-1.0 intraday markets the status filter misses).
+  Scoped deliberately: **Sawa is never price-filtered** (its read path already excludes resolved, and early pools
+  are legitimately lopsided), and the **low side is not filtered** (a longshot is real discovery; a settled-NO
+  binary is caught by the `status` filter).
+- **Don't decompose month/weekday names** (`src/pmxt/discover.ts` `TIMEFRAME_PROPER`): a capitalized month or
+  weekday breaks a proper-noun run, so "June 26 2026 1:30 pm cdt" no longer emits "June". The query now returns a
+  clean empty instead of a copper market.
+
+**Adversarial review (Workflow, 5 agents) — one blocker caught + hardening:**
+- **`closed`/`inactive` are NOT resolved** (blocker, fixed): pmxt forwards each venue's RAW status string. Per
+  Kalshi's lifecycle, `status=closed` = "past close_time, outcome UNKNOWN, awaiting determination" and
+  `inactive` = "temporarily deactivated" — both are LIVE/pending. The first cut wrongly listed them, which would
+  have dropped tradeable markets. Removed; a genuinely-settled near-1.0 `closed` market is still caught by the
+  ≥97¢ price filter. Added the decided Kalshi states `disputed`/`amended` and Polymarket's `archived` (the list
+  is a best-effort, venue-native denylist — extend as venues are added).
+- **Lowercase month recurrence** (fixed): `TIMEFRAME_PROPER` only guarded the Capitalized proper-noun path; a
+  *lowercase* "june"/"monday" still passed `contentWords`. Added month/weekday names to `DECOMP_STOPWORDS` too.
+- **Deferred (known, narrow):** `searchExternal` decides stage-1-empty from the RAW row count, before
+  `rankAndCap`'s ≥97¢ filter. So a stage-1 slice of *only* near-locks skips the stage-2 entity fan-out and then
+  gets filtered to empty — a narrow over-filter window. Fix when next touching `searchExternal` (export
+  `SETTLED_HI`/`isLiveDiscoverable` from `search.ts` and make the gate discoverability-aware).
+
+**Acceptance.** `tests/pmxt.test.ts`: `searchVenue` drops `status=finalized`/`settled`/`disputed`/`archived` but
+**keeps** `closed`/`inactive`/`active`; `expandQueries` never emits a month/weekday entity (Capitalized OR
+lowercase). `tests/search.test.ts`: a ≥97¢ real-money near-lock is filtered while the competitive favorite leads
+and a longshot is kept. Verified live: "btc 15 min" leads with a 45¢ competitive market (settled gone); "June 26
+2026, 1:30 pm cdt" → clean empty (no copper); "england new zealand" still works. `npm test` 217 green.
+**Inherent limit:** dated/recurring intraday markets ("Bitcoin price on Jun 19" at 90¢, resolving today) can
+still appear — below the 0.97 bar and `resolutionDate` is future-ish, so not detectably stale; clarify
+clustering collapses the near-identical ones.
+
+---
+
 ## Consolidated acceptance (for the `/goal`)
 
 - [x] **1** `max_tokens: 256` + defensive JSON extraction; truncated/fenced/prose bodies no longer break intent.
@@ -542,7 +600,11 @@ cleanly instead of going silent; `"S&P 500"` finds them.) `npm test` 215 green.
 - [x] **12** **Lowercase-compound recall** — `expandQueries` decomposes lowercase content words (`contentWords`),
       so "10 year treasury" → "treasury" etc. reach the entity (number/timeframe/framing words dropped;
       relevance-floored vs the original query). Verified live: treasury/CPI markets now surface.
-- [x] `npm run typecheck` clean; `npm test` green (215) with new unit tests for items 1–12 (incl. cloud/business-line compatibility).
+- [x] **13** **No resolved/settled markets + no month decomposition** — `isResolvedStatus` (discover.ts) drops
+      finalized/settled rows; `isLiveDiscoverable` (search.ts) hard-filters real-money favorites ≥97¢ (Sawa
+      exempt, longshots kept); `TIMEFRAME_PROPER` excludes month/weekday names from decomposition (the
+      copper-for-June bug). Verified live: "btc 15 min" leads with a competitive market, no copper.
+- [x] `npm run typecheck` clean; `npm test` green (217) with new unit tests for items 1–13 (incl. cloud/business-line compatibility).
 - [ ] **Live group re-test** (pending hardware): World Cup (Sawa lead), `look for Czechia` (Kalshi),
       `look for player props on Raul Jimenez` (Kalshi goals market), `quips off`/`sawa only`/`settings`
       toggles, link follow-up.

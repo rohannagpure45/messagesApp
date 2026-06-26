@@ -106,17 +106,17 @@ describe("runSearch", () => {
     expect(r.externalUnavailable).toBe(false);
   });
 
-  it("ranks a competitive favorite above a near-lock (99¢) and a longshot", async () => {
+  it("drops a settled real-money near-lock (99¢), keeps the competitive race and a longshot", async () => {
     installStub({
       kalshi: [
-        pmxtMarket("kalshi", "Who will win the Britain by-election?", "Labour", 0.99, 9000), // near-lock
-        pmxtMarket("kalshi", "Who will win the LA mayor election?", "Karen Bass", 0.6, 100), // competitive
-        pmxtMarket("kalshi", "Who will win the Peru election?", "Longshot Candidate", 0.01, 100), // longshot
+        pmxtMarket("kalshi", "Who will win the Britain by-election?", "Labour", 0.99, 9000), // ≥97¢ → filtered
+        pmxtMarket("kalshi", "Who will win the LA mayor election?", "Karen Bass", 0.6, 100), // competitive → leads
+        pmxtMarket("kalshi", "Who will win the Peru election?", "Longshot Candidate", 0.01, 100), // longshot → kept, last
       ],
     });
     const r = await runSearch("election", { config, pmxt });
-    // The 60¢ competitive race leads; the 99¢ near-lock and the 1¢ longshot both sink.
-    expect(r.kalshi[0]!.top!.label).toBe("Karen Bass");
+    // The ≥97¢ near-lock is hard-filtered; the competitive favorite leads, the longshot is kept (ranked last).
+    expect(r.kalshi.map((m) => m.top!.label)).toEqual(["Karen Bass", "Longshot Candidate"]);
   });
 
   it("filters Sawa markets below the relevance floor (no substring false-positives)", async () => {

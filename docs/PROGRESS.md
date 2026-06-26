@@ -5,6 +5,31 @@ status lives in [`../AGENTS.md`](../AGENTS.md); the phased plan in [`BUILD_PLAN.
 
 ---
 
+## 2026-06-26 — resolved/settled markets surfaced + "June"→copper decomposition (Issue 13)
+
+A live "btc 15 min" session showed a **settled** market ("BTC up in 15 mins? 100¢/1×", already resolved) and a
+clarify answered with a date returned a **copper** market for a bitcoin search (the owner: *"live markets are
+having difficulty being tracked"*). `npm test` **217** (+2); typecheck clean; adversarially reviewed via a
+Workflow; LOCAL headless bot restarted. Detail in `docs/SEARCH_FIXES.md` Issue 13.
+
+Raw-field probe: pmxt returns `status=finalized` rows **even with `closed=false`**, and many intraday markets
+sit at 0.99–1.0 while still `status=active`; and `expandQueries` decomposed the capitalized month **"June"** →
+substring-matched every market resolving in June (Fed/Drake/copper). (The link URL was a red herring — pmxt
+returns the correct `/events/KXBTC15M-…`; "kalshi.com" is Kalshi's weak OG preview, not our bug.)
+
+Fixes: (a) **drop resolved markets** — `isResolvedStatus` (`src/pmxt/discover.ts`) filters
+finalized/settled/resolved/closed/… rows before caching; (b) **drop decided real-money markets** —
+`isLiveDiscoverable` (`src/search.ts`, in `rankAndCap`) hard-filters real-money favorites **≥97¢** (catches the
+active-but-near-1.0 intraday ones the status filter misses). Scoped: **Sawa never price-filtered** (its read
+path already excludes resolved; early pools are lopsided), **low side not filtered** (a longshot is real
+discovery; a settled-NO binary is caught by status); (c) **don't decompose month/weekday names** —
+`TIMEFRAME_PROPER` (`src/pmxt/discover.ts`) breaks a proper-noun run on a capitalized month/day, so "June 26
+2026 1:30 pm cdt" → clean empty, not copper. Verified live: "btc 15 min" → 45¢ competitive market; "england new
+zealand" still works. Inherent limit: dated intraday markets ("Bitcoin price on Jun 19" @90¢ resolving today)
+can still appear (below the 97¢ bar; resolutionDate is future-ish so not detectably stale).
+
+---
+
 ## 2026-06-26 — dropped DM refinement + lowercase-compound recall (Issues 11–12)
 
 A live clarify/refine test exposed two more bugs (the owner: *"it bounces from my number to unknown and

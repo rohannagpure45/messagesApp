@@ -85,6 +85,28 @@ describe("searchVenue", () => {
     expect((c.init.headers as Record<string, string>).Authorization).toBe("Bearer test-key");
   });
 
+  it("drops RESOLVED markets but KEEPS closed/inactive (still live — outcome not yet determined)", async () => {
+    stub(() =>
+      res(
+        resp([
+          market({ status: "finalized", title: "Finalized market" }), // resolved → dropped
+          market({ status: "settled", title: "Settled market" }), // resolved → dropped
+          market({ status: "disputed", title: "Disputed market" }), // decided (challenged) → dropped
+          market({ status: "archived", title: "Archived market" }), // Polymarket terminal → dropped
+          market({ status: "closed", title: "Closed awaiting determination" }), // LIVE/pending → KEPT
+          market({ status: "inactive", title: "Temporarily inactive" }), // LIVE/pending → KEPT
+          market({ status: "active", title: "Active market" }), // live → kept
+        ]),
+      ),
+    );
+    const rows = await searchVenue(cfg, "kalshi", "Kalshi", "btc", 20);
+    expect(rows.map((r) => r.title)).toEqual([
+      "Closed awaiting determination",
+      "Temporarily inactive",
+      "Active market",
+    ]);
+  });
+
   it("maps a UnifiedMarket to a VenueResult and picks the highest affirmative outcome (favorite)", async () => {
     stub(() => res(resp([market()])));
     const [vr] = await searchVenue(cfg, "kalshi", "Kalshi", "la mayor", 20);
@@ -165,6 +187,19 @@ describe("expandQueries (list + proper-noun entity decomposition)", () => {
   it("leaves a single-word query unchanged (it is already the entity)", () => {
     expect(expandQueries("Czechia")).toEqual(["Czechia"]);
     expect(expandQueries("bitcoin")).toEqual(["bitcoin"]);
+  });
+
+  it("does NOT decompose a capitalized month/weekday as an entity (the copper-for-bitcoin bug)", () => {
+    // "June" passes PROPER_WORD but is a date, not an entity — decomposing it matched "…Fed in June",
+    // "…copper above 6.14 on June". A month/weekday must never become a sub-query.
+    expect(expandQueries("June 26 2026 cdt")).not.toContain("June");
+    expect(expandQueries("bitcoin Friday")).not.toContain("Friday");
+    // A real proper noun next to a month still decomposes (only the month token is excluded).
+    expect(expandQueries("Argentina June")).toContain("Argentina");
+    expect(expandQueries("Argentina June")).not.toContain("June");
+    // LOWERCASE months/weekdays must also be excluded (the content-word path, not just proper-noun spans).
+    expect(expandQueries("bitcoin june monday")).not.toEqual(expect.arrayContaining(["june", "monday"]));
+    expect(expandQueries("bitcoin june monday")).toContain("bitcoin");
   });
 
   it("decomposes an all-lowercase compound into its content words (the '10 year treasury' recall bug)", () => {

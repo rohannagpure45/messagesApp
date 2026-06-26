@@ -161,9 +161,33 @@ export async function searchVenue(
   url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 50))));
 
   const res = await getJson<MarketsResponse>(url, cfg.apiKey);
-  const results = (res.data ?? []).map((m) => toVenueResult(m, label, relevanceQuery));
+  // Drop RESOLVED/settled markets up front — pmxt returns them even with `closed=false` (verified live:
+  // a `status=finalized` "BTC price up in next 15 mins?" at 100¢). A done market is never a useful answer.
+  const results = (res.data ?? [])
+    .filter((m) => !isResolvedStatus(m.status))
+    .map((m) => toVenueResult(m, label, relevanceQuery));
   cache.set(key, { at: now(), results });
   return results;
+}
+
+/**
+ * pmxt market statuses that mean the market is DONE (a known outcome) — never surface a resolved one.
+ *
+ * pmxt forwards each venue's RAW status string (not a normalized enum), so this is a best-effort,
+ * venue-native denylist — extend it as venues are added. Kalshi's genuinely-decided states are
+ * `finalized`/`determined`/`settled`/`disputed`/`amended`; Polymarket's terminal flag is `archived`.
+ *
+ * DELIBERATELY EXCLUDED — these are still LIVE/pending, not resolved (adversarial review caught this):
+ *   - `closed`   = past close_time but the outcome is UNKNOWN, awaiting determination — a real market
+ *                  with a last-traded favorite, a legit discovery answer; a *settled* near-1.0 one is
+ *                  caught by the price filter (`isLiveDiscoverable`) instead.
+ *   - `inactive` = temporarily deactivated by the exchange — can return.
+ * Conflating "trading stopped" with "resolved" would drop tradeable rows and defeat the feature.
+ */
+const RESOLVED_STATUS =
+  /^(finalized|settled|resolved|determined|disputed|amended|expired|void|canceled|cancelled|archived|complete|completed|ended|matured|graded)$/i;
+function isResolvedStatus(status: string | null | undefined): boolean {
+  return typeof status === "string" && RESOLVED_STATUS.test(status.trim());
 }
 
 /**
@@ -188,16 +212,31 @@ const MAX_SUBQUERIES = 6;
 const PROPER_WORD = /^\p{Lu}[\p{L}\p{N}''-]*$/u;
 
 /**
+ * Capitalized TIMEFRAME words (months + weekdays) that pass `PROPER_WORD` but are NOT entities — they are
+ * when a market resolves, not what it's about. Decomposing them poisoned a query with junk: "June 26 2026
+ * 1:30 pm cdt" → "June" → matched "…Fed decision in June", "…copper above 6.14 on June" (the live copper-for
+ * -bitcoin bug). Excluded from proper-noun spans so a date token never becomes an entity sub-query.
+ */
+const TIMEFRAME_PROPER = new Set([
+  "january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
+  "november", "december", "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+  "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+  "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun",
+  "today", "tomorrow", "tonight", "yesterday", "eod",
+]);
+
+/**
  * Maximal runs of consecutive proper-noun words in `query` (e.g. "Mexico Raul Jimenez player props"
  * → ["Mexico Raul Jimenez"]; "Switzerland vs Canada" → ["Switzerland", "Canada"], since lowercase
  * "vs" breaks the run). Lowercase tails like "player props"/"goals"/"odds" are naturally excluded —
- * they are not proper nouns. These spans are the entities a compound query is really about.
+ * they are not proper nouns. A capitalized month/weekday (`TIMEFRAME_PROPER`) also breaks the run —
+ * it's a date, not an entity. These spans are the entities a compound query is really about.
  */
 function properNounSpans(query: string): string[] {
   const spans: string[] = [];
   let run: string[] = [];
   for (const tok of query.split(/\s+/)) {
-    if (PROPER_WORD.test(tok)) {
+    if (PROPER_WORD.test(tok) && !TIMEFRAME_PROPER.has(tok.toLowerCase())) {
       run.push(tok);
     } else {
       if (run.length) spans.push(run.join(" "));
@@ -224,6 +263,13 @@ const DECOMP_STOPWORDS = new Set([
   // noise set ("price" → every price market) that the relevance floor then drops — so skip them and
   // search the real entity instead (the salient noun remains: "bitcoin price" → "bitcoin").
   "price", "prices", "range", "value", "values", "level", "levels", "odds", "line", "lines", "high", "low",
+  // Lowercase month / weekday names — the date-not-entity case `TIMEFRAME_PROPER` handles for the
+  // Capitalized proper-noun path, mirrored here so a lowercase "june"/"monday" can't recur the
+  // copper-for-June bug via this content-word path (adversarial review caught the lowercase gap).
+  "january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
+  "november", "december", "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+  "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+  "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun",
 ]);
 
 /**

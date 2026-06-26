@@ -191,11 +191,31 @@ export function venuesPresent(results: SearchResults): Venue[] {
   return out;
 }
 
-/** Rank by relevance → recency → interest → 24h volume; floor + cap. */
+/**
+ * Drop a REAL-MONEY market whose favorite is at/above 97¢ — it's settled or a foregone conclusion, not
+ * useful discovery. A HARD filter, beyond `interest()`'s ranking demotion: the live test surfaced a
+ * finalized "BTC price up in next 15 mins?" at 100¢ (1×) plus other near-1.0 intraday markets (some
+ * still `status=active`, so the discover.ts status filter alone doesn't catch them).
+ *
+ * Scope is deliberate: ONLY real-money venues (Kalshi/Polymarket). SAWA is never price-filtered — its
+ * read path already excludes resolved markets server-side, its pools are legitimately lopsided early on
+ * (a fresh market can sit at 100% one side), and the user is building Sawa so we surface it generously.
+ * The LOW side is NOT filtered either — a longshot (Congo DR 1¢ to win the World Cup) is real discovery,
+ * not a dead market; a genuinely settled-NO binary is caught by the discover.ts `status` filter instead.
+ */
+const SETTLED_HI = 0.97;
+function isLiveDiscoverable(r: VenueResult): boolean {
+  if (!r.realMoney) return true;
+  const p = r.top?.price;
+  return p == null || p < SETTLED_HI;
+}
+
+/** Rank by relevance → recency → interest → 24h volume; relevance floor + drop settled/decided + cap. */
 function rankAndCap(results: VenueResult[]): { rows: VenueResult[]; truncated: boolean } {
   const nowMs = clock();
   const kept = results
     .filter((r) => r.relevance >= RELEVANCE_MIN)
+    .filter(isLiveDiscoverable)
     .sort((a, b) => compareResults(a, b, nowMs));
   return { rows: kept.slice(0, PER_SOURCE_CAP), truncated: kept.length > PER_SOURCE_CAP };
 }
