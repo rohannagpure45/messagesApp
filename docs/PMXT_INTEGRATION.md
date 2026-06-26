@@ -50,13 +50,23 @@ has no value," never "pmxt failed."
   static scan to cover `src/pmxt` (the trade host must never appear).
 - **Never** pass Sawa user identifiers to pmxt (query by market title/category only) — preserves no-PII.
 - Enrichment is **fail-soft**: a pmxt timeout/error must never block or break a Sawa reply.
+- **Client-side rate limiting** *(shipped — `src/pmxt/http.ts`)*: a sliding-window guard caps outgoing GETs at
+  **~55 req/min** (headroom under the §2 60/min free-tier ceiling) so we self-throttle and **never trip the
+  server-side cooldown that 429s the rest of the minute window** — the failure mode that made a rapid manual
+  burst (entity fan-out × several quick messages × 2 venues) blank out every venue. Overflow is **fail-soft
+  dropped** (a `PmxtRateLimitError` thrown before any network call), never queued, so a reply can't hang. On a
+  real `429`, a **`Retry-After` circuit breaker** pauses *all* calls until the header (or a 15 s default)
+  elapses instead of hammering; a `429` itself is not retried (it is a definitive answer — see `SEARCH_FIXES.md`
+  Issue 3). Per-`(venue, query)` cache TTL is **180 s** (a re-asked topic reuses cached rows). See
+  `SEARCH_FIXES.md` Issue 6.
 - **Cost control:** `fetchMatchedMarketClusters` is embedding+LLM-backed and may cost **more than 1
   credit** — cache per market with a TTL and gate per space (don't call it on every group message);
   confirm its real credit cost before relying on the 25k/mo free tier.
 - Always label external prices as **real-money venues** to avoid conflating them with Sawa virtual coins.
 
 ## 6. Module sketch
-`src/pmxt/http.ts` (GET, bearer, timeout/UpstreamError) · `src/pmxt/discover.ts`
+`src/pmxt/http.ts` (GET, bearer, timeout/UpstreamError, **client-side ~55/min rate guard + Retry-After circuit
+breaker**) · `src/pmxt/discover.ts`
 (`fetchMarkets({query,category,exchange,limit})`, `fetchMatchedClusters({query,minConfidence,minVenues})`,
 `fetchOhlcv(marketId)`) · wired into the router as the price-anchor enrichment + a "trending" capability,
 leaving `src/sawa/read.ts`/`suggest.ts` as the authoritative source for Sawa's own markets.

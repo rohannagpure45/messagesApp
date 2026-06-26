@@ -189,3 +189,36 @@ Native iMessage Poll **buttons** render only on a **cloud or dedicated** line; L
 group path) is text-only, so it shows the numbered list. The code already sends a real `poll()` where
 the platform supports it (`pollCapable`). Getting buttons **and** reliable groups together needs a
 dedicated Business line — deferred (owner decision).
+
+---
+
+# v3 — follow-up prompt hardening (off-schema hallucination, 26-Jun)
+
+The v2 `answer` action injects the **currently-shown market's facts** into `FOLLOWUP_SYSTEM_PROMPT`
+(`contextDigest`) so a question about it is answered, not mis-searched. A later live group test exposed the
+flip side: when an **unrelated NEW topic** arrives while a *different* market is still the active-thread
+context — e.g. a Solana market on screen, then `"Haaland goals first half"` — `gemini-3.1-flash-lite`
+conflated "classify this message" with "answer whether a market exists" and emitted an **off-schema
+`{"error":"No market found…"}`** object. The bot never asks the model whether a market exists, so this was a
+pure hallucination; `parseLlmJson` parsed it, `interpretFollowupLlm`'s `default: return null` dropped it (no
+`kind`), and `parseIntent` fell back to a regex search — so it **never reached the user**, but it wasted an LLM
+call and was fragile. Owner framing: *"the model must never judge market existence."* `npm test` **201** green;
+typecheck clean. Full fix-log entry: [`SEARCH_FIXES.md`](SEARCH_FIXES.md) Issue 7.
+
+1. **Forbid the escape hatch.** `FOLLOWUP_SYSTEM_PROMPT` (`src/sawa/intent.ts` — distinct from the v1 §A cold
+   extraction `SYSTEM_PROMPT`) now states the model has **no market data and must never claim a market does/does
+   not exist or refuse**, and must **never output an `error` field or any key other than
+   `kind`/`query`/`venue`/`reply`**.
+2. **Mismatch → search.** When the message is unrelated to the shown market (a topic mismatch) or the model is
+   unsure it is a `next`/`link`/`answer`/`other` follow-up, it must classify it as `{"kind":"search"}` with the
+   clean new topic in `query` — exactly what the user wanted.
+
+## v3 safety
+
+`parseLlmJson`'s fence/prose/array tolerance and `interpretFollowupLlm`'s `default: return null` clamp are
+**retained as the downstream backstop** — the prompt prevents the hallucination at the source, the parser still
+catches any stray off-schema body and degrades to a regex search (defense in depth). A regression test
+(`tests/intent.test.ts`) pins the exact Solana/Haaland `{error}` body → `kind:"search"`, `via:"fallback"`.
+
+> The pmxt **429 rate guard** shipped alongside this (same live test) but is a separate concern — it lives in
+> [`SEARCH_FIXES.md`](SEARCH_FIXES.md) Issue 6 + [`PROGRESS.md`](PROGRESS.md), **not** documented here.

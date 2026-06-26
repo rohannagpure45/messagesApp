@@ -232,6 +232,17 @@ describe("parseIntent with active-market context", () => {
     const intent = await parseIntent("what game is that for", BOT, cfg, activeCtx);
     expect(intent.kind).not.toBe("answer"); // empty reply → null → keep the regex gate's guess
   });
+
+  it("falls back to a SEARCH when the follow-up LLM hallucinates an off-schema {error} object (the Solana/Haaland bug)", async () => {
+    // With a stale active-market context (e.g. Solana) and an UNRELATED new topic, flash-lite would emit
+    // {"error":"No market found..."} — it has no `kind`, so interpretFollowupLlm returns null and the
+    // regex gate's guess (a search for the raw topic) is used. The hallucination never reaches the user.
+    __setClient(stubClient('{"error":"No market found for \'Haaland goals first half\' on the specified venues."}'));
+    const intent = await parseIntent("Haaland goals first half", BOT, cfg, activeCtx);
+    expect(intent.kind).toBe("search");
+    expect(intent.query).toBe("Haaland goals first half");
+    expect(intent.via).toBe("fallback");
+  });
 });
 
 describe("classifyWithLlm JSON robustness (Issue 1)", () => {

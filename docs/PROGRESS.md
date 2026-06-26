@@ -5,6 +5,39 @@ status lives in [`../AGENTS.md`](../AGENTS.md); the phased plan in [`BUILD_PLAN.
 
 ---
 
+## 2026-06-26 — pmxt 429 client-side rate guard + Gemini follow-up off-schema hardening
+
+A live group test (LOCAL mode) hit two distinct failures back-to-back: (1) **every** pmxt call returned
+`HTTP 429` for a whole session — rapid testing by two members tripped the free-tier **60 req/min** ceiling, and
+pmxt then 429s *everything* for the rest of the minute window (a direct probe with the same key returned `200`
+seconds later, proving the markets exist and the key is fine); and (2) the intent LLM returned an off-schema
+`{"error":"No market found for 'Haaland goals first half'…"}` when an *unrelated* new topic arrived while a
+different market (Solana) was still the active-thread context injected into `FOLLOWUP_SYSTEM_PROMPT`. Both are
+now fixed. `npm run typecheck` clean; `npm test` **201** (+5). Full spec: [`SEARCH_FIXES.md`](SEARCH_FIXES.md)
+Issues 6–7.
+
+1. **pmxt 429 storm — client-side rate guard** (`src/pmxt/http.ts` `getJson`/`reserveSlot`, `src/pmxt/discover.ts`).
+   The staged fan-out + `PMXT_CONCURRENCY = 4` (commit `3741ddd`) bounded *concurrency*, not *rate* — 4 concurrent
+   × ~1 s ≈ 240 req/min, ~4× over the ceiling. Added (a) a **sliding-window cap** of **55 / 60 s** that fail-soft
+   **drops** the overflow (new `PmxtRateLimitError`, thrown before any network call) so we self-throttle and never
+   trigger the server cooldown — a *drop*, not a queue, so a reply never hangs and the happy path (~2 calls) adds
+   zero latency; and (b) a **`Retry-After` circuit breaker** that pauses every call after a real 429 until the
+   header (or a 15 s default) elapses, so a burst stops hammering. A 429 is still **not retried** (consistent with
+   Issue 3); the log distinguishes `rate-capped (local)` from a server `HTTP 429`. Also `CACHE_TTL_MS` 60 s→180 s.
+   `MAX_SUBQUERIES` deliberately **kept at 6** — trimming it would drop the `"Raul Jimenez"` bigram Issue 4's
+   decomposition needs. This closes the 25-Jun retest #2 deferral (*"pmxt HTTP 429 under a rapid manual burst …
+   not addressed this round"*).
+2. **Gemini follow-up off-schema `{error}`** (`src/sawa/intent.ts` `FOLLOWUP_SYSTEM_PROMPT`). The bot never asks
+   the LLM whether a market exists — the `{error}` was a hallucination on a context mismatch (new topic vs the
+   stale active-market context). The parser's `default→null` clamp already dropped it (fell back to a regex
+   search, so it never reached the user), but it was wasteful/fragile. Hardened the prompt: no market data / never
+   judge existence, never emit an `error` (or any non-schema) field, an unrelated/mismatched message →
+   `kind:search`. Backstop clamp retained for defense in depth. See [`CLARIFY_FOLLOWUP.md`](CLARIFY_FOLLOWUP.md) §v3.
+
+**Verification:** all 201 unit tests green incl. new pmxt rate-guard tests (cap drop + recovery, Retry-After pause,
+default pause, per-slice fail-soft) and the off-schema `{error}` intent regression; the headless LOCAL bot was
+restarted on the fix. Live burst re-test in iMessage is the owner's confirming step.
+
 ## 2026-06-25 — rich-link preview on the "send the link" follow-up
 
 **Symptom (owner, from live use):** when the bot hands out a market link it shows differently on

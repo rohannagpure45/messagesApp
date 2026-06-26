@@ -1,6 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { searchVenue, searchExternal, expandQueries, __setClock, __clearCache } from "../src/pmxt/discover";
-import { PmxtError, __setRetryBackoffMs } from "../src/pmxt/http";
+import {
+  PmxtError,
+  PmxtRateLimitError,
+  __setRetryBackoffMs,
+  __setHttpClock,
+  __resetRateGuard,
+} from "../src/pmxt/http";
 import type { PmxtConfig } from "../src/sawa/config";
 
 const cfg: PmxtConfig = { apiKey: "test-key", baseUrl: "https://api.pmxt.dev", builderMode: false };
@@ -8,11 +14,15 @@ const cfg: PmxtConfig = { apiKey: "test-key", baseUrl: "https://api.pmxt.dev", b
 const realFetch = globalThis.fetch;
 let calls: { url: string; init: RequestInit }[] = [];
 
-function res(body: unknown, status = 200): Response {
+/** Stub Response. `headers` (optional) exposes a case-insensitive `.get` so Retry-After tests work; the
+ *  real fetch Response always has `headers`, so the guarded `res.headers?.get?.()` reads it the same way. */
+function res(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  const lower = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
   return {
     ok: status >= 200 && status < 300,
     status,
     statusText: `S${status}`,
+    headers: { get: (h: string) => lower[h.toLowerCase()] ?? null },
     json: async () => body,
   } as unknown as Response;
 }
@@ -47,11 +57,15 @@ beforeEach(() => {
   __clearCache();
   __setClock(() => 0);
   __setRetryBackoffMs(0); // don't actually sleep during retry tests
+  __resetRateGuard(); // clear any window/429-pause leaked from a prior case
+  __setHttpClock(() => 0); // freeze the rate-guard clock too (deterministic window math)
 });
 afterEach(() => {
   globalThis.fetch = realFetch;
   __setClock(() => Date.now());
   __setRetryBackoffMs(250);
+  __resetRateGuard();
+  __setHttpClock(() => Date.now());
 });
 
 describe("searchVenue", () => {
@@ -109,7 +123,7 @@ describe("searchVenue", () => {
     await searchVenue(cfg, "kalshi", "Kalshi", "x", 20);
     await searchVenue(cfg, "kalshi", "Kalshi", "x", 20); // within TTL → served from cache
     expect(calls.length).toBe(1);
-    t += 61_000; // past the 60s TTL
+    t += 181_000; // past the 180s (3-min) TTL
     await searchVenue(cfg, "kalshi", "Kalshi", "x", 20);
     expect(calls.length).toBe(2);
   });
@@ -175,6 +189,68 @@ describe("getJson transient retry (via searchVenue)", () => {
     }) as typeof fetch;
     await expect(searchVenue(cfg, "kalshi", "Kalshi", "x", 20)).rejects.toBeInstanceOf(PmxtError);
     expect(n).toBe(1); // no retry
+  });
+});
+
+describe("client-side rate guard (the 429-storm fix)", () => {
+  it("self-limits to 55 requests/min, fail-soft-drops the overflow (no network), then recovers when the window slides", async () => {
+    let t = 0;
+    __setHttpClock(() => t);
+    stub(() => res(resp([market()])));
+    for (let i = 0; i < 55; i++) await searchVenue(cfg, "kalshi", "Kalshi", `q${i}`, 20); // distinct → bypass cache
+    expect(calls.length).toBe(55); // all 55 within the minute window reach the wire
+    await expect(searchVenue(cfg, "kalshi", "Kalshi", "q-over", 20)).rejects.toBeInstanceOf(PmxtRateLimitError);
+    expect(calls.length).toBe(55); // the 56th is dropped BEFORE any network call
+    t += 60_000; // the 60s window slides
+    await searchVenue(cfg, "kalshi", "Kalshi", "q-after", 20);
+    expect(calls.length).toBe(56); // calls flow again — no server cooldown was ever triggered
+  });
+
+  it("pauses every call after a server 429 (honoring Retry-After), short-circuiting until it elapses", async () => {
+    let t = 0;
+    __setHttpClock(() => t);
+    let n = 0;
+    stub(() => {
+      n += 1;
+      return res({ error: "rate limited" }, 429, { "retry-after": "30" });
+    });
+    await expect(searchVenue(cfg, "kalshi", "Kalshi", "a", 20)).rejects.toBeInstanceOf(PmxtError); // real 429
+    expect(n).toBe(1);
+    // Inside the 30s Retry-After pause → fail-soft local error, NO network hit.
+    await expect(searchVenue(cfg, "kalshi", "Kalshi", "b", 20)).rejects.toBeInstanceOf(PmxtRateLimitError);
+    expect(n).toBe(1); // unchanged — short-circuited before fetch
+    t += 31_000; // past the Retry-After window
+    await expect(searchVenue(cfg, "kalshi", "Kalshi", "c", 20)).rejects.toBeInstanceOf(PmxtError);
+    expect(n).toBe(2); // pause lifted → it hit the wire again
+  });
+
+  it("falls back to a default pause when a 429 carries no Retry-After header", async () => {
+    let t = 0;
+    __setHttpClock(() => t);
+    let n = 0;
+    stub(() => {
+      n += 1;
+      return res({ error: "rate limited" }, 429); // no Retry-After header
+    });
+    await expect(searchVenue(cfg, "kalshi", "Kalshi", "a", 20)).rejects.toBeInstanceOf(PmxtError);
+    await expect(searchVenue(cfg, "kalshi", "Kalshi", "b", 20)).rejects.toBeInstanceOf(PmxtRateLimitError);
+    expect(n).toBe(1); // default 15s pause short-circuits b
+    t += 16_000;
+    await expect(searchVenue(cfg, "kalshi", "Kalshi", "c", 20)).rejects.toBeInstanceOf(PmxtError);
+    expect(n).toBe(2); // default pause elapsed → wire again
+  });
+
+  it("a 429 on one venue does not pre-empt a sibling call already in flight (fail-soft per slice)", async () => {
+    __setHttpClock(() => 0);
+    stub((url) =>
+      url.includes("sourceExchange=kalshi")
+        ? res({ error: "rate limited" }, 429)
+        : res(resp([market({ sourceExchange: "polymarket", title: "Poly bitcoin market" })])),
+    );
+    const out = await searchExternal(cfg, "bitcoin", 20);
+    expect(out.errored).toBe(true);
+    expect(out.kalshi).toEqual([]); // 429 → degraded to empty
+    expect(out.polymarket).toHaveLength(1); // sibling reserved its slot before the 429 opened the pause
   });
 });
 

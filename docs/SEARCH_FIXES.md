@@ -1,9 +1,10 @@
 # Conversational Search — reliability + matching fixes (implementation spec)
 
-**Status:** ALL FIVE IMPLEMENTED. Issues **1–4** shipped 24-Jun; Issue **5 shipped 25-Jun, generalized into a
-natural-language AGENT SETTINGS framework** (not just quips). Typecheck clean; `npm test` 141 green. Found
-24-Jun during the first live LOCAL-mode group test. Each item has **symptom → evidence → root cause → fix →
-acceptance**.
+**Status:** ALL SEVEN IMPLEMENTED. Issues **1–4** shipped 24-Jun; Issue **5 shipped 25-Jun, generalized into a
+natural-language AGENT SETTINGS framework** (not just quips). Issues **6–7 shipped 26-Jun** from a later live
+group test — a pmxt **429 storm** (client-side rate guard) and a Gemini **follow-up off-schema `{error}`
+hallucination** (prompt hardening). Typecheck clean; `npm test` 201 green. Each item has **symptom → evidence →
+root cause → fix → acceptance**.
 
 **What shipped (1–4):** `max_tokens 80→256` + defensive JSON extraction (fences/prose/first-`{`-to-last-`}`)
 in `classifyWithLlm`; `look for`/`search for`/`find me`/`look up for` added to the regex `SEARCH_TRIGGERS`;
@@ -217,6 +218,87 @@ reply after `quips on` includes the flourish, after `quips off` does not. **Live
 
 ---
 
+## Issue 6 — pmxt `429` storm: rapid testing trips the free-tier per-minute ceiling, then pmxt 429s *everything* ✅ DONE
+
+**Symptom.** During live group testing every external venue came back empty and the reply said *"couldn't reach
+Kalshi or Polymarket just now"*. The headless log showed **`HTTP 429` on every pmxt call** — not the intermittent
+single timeout of Issue 3, but a sustained wall of 429s across an entire session, including simple follow-up
+queries that had markets.
+
+**Evidence.** A direct probe with the SAME key returned `200 OK` with live data seconds later — so the key is
+valid and the markets exist; the empties were purely rate-limiting. The free tier is **60 req/min**
+([`PMXT_INTEGRATION.md`](PMXT_INTEGRATION.md) §2), and tripping it does **not** just fail the offending call —
+pmxt then `429`s *every* request for the rest of the minute window, poisoning the key so the next legit search
+is empty too. Two testers firing ~9 messages in ~2 min, several of them compound (each entity-decomposed into
+up to 6 sub-queries × 2 venues), blew well past 60/min.
+
+**Root cause.** The staged fan-out + `PMXT_CONCURRENCY = 4` cap (commit `3741ddd`) bound how many calls run **at
+once**, not the request **rate** — 4 concurrent × ~1s each ≈ 240 req/min sustained, ~4× over the ceiling. There
+was **no client-side rate limit**, and a `429` only degraded the current slice (it never told us to *stop
+sending*), so a burst kept hammering the server straight through its cooldown. This is the deferred item the
+25-Jun retest #2 log explicitly flagged (*"pmxt HTTP 429 under a rapid manual burst … not addressed this
+round"*); Issue 6 closes it.
+
+**Fix** (`src/pmxt/http.ts` + `src/pmxt/discover.ts`):
+- **(a) Sliding-window cap (proactive).** A client-side guard in `getJson` (`reserveSlot`) caps outgoing calls at
+  **55 / 60 s** — headroom under the 60/min ceiling — so we self-throttle and **never trip the server cooldown**.
+  Overflow is **fail-soft dropped** (a new `PmxtRateLimitError`, thrown *before any network call*), so the search
+  degrades to the graceful empty-state rather than blocking the reply. Deliberately a **drop, not a queue**: a
+  chat reply must never hang waiting on a token, and the bucket starts full so normal use (~2 calls/search) adds
+  **zero latency**.
+- **(b) Retry-After circuit breaker (reactive).** If a `429` *does* come back (shared key, or the cap a hair
+  generous), read its **`Retry-After`** header (or a 15 s default) and **pause every call until it elapses** — the
+  direct antidote to the "429-everything-for-a-minute" storm. A `429` is still **NOT retried** (consistent with
+  Issue 3's "an HTTP status is a definitive answer"); the pause prevents the *next* calls from hammering.
+- **(c) Lighter footprint.** `CACHE_TTL_MS` **60 s → 180 s** (a re-asked topic — common in testing — reuses cached
+  rows; discovery names a favorite, not a tradable quote, so slightly-staler odds are fine). `MAX_SUBQUERIES`
+  **left at 6** — trimming it would drop the high-value proper-noun *bigram* (`"Raul Jimenez"`) that Issue 4's
+  decomposition depends on, so the rate guard, not a fan-out cut, is what bounds the burst.
+- New `PmxtRateLimitError` carries no HTTP status (no request was made); `searchSubqueries` classifies it in the
+  warn log as `rate-capped (local)` to disambiguate a self-imposed skip from a real server `HTTP 429`.
+
+**Acceptance.** `tests/pmxt.test.ts`: the guard lets 55 calls/min through then **fail-soft-drops the 56th with no
+network hit**, and recovers when the window slides; a server `429` with `Retry-After: 30` **pauses subsequent
+calls** (short-circuit, no fetch) until 30 s pass, with a 15 s default when the header is absent; a `429` on one
+venue does **not** pre-empt a sibling call already in flight (per-slice fail-soft). Injectable clock
+(`__setHttpClock`) + reset seam (`__resetRateGuard`) keep it deterministic. Issue 3's transient-retry test stays
+green (a `429` is not swept into that path). **Extends, does not replace, `3741ddd`.**
+
+---
+
+## Issue 7 — Gemini follow-up hallucinates an off-schema `{"error"}` object on an unrelated new topic ✅ DONE
+
+**Symptom.** After the bot showed a market (e.g. Solana), an *unrelated* new topic in the same thread
+(`"Haaland goals first half"`) produced — from the intent LLM — `{"error":"No market found for 'Haaland goals
+first half' on the specified venues."}`. The bot never asks the LLM whether a market exists, so this was a pure
+hallucination.
+
+**Evidence.** A captured `gemini-3.1-flash-lite` call shows the **active-market context** (`contextDigest`, the
+Solana facts) injected into `FOLLOWUP_SYSTEM_PROMPT`, the user content `"Haaland goals first half"`, and the model
+returning the off-schema `{error}` object (no `kind`). `interpretFollowupLlm`'s `default: return null` caught it
+and `parseIntent` fell back to a regex search, so it **never reached the user** — but it wasted an LLM call and is
+fragile.
+
+**Root cause.** When the conversation has an active market, every follow-up message is classified with that
+market's facts stapled into the system prompt (so `next`/`link`/`answer` follow-ups work hail-free). Given a
+**context mismatch** — a brand-new topic while a *different* market is in context — flash-lite conflated "classify
+this message" with "answer whether a market exists" and emitted an `error` escape hatch the prompt never forbade.
+
+**Fix** (`src/sawa/intent.ts`, `FOLLOWUP_SYSTEM_PROMPT`):
+- Append three clauses: **(a)** *"You have NO market data and CANNOT know whether any market exists — NEVER claim a
+  market does or does not exist, NEVER refuse"*; **(b)** *"NEVER output an `error` field or any key other than
+  kind/query/venue/reply"*; **(c)** *"If the message is UNRELATED to the shown market (a topic mismatch) or you are
+  unsure it is a next/link/answer/other follow-up, classify it as `{"kind":"search"}` with the clean new topic in
+  `query`."* The cold `SYSTEM_PROMPT` and all schema field names are untouched.
+- Belt-and-suspenders: `interpretFollowupLlm`'s `default: return null` clamp (off-schema → regex-gate search)
+  stays as the downstream backstop — defense in depth, so a stray hallucination still degrades to a search.
+
+**Acceptance.** `tests/intent.test.ts`: with active-market `ctx`, an off-schema `{"error":"No market found…"}`
+body (via the `__setClient` stub) yields `{kind:"search", query:"Haaland goals first half", via:"fallback"}` — the
+hallucination is dropped and the topic is searched, never surfaced.
+
+---
+
 ## Consolidated acceptance (for the `/goal`)
 
 - [x] **1** `max_tokens: 256` + defensive JSON extraction; truncated/fenced/prose bodies no longer break intent.
@@ -228,7 +310,13 @@ reply after `quips on` includes the flourish, after `quips off` does not. **Live
       extensible), sticky per-space (no TTL), default from env; the toggle phrase is never searched, and a
       compound `"turn on the quips, look for X"` applies the toggle then searches the remainder. `"settings"`
       reads current values.
-- [x] `npm run typecheck` clean; `npm test` green (141) with new unit tests for items 1–5.
+- [x] **6** pmxt **429 storm** — client-side sliding-window cap (55/60 s, fail-soft drop) keeps us under the
+      free-tier 60/min so the server cooldown never triggers; a `Retry-After` circuit breaker pauses calls after
+      a real 429; cache TTL 60 s→180 s; `MAX_SUBQUERIES` left at 6 (trimming would break Issue 4's decomposition).
+- [x] **7** Gemini **follow-up off-schema `{error}`** — `FOLLOWUP_SYSTEM_PROMPT` now forbids non-schema/`error`
+      fields, declares the model has no market data / must never judge existence, and routes an
+      unrelated/mismatched message to `kind:search`; the parser `default→null` backstop stays for defense in depth.
+- [x] `npm run typecheck` clean; `npm test` green (201) with new unit tests for items 1–7.
 - [ ] **Live group re-test** (pending hardware): World Cup (Sawa lead), `look for Czechia` (Kalshi),
       `look for player props on Raul Jimenez` (Kalshi goals market), `quips off`/`sawa only`/`settings`
       toggles, link follow-up.

@@ -13,7 +13,7 @@
  * (venue, query) cache, a STAGED fan-out (full query first; entities only if it found nothing), and a
  * concurrency cap. A 429/timeout is fail-soft (an empty venue) and flagged via `errored`.
  */
-import { getJson, PmxtError } from "./http";
+import { getJson, PmxtError, PmxtRateLimitError } from "./http";
 import type { PmxtConfig } from "../sawa/config";
 import { type Venue, type VenueResult, scoreRelevance } from "../venue";
 
@@ -72,7 +72,10 @@ interface CacheEntry {
   results: VenueResult[];
 }
 
-const CACHE_TTL_MS = 60_000; // 1 minute — fresh enough for live odds, cheap on credits.
+// 3 minutes — discovery names a favorite, not a tradable quote, so slightly-staler odds are fine, and a
+// longer TTL means a re-asked topic (common in live testing) reuses the cached rows instead of spending
+// fresh calls/credits. Works WITH the client-side rate guard (src/pmxt/http.ts) to keep us under 60/min.
+const CACHE_TTL_MS = 180_000;
 const cache = new Map<string, CacheEntry>();
 /** Injectable clock so tests are deterministic (avoids Date.now() flakiness). */
 let now: () => number = () => Date.now();
@@ -309,14 +312,18 @@ async function searchSubqueries(
       }
     } else {
       errored = true;
-      // Distinguish the failure class: a real HTTP status (definitive), a timeout, or a network error.
+      // Distinguish the failure class: our client-side rate guard (no call made), a real HTTP status
+      // (definitive), a timeout, or a network error — so the logs disambiguate a self-imposed skip
+      // ("rate-capped (local)") from an actual server 429 ("HTTP 429").
       const reason = r.reason as Error | undefined;
       const detail =
-        r.reason instanceof PmxtError
-          ? `HTTP ${r.reason.status}`
-          : reason?.name === "AbortError"
-            ? "timeout"
-            : "network";
+        r.reason instanceof PmxtRateLimitError
+          ? "rate-capped (local)"
+          : r.reason instanceof PmxtError
+            ? `HTTP ${r.reason.status}`
+            : reason?.name === "AbortError"
+              ? "timeout"
+              : "network";
       console.warn(`[pmxt] ${e.venue} search "${q}" failed (${detail}) — degrading to without it.`);
     }
   });

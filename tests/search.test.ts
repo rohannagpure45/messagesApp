@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { runSearch, isBroadQuery, flattenRanked, venuesPresent, __setClock as __setSearchClock } from "../src/search";
 import { __clearCache, __setClock } from "../src/pmxt/discover";
+import { __resetRateGuard, __setHttpClock } from "../src/pmxt/http";
 import type { SearchResults } from "../src/search";
 import type { Config, PmxtConfig } from "../src/sawa/config";
 import type { VenueResult } from "../src/venue";
@@ -73,11 +74,15 @@ function installStub(v: StubVenues) {
 beforeEach(() => {
   __clearCache();
   __setClock(() => 0);
+  __resetRateGuard(); // pmxt rate guard is global module state — isolate each test
+  __setHttpClock(() => 0);
 });
 afterEach(() => {
   globalThis.fetch = realFetch;
   __setClock(() => Date.now());
   __setSearchClock(() => Date.now());
+  __resetRateGuard();
+  __setHttpClock(() => Date.now());
 });
 
 describe("runSearch", () => {

@@ -233,7 +233,15 @@ const FOLLOWUP_SYSTEM_PROMPT =
   '(do NOT invent fixtures, odds, or links). ' +
   '"search" = the user asks about a genuinely NEW topic; put the clean topic (no filler) in "query". ' +
   '"other" = greeting, small talk, account/help, or a request to CREATE a market. ' +
-  'Set every unused field to "". Return a SINGLE JSON object, never an array.';
+  'Set every unused field to "". Return a SINGLE JSON object, never an array. ' +
+  // Hardening (the Solana/Haaland off-schema bug): when an UNRELATED new topic arrives while a market
+  // for a different subject is in context, flash-lite would emit {"error":"No market found..."} — it has
+  // no market data and was answering a question we never asked. Forbid that escape hatch outright.
+  'You have NO market data and CANNOT know whether any market exists — NEVER claim a market does or ' +
+  'does not exist, NEVER refuse, and NEVER output an "error" field or any key other than ' +
+  'kind/query/venue/reply. If the message is UNRELATED to the shown market (a topic mismatch) or you are ' +
+  'unsure it is a next/link/answer/other follow-up, classify it as {"kind":"search"} with the clean new ' +
+  'topic in "query".';
 
 /** A one-line context summary fed to the LLM alongside the follow-up prompt (not a raw transcript). */
 function contextDigest(ctx: FollowupContext): string {

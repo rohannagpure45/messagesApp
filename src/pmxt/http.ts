@@ -17,6 +17,22 @@ export class PmxtError extends Error {
   }
 }
 
+/**
+ * Raised by the CLIENT-SIDE rate guard BEFORE any network call — either the local per-minute cap was
+ * reached, or a prior server `429` opened a `Retry-After` pause. It is fail-soft (the caller degrades
+ * that venue/sub-query to empty, exactly like a timeout) and is deliberately NOT a `PmxtError` (it
+ * carries no HTTP status — no request was made). `retryAfterMs` is how long until the guard reopens.
+ */
+export class PmxtRateLimitError extends Error {
+  constructor(
+    public retryAfterMs: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "PmxtRateLimitError";
+  }
+}
+
 /** Backoff before the single transient retry. Injectable so tests don't actually sleep. */
 let retryBackoffMs = 250;
 /** Test seam: shrink (or zero) the retry backoff so retry tests run instantly. */
@@ -24,6 +40,71 @@ export function __setRetryBackoffMs(ms: number): void {
   retryBackoffMs = ms;
 }
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// ── Client-side rate guard ─────────────────────────────────────────────────────────────────────
+// WHY: the free tier is 60 req/min, and tripping it does NOT just fail the offending call — pmxt then
+// `429`s EVERY request for the rest of the minute window, so one rapid burst (an entity-decomposition
+// fan-out × several quick messages, ×2 venues) poisons the key and the NEXT legit search comes back
+// empty. The staged fan-out + concurrency cap (discover.ts) reduce how many calls a search makes but do
+// NOT bound the request RATE — 4 concurrent × ~1s each ≈ 240/min, well over the ceiling under sustained
+// testing. So we self-limit two ways, both fail-soft:
+//   1. a sliding-window cap (MAX_PER_WINDOW per WINDOW_MS, headroom under 60/min) — never SEND a burst
+//      that would trip the server cooldown; excess calls are dropped to an empty slice, never queued
+//      (a chat reply must not block on a token), and
+//   2. a Retry-After circuit breaker — if a `429` DOES come back (e.g. the key is shared, or our cap is
+//      a hair generous), pause ALL calls until the server's `Retry-After` elapses instead of hammering.
+// Injectable clock + reset seam keep it deterministic in tests. The bucket starts full, so normal use
+// (~2 calls/search) never waits — only a sustained burst hits the guard.
+const WINDOW_MS = 60_000;
+const MAX_PER_WINDOW = 55;
+/** Fallback pause when a 429 carries no (or an unparseable) Retry-After header. */
+const DEFAULT_PAUSE_MS = 15_000;
+
+let httpNow: () => number = () => Date.now();
+let windowStart = 0;
+let windowCount = 0;
+let pausedUntil = 0;
+
+/** Test seam: inject a deterministic clock for the rate guard (mirrors discover.ts `__setClock`). */
+export function __setHttpClock(fn: () => number): void {
+  httpNow = fn;
+}
+/** Test seam: clear the rate-guard window + pause between cases. */
+export function __resetRateGuard(): void {
+  windowStart = 0;
+  windowCount = 0;
+  pausedUntil = 0;
+}
+
+/**
+ * Reserve one request slot, or throw `PmxtRateLimitError` (no network) when paused by a server 429 or
+ * over the local per-minute cap. Called once at the top of `getJson`, so a fail-soft caller degrades to
+ * empty without ever touching the wire.
+ */
+function reserveSlot(): void {
+  const t = httpNow();
+  if (t < pausedUntil) {
+    throw new PmxtRateLimitError(pausedUntil - t, `pmxt paused after a 429 (~${Math.ceil((pausedUntil - t) / 1000)}s left)`);
+  }
+  if (t - windowStart >= WINDOW_MS) {
+    windowStart = t;
+    windowCount = 0;
+  }
+  if (windowCount >= MAX_PER_WINDOW) {
+    throw new PmxtRateLimitError(
+      windowStart + WINDOW_MS - t,
+      `pmxt local rate cap (${MAX_PER_WINDOW}/min) reached — skipping this call to protect the shared key`,
+    );
+  }
+  windowCount += 1;
+}
+
+/** Open the circuit after a server 429: pause every call until Retry-After (or a default) elapses. */
+function noteServer429(retryAfterHeader: string | null | undefined): void {
+  const secs = retryAfterHeader != null ? Number(retryAfterHeader) : NaN;
+  const ms = Number.isFinite(secs) && secs > 0 ? secs * 1000 : DEFAULT_PAUSE_MS;
+  pausedUntil = Math.max(pausedUntil, httpNow() + ms);
+}
 
 /**
  * GET `url` with the pmxt bearer key and parse JSON. The key is sent as `Authorization: Bearer`
@@ -42,6 +123,9 @@ export async function getJson<T>(
   timeoutMs = 9_000,
   retries = 1,
 ): Promise<T> {
+  // Client-side rate guard: throws PmxtRateLimitError (fail-soft, no network) when over the local cap
+  // or inside a post-429 pause. Reserved ONCE — a transient retry below reuses this slot.
+  reserveSlot();
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
     const controller = new AbortController();
@@ -53,6 +137,9 @@ export async function getJson<T>(
         signal: controller.signal,
       });
       if (!res.ok) {
+        // A 429 means the whole key is throttled — open the circuit so we stop hammering until the
+        // server's Retry-After elapses (the antidote to the "429-everything-for-a-minute" storm).
+        if (res.status === 429) noteServer429(res.headers?.get?.("retry-after"));
         throw new PmxtError(res.status, `GET ${redact(url)} → ${res.status} ${res.statusText}`);
       }
       return (await res.json()) as T;
