@@ -5,6 +5,38 @@ status lives in [`../AGENTS.md`](../AGENTS.md); the phased plan in [`BUILD_PLAN.
 
 ---
 
+## 2026-06-26 — the 429 fix WAS the bug + LOCAL-DM follow-ups dropped (Issues 9–10)
+
+A live DM/clarify test (the owner's "you created problems instead of solutions" report) plus a direct pmxt
+probe exposed two more bugs — and corrected a mis-diagnosis from the 6–8 round. `npm test` **211** (+8);
+typecheck clean. The LOCAL headless bot was restarted on the fix. Full detail in `docs/SEARCH_FIXES.md`
+Issues 9–10.
+
+1. **Transient header-less 429s were treated as definitive → false "couldn't reach (rate-limit)"**
+   (`src/pmxt/http.ts`). The owner's pmxt dashboard showed **1–2 calls/min**, yet replies claimed a rate-limit.
+   A probe was the smoking gun: at ~3 paced calls, `q="spaceX"` → **429 in 57 ms**, and the *very next* call
+   `q="SpaceX"` → 200/20 rows; an 8-way burst → 2 instant 429s + 6×200, **no `Retry-After` on any**. So pmxt's
+   free-tier 429 is a **fast transient burst/edge rejection that clears on the next call**, unrelated to the
+   60/min budget — and the code's "a 429 is definitive, never retry" assumption was exactly backwards. Fix:
+   `getJson` retries a **header-less** 429 (`PmxtError.retryable`, ≤2, short backoff; the single `reserveSlot`
+   is reused so retries don't spend window budget); a `Retry-After` 429 stays non-retryable + arms the breaker;
+   non-429 stays definitive; `PMXT_CONCURRENCY` 4→3. Verified live via the real `searchExternal`: spaceX (34),
+   Haaland goals (25), Mbappé goals (13) all `errored=false`; SPCX / "spaceX stock price" → clean empty
+   (`errored=false`), so the bot correctly offers to create rather than crying rate-limit.
+
+2. **LOCAL-mode DM follow-ups / clarify answers silently dropped** (`src/routing.ts` + `src/index.ts`). The bot
+   asked "Which 'spaceX' market? 1…4", the owner replied `"2"`, and it was **ignored** (`⊘ ignored … from=unknown`).
+   The same DM sender arrives as `+16302101333` on some inbounds and `unknown` on others (chat.db `LEFT JOIN
+   handle` doesn't resolve every row); the per-(space,sender) session key, the `pendingBy` binding, and the
+   "unknown-never-relaxed" rule (correct for groups) **all** keyed on that flapping handle, so the `"2"` landed
+   in a different bucket, failed the binding, and was refused relaxation — dropped three ways. (A latent NUL-byte
+   separator in the old DM key surfaced during the fix too.) Fix: a DM binds its thread to the **space** via new
+   pure helpers `threadOwner` / `sessionKey` / `canRelaxSender` (group behavior unchanged); `index.ts` threads
+   `isGroup` through the handlers and keys `pendingBy`/relaxation by `threadOwner`. Also peels a trailing venue
+   word that leaked into a query ("spaceX stock price kalshi" → "spaceX stock price").
+
+---
+
 ## 2026-06-26 — accented-name empties + over-aggressive 429 pause (follow-on to 6–7)
 
 A live DM test right after Issues 6–7 surfaced two more search-path bugs (`docs/SEARCH_FIXES.md` Issue 8).

@@ -45,7 +45,15 @@ import {
   confirmChanges,
   describeSettings,
 } from "./sawa/settings";
-import { shouldHandle, SeenSet, normalizeHandle, actionableWhenRelaxed } from "./routing";
+import {
+  shouldHandle,
+  SeenSet,
+  normalizeHandle,
+  actionableWhenRelaxed,
+  sessionKey,
+  threadOwner,
+  canRelaxSender,
+} from "./routing";
 
 // Single-instance lock (a localhost mutex, NOT a network server). Two bot processes on one Photon
 // project duel over the iMessage subscription — Photon delivers each text to only one of them, so
@@ -253,20 +261,12 @@ async function sendClarify(space: Space, question: ClarifyQuestion, platform: st
 }
 
 /**
- * Conversation-memory key — per (space, SENDER) so the HAILING sender's follow-ups flow without a
- * re-hail and each person keeps their own thread (settings stay per-space). When the handle is unknown
- * (local-mode groups where chat.db doesn't resolve every member's handle, reported as "unknown") all
- * such messages share one per-space bucket — the best we can do without a handle. space-joined so it
- * can't collide with a raw space id.
- */
-function sessionKey(spaceId: string, senderId: string): string {
-  return senderId && senderId !== "unknown" ? `${spaceId} ${senderId}` : spaceId;
-}
-
-/**
  * Run a fresh cross-venue search. When several DISTINCT markets match one topic (e.g. "bitcoin"), ASK
  * which one (a poll / numbered list) instead of guessing; otherwise reply with the single best market.
  * Either way the thread state is stored so follow-ups ("not that" / "send the link") resolve.
+ *
+ * `isGroup` decides thread ownership (routing.ts `threadOwner` / `sessionKey`): a DM binds to the space
+ * so a pending clarify survives local-mode handle flapping; a group binds per sender.
  */
 async function runConversationalSearch(
   space: Space,
@@ -274,9 +274,10 @@ async function runConversationalSearch(
   query: string,
   platform: string,
   senderId: string,
+  isGroup: boolean,
 ): Promise<void> {
   if (!config) return void (await guard("config notice", () => space.send(needsConfig())));
-  const sKey = sessionKey(spaceId, senderId);
+  const sKey = sessionKey(spaceId, senderId, isGroup);
   // Resolve agent settings for this space: "sawa only" drops external enrichment; "quips" sets the tone.
   const pmxt = settings.get(spaceId, "external") ? pmxtConfig : null;
   const folkTone = settings.get(spaceId, "quips");
@@ -288,8 +289,9 @@ async function runConversationalSearch(
     let question = decideClarify(candidates, query);
     if (question && intentConfig) question = await refineClarify(query, question, intentConfig);
     if (question && question.options.length >= 2) {
-      // Bind the pending question to the asker so only THEY can answer it with unhailed text.
-      convo.set(sKey, clarifyState(query, candidates, results, question, senderId));
+      // Bind the pending question to the thread OWNER (DM → the space; group → the sender) so only the
+      // right party answers it with unhailed text — and a DM answer survives the local handle flapping.
+      convo.set(sKey, clarifyState(query, candidates, results, question, threadOwner(spaceId, senderId, isGroup)));
       await sendClarify(space, question, platform);
       return;
     }
@@ -310,11 +312,18 @@ async function runConversationalSearch(
 }
 
 /** Slash-command fallback (power users + the terminal TUI). */
-async function handleSlash(space: Space, cmd: string, arg: string, platform: string, senderId: string): Promise<void> {
+async function handleSlash(
+  space: Space,
+  cmd: string,
+  arg: string,
+  platform: string,
+  senderId: string,
+  isGroup: boolean,
+): Promise<void> {
   switch (cmd) {
     case "/search": {
       if (!arg) return void (await space.send("Usage: /search <topic>"));
-      await runConversationalSearch(space, space.id, arg, platform, senderId);
+      await runConversationalSearch(space, space.id, arg, platform, senderId, isGroup);
       return;
     }
     case "/markets": {
@@ -365,16 +374,18 @@ async function handleNatural(
   platform: string,
   relaxed: boolean,
   senderId: string,
+  isGroup: boolean,
 ): Promise<void> {
   const spaceId = space.id;
-  const sKey = sessionKey(spaceId, senderId);
+  const owner = threadOwner(spaceId, senderId, isGroup);
+  const sKey = sessionKey(spaceId, senderId, isGroup);
   let state = convo.get(sKey) ?? null;
   const addressed = stripAddress(body, botName);
 
   // A pending clarify ("which market?") answer on the TEXT path (poll taps resolve in the loop). Bound
-  // to the ASKER: a bystander's "2" in a shared space (group / local-mode inbox) is NOT their answer to
-  // give, so we skip resolution for anyone else and leave the question standing for the asker.
-  if (state?.pending && state.pendingBy === senderId) {
+  // to the thread OWNER: in a group a bystander's "2" is NOT their answer to give; in a DM the owner is
+  // the space, so the answer resolves even when this inbound's handle didn't resolve (local flapping).
+  if (state?.pending && state.pendingBy === owner) {
     const opt = resolveAnswer(state.pending, addressed);
     if (opt) {
       const outcome = resolveClarifyTurn(state, opt, { folkTone: settings.get(spaceId, "quips") });
@@ -410,7 +421,7 @@ async function handleNatural(
   if (relaxed && !actionableWhenRelaxed(intent)) return;
 
   if (intent.kind === "search" && intent.query) {
-    await runConversationalSearch(space, spaceId, intent.query, platform, senderId);
+    await runConversationalSearch(space, spaceId, intent.query, platform, senderId, isGroup);
     return;
   }
   if (intent.kind === "answer" && intent.reply) {
@@ -454,16 +465,17 @@ function normTitle(s: string): string {
  * is silently dropped (the user just taps the current poll). Message ordering is Spectrum-guaranteed, so
  * a vote arriving after the text path already cleared `pending` simply finds none and returns.
  */
-async function handlePollVote(space: Space, message: Message): Promise<void> {
+async function handlePollVote(space: Space, message: Message, isGroup: boolean): Promise<void> {
   if (message.content.type !== "poll_option") return;
   if (!message.content.selected) return; // act on a selection, not a deselect
   if (isFromSelf(message)) return;
   const spaceId = space.id;
   const senderId = normalizeHandle(message.sender?.id || "unknown");
-  const sKey = sessionKey(spaceId, senderId);
+  const owner = threadOwner(spaceId, senderId, isGroup);
+  const sKey = sessionKey(spaceId, senderId, isGroup);
   const state = convo.get(sKey);
   if (!state?.pending) return;
-  if (state.pendingBy !== senderId) return; // only the asker resolves their own poll (symmetric w/ text)
+  if (state.pendingBy !== owner) return; // only the asker resolves their own poll (symmetric w/ text)
   if (normTitle(message.content.poll.title) !== normTitle(state.pending.question)) return; // not our poll
   if (seen.seen(message.id)) return; // at-least-once delivery → never resolve the same vote twice
   const opt = resolveAnswer(state.pending, message.content.option.title);
@@ -536,10 +548,11 @@ for await (const [space, message] of app.messages) {
   console.warn(
     `[sawa] ⟵ event [${message.platform}] type=${message.content.type} from=${normalizeHandle(message.sender?.id ?? "unknown")}`,
   );
+  const isGroup = isGroupSpace(space, message);
   // A native poll vote — the answer to a clarifying "which market?" poll. Handled before the text gate
   // (it carries no text/hail) and only acts on a pending clarify in this space. Cloud/terminal only.
   if (message.content.type === "poll_option") {
-    await guard("poll vote", () => handlePollVote(space, message));
+    await guard("poll vote", () => handlePollVote(space, message, isGroup));
     continue;
   }
   if (message.content.type !== "text") continue; // v1: text + poll_option (reactions land later)
@@ -551,7 +564,6 @@ for await (const [space, message] of app.messages) {
   // collapses to "unknown" and keys consistently (see sessionKey), rather than forking "" vs undefined.
   const senderId = normalizeHandle(message.sender?.id || "unknown");
   const isSlash = body.startsWith("/");
-  const isGroup = isGroupSpace(space, message);
 
   // Operational visibility: prove inbound delivery per platform (esp. for debugging the iMessage line).
   console.warn(
@@ -561,15 +573,16 @@ for await (const [space, message] of app.messages) {
   // In local mode the bot reads the Mac's whole inbox, so require an explicit "sawa …" hail everywhere
   // (treat like a group) — otherwise it would auto-reply to every DM this Apple ID receives.
   const hailed = shouldHandle({ isGroup: isGroup || localImessage, isSlash, body, botName });
-  // Relaxed follow-up: a non-hailed message is still handled WHEN the SENDER has an active session in
-  // this space (within TTL) — so THEIR poll/clarify answer ("2"), "send the kalshi link", a question
-  // about the shown market, or "find a market on X" work without re-hailing. Keyed by (space, sender),
-  // so one member hailing does NOT relax the whole space. handleNatural still gates it to follow-ups +
-  // explicit searches, staying silent on overheard chatter.
-  // UNKNOWN-handle senders (local-mode groups where chat.db doesn't resolve a member) are NEVER relaxed:
-  // they'd share one per-space bucket, so an unhailed bystander could ride another's session. They must
-  // hail each message — safe, at the cost of no hail-free follow-ups for unresolved members.
-  const relaxed = !hailed && senderId !== "unknown" && convo.get(sessionKey(space.id, senderId)) !== undefined;
+  // Relaxed follow-up: a non-hailed message is still handled WHEN the thread owner has an active session
+  // in this space (within TTL) — so a poll/clarify answer ("2"), "send the kalshi link", a question about
+  // the shown market, or "find a market on X" work without re-hailing. handleNatural still gates it to
+  // follow-ups + explicit searches, staying silent on overheard chatter.
+  //   - DM: ALWAYS relaxable (1:1 — the counterparty is unambiguous even when the handle didn't resolve;
+  //     this is the fix for the "'2' ignored" bug, where the answer's handle flapped to "unknown").
+  //   - GROUP: only KNOWN handles relax (an unknown member shares the per-space "unknown" bucket, so an
+  //     unhailed bystander could otherwise ride another member's session) — they must hail each message.
+  const relaxed =
+    !hailed && canRelaxSender(senderId, isGroup) && convo.get(sessionKey(space.id, senderId, isGroup)) !== undefined;
   if (!hailed && !relaxed) {
     // Bystander chatter (not addressed, no active thread) — feed the buffer for future suggestions, no reply.
     console.warn(
@@ -592,9 +605,9 @@ for await (const [space, message] of app.messages) {
         const parts = body.split(/\s+/);
         const cmd = (parts[0] ?? "").toLowerCase();
         const arg = parts.slice(1).join(" ").trim();
-        await handleSlash(space, cmd, arg, message.platform, senderId);
+        await handleSlash(space, cmd, arg, message.platform, senderId, isGroup);
       } else {
-        await handleNatural(space, body, message.platform, relaxed, senderId);
+        await handleNatural(space, body, message.platform, relaxed, senderId, isGroup);
       }
     } catch (err) {
       console.error(`[sawa] handler failed:`, err);

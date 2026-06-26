@@ -4,6 +4,7 @@ import {
   PmxtError,
   PmxtRateLimitError,
   __setRetryBackoffMs,
+  __setRate429BackoffMs,
   __setHttpClock,
   __resetRateGuard,
 } from "../src/pmxt/http";
@@ -57,6 +58,7 @@ beforeEach(() => {
   __clearCache();
   __setClock(() => 0);
   __setRetryBackoffMs(0); // don't actually sleep during retry tests
+  __setRate429BackoffMs(0); // ditto for the transient-429 retry backoff
   __resetRateGuard(); // clear any window/429-pause leaked from a prior case
   __setHttpClock(() => 0); // freeze the rate-guard clock too (deterministic window math)
 });
@@ -64,6 +66,7 @@ afterEach(() => {
   globalThis.fetch = realFetch;
   __setClock(() => Date.now());
   __setRetryBackoffMs(250);
+  __setRate429BackoffMs(200);
   __resetRateGuard();
   __setHttpClock(() => Date.now());
 });
@@ -188,12 +191,33 @@ describe("getJson transient retry (via searchVenue)", () => {
     expect(rows).toHaveLength(1);
   });
 
-  it("does NOT retry a definitive HTTP error (e.g. 429) — it is a real answer, not transient", async () => {
+  it("RETRIES a transient (header-less) 429 — pmxt's free tier emits fast burst 429s that clear next call", async () => {
     let n = 0;
-    globalThis.fetch = (() => {
+    stub(() => {
       n += 1;
-      return Promise.resolve(res({ error: "rate limited" }, 429));
-    }) as typeof fetch;
+      return n === 1 ? res({ error: "rate limited" }, 429) : res(resp([market()])); // 429 once, then OK
+    });
+    const rows = await searchVenue(cfg, "kalshi", "Kalshi", "x", 20);
+    expect(n).toBe(2); // one retry cleared the transient 429
+    expect(rows).toHaveLength(1);
+  });
+
+  it("gives up after exhausting the 429 retry budget (a PERSISTENT header-less 429 finally throws)", async () => {
+    let n = 0;
+    stub(() => {
+      n += 1;
+      return res({ error: "rate limited" }, 429);
+    });
+    await expect(searchVenue(cfg, "kalshi", "Kalshi", "x", 20)).rejects.toBeInstanceOf(PmxtError);
+    expect(n).toBe(3); // 1 initial attempt + MAX_RATE_RETRIES (2)
+  });
+
+  it("does NOT retry a definitive non-429 HTTP error (e.g. 500) — it is a real answer, not transient", async () => {
+    let n = 0;
+    stub(() => {
+      n += 1;
+      return res({ error: "boom" }, 500);
+    });
     await expect(searchVenue(cfg, "kalshi", "Kalshi", "x", 20)).rejects.toBeInstanceOf(PmxtError);
     expect(n).toBe(1); // no retry
   });
@@ -231,17 +255,20 @@ describe("client-side rate guard (the 429-storm fix)", () => {
     expect(n).toBe(2); // pause lifted → it hit the wire again
   });
 
-  it("does NOT pause on a 429 without Retry-After (a transient blip recovers on the very next call)", async () => {
+  it("does NOT pause on a 429 without Retry-After (transient blip → retried, and later calls still flow)", async () => {
     __setHttpClock(() => 0);
     let n = 0;
     stub(() => {
       n += 1;
-      return n === 1 ? res({ error: "rate limited" }, 429) : res(resp([market()])); // 429 once, then OK
+      return n === 1 ? res({ error: "rate limited" }, 429) : res(resp([market()])); // 429 once, then OK forever
     });
-    await expect(searchVenue(cfg, "kalshi", "Kalshi", "a", 20)).rejects.toBeInstanceOf(PmxtError); // transient 429
-    const rows = await searchVenue(cfg, "kalshi", "Kalshi", "b", 20); // NOT paused → hits the wire, succeeds
+    const rows = await searchVenue(cfg, "kalshi", "Kalshi", "a", 20); // header-less 429 → retried in place, succeeds
     expect(n).toBe(2);
-    expect(rows).toHaveLength(1); // the useful follow-up query is no longer blacked out
+    expect(rows).toHaveLength(1);
+    // No pause was armed, so a later distinct query still reaches the wire (not short-circuited to a local cap).
+    const more = await searchVenue(cfg, "kalshi", "Kalshi", "b", 20);
+    expect(more).toHaveLength(1);
+    expect(n).toBe(3);
   });
 
   it("a 429 on one venue does not pre-empt a sibling call already in flight (fail-soft per slice)", async () => {
@@ -253,8 +280,8 @@ describe("client-side rate guard (the 429-storm fix)", () => {
     );
     const out = await searchExternal(cfg, "bitcoin", 20);
     expect(out.errored).toBe(true);
-    expect(out.kalshi).toEqual([]); // 429 → degraded to empty
-    expect(out.polymarket).toHaveLength(1); // sibling reserved its slot before the 429 opened the pause
+    expect(out.kalshi).toEqual([]); // persistent header-less 429 → retries exhausted → degraded to empty
+    expect(out.polymarket).toHaveLength(1); // a header-less 429 never pauses siblings; this slice still succeeds
   });
 });
 

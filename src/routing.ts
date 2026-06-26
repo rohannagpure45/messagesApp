@@ -41,6 +41,39 @@ export function mentionsBot(body: string, botName: string): boolean {
 }
 
 /**
+ * The identity that OWNS a conversation thread (and any pending clarify) in a space.
+ *
+ * A DM is 1:1, so the counterparty is implicit — we bind to the SPACE, NOT the sender handle. This is
+ * the fix for the live "follow-ups not tracked / '2' ignored" bug: in LOCAL mode the same DM sender's
+ * handle FLAPS between their number and "unknown" (chat.db's `LEFT JOIN handle` doesn't resolve every
+ * inbound row), so a per-handle key sent the clarify ANSWER to a different bucket than the QUESTION.
+ * Binding a DM to the space is handle-independent, so the answer always lands on the same thread.
+ *
+ * A GROUP keeps per-handle ownership so each member has their own thread and a bystander can't answer
+ * someone else's clarify; an unresolved group handle stays "unknown" (those are never relaxed — see
+ * `canRelaxSender` — so they can't ride another member's session).
+ */
+export function threadOwner(spaceId: string, senderId: string, isGroup: boolean): string {
+  if (!isGroup) return `dm:${spaceId}`;
+  return senderId && senderId !== "unknown" ? senderId : "unknown";
+}
+
+/** Conversation-memory key: per (space, thread-owner). DMs collapse to one bucket per space (see above). */
+export function sessionKey(spaceId: string, senderId: string, isGroup: boolean): string {
+  return `${spaceId} ${threadOwner(spaceId, senderId, isGroup)}`;
+}
+
+/**
+ * May an UNHAILED sender be relaxed into an active thread (hail-free follow-ups)? Always yes for a DM —
+ * the one counterparty is unambiguous even when their handle didn't resolve. In a GROUP an unknown
+ * handle is NEVER relaxed (it shares the per-space "unknown" bucket, so a bystander could otherwise
+ * ride another member's session); known group members relax normally.
+ */
+export function canRelaxSender(senderId: string, isGroup: boolean): boolean {
+  return isGroup ? senderId !== "unknown" : true;
+}
+
+/**
  * Canonicalize a sender handle so the same human is keyed consistently regardless of how the
  * platform spells them. iMessage delivers a user as either a phone number (in any of several
  * formats) or an email-style Apple ID, and a project's Photon allowlist may hold one form while

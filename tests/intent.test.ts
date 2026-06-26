@@ -103,6 +103,18 @@ describe("classify (regex-first gate)", () => {
     // A legitimate "market" content word (no on/for/about/of right after it) is preserved untouched.
     expect(classify("sawa market cap of bitcoin", BOT)).toMatchObject({ kind: "search", query: "market cap of bitcoin" });
   });
+
+  it("strips a trailing venue word that leaked into the subject (the 'spaceX stock price kalshi' bug)", () => {
+    // A venue name is never a legit search subject; peel it so we don't search "… kalshi" (→ 0 matches).
+    expect(classify("sawa find a market on spaceX stock price kalshi", BOT)).toMatchObject({
+      kind: "search",
+      query: "spaceX stock price",
+    });
+    expect(classify("sawa bitcoin on polymarket", BOT)).toMatchObject({ kind: "search", query: "bitcoin" });
+    expect(classify("sawa world cup poly", BOT)).toMatchObject({ kind: "search", query: "world cup" });
+    // Only a TRAILING whole-word venue is peeled — "Poland" / a mid-phrase mention stay intact.
+    expect(classify("sawa Poland", BOT)).toMatchObject({ kind: "search", query: "Poland" });
+  });
 });
 
 describe("parseIntent", () => {

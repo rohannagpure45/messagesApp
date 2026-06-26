@@ -107,6 +107,14 @@ const SEARCH_TRIGGERS: { re: RegExp; strip: RegExp }[] = [
 const LEADING_ROLE_PHRASE_RE =
   /^\s*(?:markets?|predictions?|bets?|wagers?|polls?|lines?|odds)\s+(?:on|for|about|of)\s+(?:(?:the|a|an)\s+)?/i;
 
+/**
+ * A trailing venue word ("… kalshi" / "… on polymarket" / "… poly") that leaked into the search SUBJECT
+ * — e.g. the follow-up LLM echoing the current venue ("spaceX stock price kalshi"). A venue name is never
+ * a legitimate search subject, so peel it off the END before searching. Only matches a trailing token, so
+ * "Poland" / "polygon" (not whole-word "poly") and a mid-phrase mention are untouched.
+ */
+const TRAILING_VENUE_RE = /(?:\s+(?:on\s+)?(?:kalshi|polymarket|poly|sawa))+\s*$/i;
+
 /** Trim trailing filler/punctuation and a leading article/role-phrase from an extracted subject. */
 function cleanQuery(s: string): string {
   return s
@@ -115,6 +123,7 @@ function cleanQuery(s: string): string {
     .replace(/\b(please|pls|plz|thanks?|thx)\b/gi, "")
     .replace(/^\s*(the|a|an)\s+/i, "") // leading article: "the FIFA World Cup" → "FIFA World Cup"
     .replace(LEADING_ROLE_PHRASE_RE, "") // residual role phrase: "market on bitcoin" → "bitcoin"
+    .replace(TRAILING_VENUE_RE, "") // residual venue word: "spaceX stock price kalshi" → "spaceX stock price"
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, MAX_QUERY_LEN);

@@ -165,7 +165,7 @@ export function emptyReply(query: string, externalErrored = false): string {
   if (externalErrored) {
     return (
       `Sawa has nothing on ${q}, and I couldn't reach Kalshi or Polymarket just now ` +
-      `(usually a brief rate-limit). Try again in a few seconds.`
+      `(a brief hiccup on their end). Try again in a few seconds.`
     );
   }
   return (

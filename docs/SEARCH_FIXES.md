@@ -1,11 +1,14 @@
 # Conversational Search — reliability + matching fixes (implementation spec)
 
-**Status:** ALL EIGHT IMPLEMENTED. Issues **1–4** shipped 24-Jun; Issue **5 shipped 25-Jun, generalized into a
+**Status:** ALL TEN IMPLEMENTED. Issues **1–4** shipped 24-Jun; Issue **5 shipped 25-Jun, generalized into a
 natural-language AGENT SETTINGS framework** (not just quips). Issues **6–8 shipped 26-Jun** from later live
 tests — a pmxt **429 storm** (client-side rate guard), a Gemini **follow-up off-schema `{error}`
 hallucination** (prompt hardening), and **accented-name empties + an over-aggressive 429 pause** (Unicode
-decomposition + a gentler circuit breaker). Typecheck clean; `npm test` 203 green. Each item has **symptom →
-evidence → root cause → fix → acceptance**.
+decomposition + a gentler circuit breaker). Issues **9–10 shipped 26-Jun** from a live DM/clarify test that
+exposed the **previous round's 429 fix as the actual culprit** — pmxt's free tier emits **transient
+header-less 429s** that the code wrongly treated as definitive (now retried), and **LOCAL-mode DM follow-ups
+were silently dropped** because the sender handle flaps `+1…` ↔ `unknown` (DM threads now bind to the space).
+Typecheck clean; `npm test` 211 green. Each item has **symptom → evidence → root cause → fix → acceptance**.
 
 **What shipped (1–4):** `max_tokens 80→256` + defensive JSON extraction (fences/prose/first-`{`-to-last-`}`)
 in `classifyWithLlm`; `look for`/`search for`/`find me`/`look up for` added to the regex `SEARCH_TRIGGERS`;
@@ -338,6 +341,82 @@ explicit `Retry-After` still pauses (Issue 6 test retained). 203 green.
 
 ---
 
+## Issue 9 — pmxt's transient header-less 429s are treated as definitive → false "couldn't reach" empties ✅ DONE
+
+**Symptom.** A live DM/group test (after 6–8 shipped) still showed `[pmxt] … failed (HTTP 429)` and the reply
+*"I couldn't reach Kalshi or Polymarket just now (usually a brief rate-limit)"* — but **the owner's pmxt
+dashboard showed only 1–2 calls/min, never above 5.** A real 60/min limit was impossible; the 429s were
+something else, and the prior round's rate-guard work had wrongly assumed they were budget exhaustion. (This is
+the "you created problems instead of solutions" report.)
+
+**Evidence.** A direct probe (paced ~3 calls, and an 8-way burst):
+```
+[kalshi] q="spaceX"  -> 429 in 57ms   count=-1      ← 429 in 57ms, at ~3 calls total
+[kalshi] q="SpaceX"  -> 200 in 1467ms count=20      ← the very next call: fine
+burst(8): 2 × "429 in ~137ms", 6 × "200"            ← NO Retry-After header on any 429
+```
+So pmxt's free-tier 429 is a **fast (~60 ms), transient burst/edge rejection that clears on the next call** and
+carries **no `Retry-After`** — it is nothing to do with the 60/min budget. The code's core assumption — *"an
+HTTP 429 is a definitive answer, never retry"* — was **exactly backwards for this provider.**
+
+**Root cause.** `getJson` ([`src/pmxt/http.ts`](../src/pmxt/http.ts)) retried only `AbortError`/network errors
+and threw **every** `PmxtError` immediately. So each transient 429 → fail-soft empty for that venue/sub-query →
+`errored=true` → the false "rate-limit" empty-state (`cards.emptyReply`). At the owner's trivial call rate, the
+*only* thing producing 429s was this transient edge — and we never retried it.
+
+**Fix** (`src/pmxt/http.ts` + `src/pmxt/discover.ts`):
+- **Retry a header-less 429.** `PmxtError` gains a `retryable` flag; a `429` **without** `Retry-After` is
+  marked retryable and `getJson` retries it up to `MAX_RATE_RETRIES = 2` with a short backoff
+  (`rate429BackoffMs`, 200 ms × attempt). A `429` **with** `Retry-After` stays non-retryable and arms the
+  circuit breaker (unchanged). Any **non-429** 4xx/5xx is still definitive (never retried). The single
+  `reserveSlot()` is reused across retries, so retrying does **not** consume extra sliding-window budget.
+- **Lower the burst.** `PMXT_CONCURRENCY` 4→3 (the burst probe showed concurrency, not volume, is what trips
+  the edge limiter). The sliding-window cap + `Retry-After` breaker from Issue 6 are retained as backstops.
+- Wording: the rare *genuine* failure empty-state now reads "a brief hiccup on their end" instead of asserting
+  a rate-limit (`cards.emptyReply`).
+
+**Acceptance.** `tests/pmxt.test.ts`: a header-less 429 then OK → `searchVenue` retries and returns rows
+(`n===2`); a *persistent* header-less 429 throws after exhausting the budget (`n===3`); a non-429 (500) is not
+retried (`n===1`); the `Retry-After` pause test is retained. Verified live via the real `searchExternal`:
+`"spaceX"`→34 rows, `"Haaland goals"`→25, `"Mbappé goals"`→13, `"spaceX stock price"`/`"SPCX"`→genuine empty —
+**all `errored=false`** (the transient 429s are now retried away).
+
+---
+
+## Issue 10 — LOCAL-mode DM follow-ups / clarify answers silently dropped (sender handle flapping) ✅ DONE
+
+**Symptom.** In a live DM the bot asked *"Which 'spaceX' market did you mean? 1… 2… 3… 4…"*, the owner replied
+`"2"`, and it was **ignored**: `[sawa] ⊘ ignored [iMessage/dm] from=unknown — not addressed`. More broadly,
+follow-ups in an active DM thread intermittently weren't tracked.
+
+**Evidence.** The headless log shows the **same DM sender** arriving as `from=+16302101333` on some inbounds and
+`from=unknown` on others (e.g. the `"2"`). In LOCAL mode the bot reads the Mac's `chat.db`, whose `LEFT JOIN
+handle` does not resolve every inbound row, so `message.sender.id` is sometimes empty → normalized to
+`"unknown"`. (A latent bug also surfaced during the fix: the old per-sender DM key held a literal **NUL byte**
+separator, `` `${spaceId}\0${senderId}` ``.)
+
+**Root cause.** Conversation memory was keyed **per (space, sender)** and the pending-clarify binding
+(`pendingBy`) + the relaxation gate were all keyed on the *handle*. The clarify QUESTION was stored under the
+sender's number; the `"2"` ANSWER arrived as `"unknown"` → a *different* session bucket, a `pendingBy`
+mismatch, **and** the "unknown-handle senders are never relaxed" rule (correct for groups) refused to relax it
+— so the answer was dropped three ways over. The per-sender key was introduced for *group* threads; a DM is 1:1
+and never needed it.
+
+**Fix** (`src/routing.ts` + `src/index.ts`): a DM's thread is bound to the **space**, not the flapping handle.
+- New pure helpers in `routing.ts`: `threadOwner(spaceId, senderId, isGroup)` → `dm:${spaceId}` for a DM (so a
+  pending clarify survives the handle flapping), the normalized handle for a group; `sessionKey(...)` wraps it;
+  `canRelaxSender(senderId, isGroup)` → always `true` for a DM, `senderId !== "unknown"` for a group.
+- `index.ts` threads `isGroup` through `runConversationalSearch` / `handleNatural` / `handleSlash` /
+  `handlePollVote`; `pendingBy` is stored/checked as the `threadOwner` (DM → the space) so a DM answer resolves
+  regardless of whether *that* inbound's handle resolved; `relaxed` uses `canRelaxSender`. Group behavior
+  (per-member threads, unknown-never-relaxed, bystander can't answer another's clarify) is **unchanged**.
+
+**Acceptance.** `tests/routing.test.ts`: `threadOwner`/`sessionKey` collapse a DM's `+1…` and `"unknown"` to the
+**same** key; group keys stay per-sender and never collide with the DM key; `canRelaxSender` relaxes any DM
+(incl. unknown handle) but only known group members. 211 green.
+
+---
+
 ## Consolidated acceptance (for the `/goal`)
 
 - [x] **1** `max_tokens: 256` + defensive JSON extraction; truncated/fenced/prose bodies no longer break intent.
@@ -359,7 +438,14 @@ explicit `Retry-After` still pauses (Issue 6 test retained). 203 green.
       decompose to the entity that has a market (pmxt `q` is a substring title match, so the full phrase misses);
       the circuit breaker pauses only on an explicit `Retry-After` (no 15 s default blackout), so a transient 429
       no longer kills the useful stage-2 entity query.
-- [x] `npm run typecheck` clean; `npm test` green (203) with new unit tests for items 1–8.
+- [x] **9** **Transient header-less 429s retried** — verified live: pmxt's free tier emits fast (~60 ms) burst
+      429s with no `Retry-After` that clear on the next call; `getJson` now retries them (≤2, `retryable` flag),
+      keeps `Retry-After` 429s + non-429 errors definitive, and lowers `PMXT_CONCURRENCY` 4→3. Kills the false
+      "couldn't reach (rate-limit)" empties at the owner's 1–2 calls/min.
+- [x] **10** **LOCAL-mode DM follow-ups fixed** — DM threads bind to the space (`threadOwner`/`sessionKey`/
+      `canRelaxSender` in `routing.ts`), immune to chat.db handle flapping; the `"2"` clarify answer and hail-free
+      follow-ups now resolve in a DM even when the inbound's handle didn't resolve. Group behavior unchanged.
+- [x] `npm run typecheck` clean; `npm test` green (211) with new unit tests for items 1–10.
 - [ ] **Live group re-test** (pending hardware): World Cup (Sawa lead), `look for Czechia` (Kalshi),
       `look for player props on Raul Jimenez` (Kalshi goals market), `quips off`/`sawa only`/`settings`
       toggles, link follow-up.

@@ -259,11 +259,12 @@ export function expandQueries(query: string): string[] {
 }
 
 /**
- * Cap on concurrent pmxt requests. The free tier is 60 req/min and rejects bursts with `429`; firing a
- * whole fan-out at once (an entity-decomposed query is up to MAX_SUBQUERIES × 2 venues) is exactly what
- * tripped it in the live test. A small cap smooths the burst — excess calls queue behind it.
+ * Cap on concurrent pmxt requests. Beyond the 60/min budget, pmxt's free tier also rejects CONCURRENT
+ * bursts with a fast transient `429` (verified live: firing 8 at once → ~2 instant header-less 429s,
+ * the rest 200). A small cap smooths the burst; the header-less 429s that still slip through are now
+ * retried in http.ts (they clear on the next call). 3 trades a hair of stage-2 latency for fewer 429s.
  */
-const PMXT_CONCURRENCY = 4;
+const PMXT_CONCURRENCY = 3;
 
 /** Run thunks with a concurrency cap, returning settled results IN ORDER (never throws). */
 async function runLimited<T>(thunks: (() => Promise<T>)[], limit: number): Promise<PromiseSettledResult<T>[]> {

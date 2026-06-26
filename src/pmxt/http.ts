@@ -11,6 +11,13 @@ export class PmxtError extends Error {
   constructor(
     public status: number,
     message: string,
+    /**
+     * Whether this HTTP error is worth retrying. Default false (a 4xx/5xx is normally a definitive
+     * answer). Set TRUE only for a header-LESS `429` — verified live, pmxt's free tier emits fast
+     * (~60ms) transient burst/edge `429`s that clear on the very next call and carry NO `Retry-After`;
+     * those are retryable. A `429` WITH `Retry-After` (a real cooldown) stays non-retryable.
+     */
+    public retryable = false,
   ) {
     super(message);
     this.name = "PmxtError";
@@ -33,11 +40,23 @@ export class PmxtRateLimitError extends Error {
   }
 }
 
-/** Backoff before the single transient retry. Injectable so tests don't actually sleep. */
+/** Backoff before the single transient (timeout / network) retry. Injectable so tests don't sleep. */
 let retryBackoffMs = 250;
 /** Test seam: shrink (or zero) the retry backoff so retry tests run instantly. */
 export function __setRetryBackoffMs(ms: number): void {
   retryBackoffMs = ms;
+}
+/**
+ * Base backoff before a transient-429 retry (grows linearly per attempt: 200, 400). Short on purpose —
+ * pmxt's transient 429s clear almost immediately, so a brief wait reclaims the call without adding real
+ * latency. Injectable so tests don't sleep.
+ */
+let rate429BackoffMs = 200;
+/** Max transient-429 retries (header-less 429 only). Two is plenty — live, the next call already clears. */
+const MAX_RATE_RETRIES = 2;
+/** Test seam: shrink (or zero) the 429 retry backoff so rate-retry tests run instantly. */
+export function __setRate429BackoffMs(ms: number): void {
+  rate429BackoffMs = ms;
 }
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -121,10 +140,12 @@ function noteServer429(retryAfterHeader: string | null | undefined): void {
  * 6s after live bursts tripped the old ceiling on responses that normally land <1s) so a slow
  * enrichment call can never hang a reply.
  *
- * Transient failures — a timeout `AbortError` or a network `TypeError` — get ONE retry after a
- * short backoff, since pmxt under burst occasionally responds slowly. An HTTP error (`PmxtError`,
- * any 4xx/5xx) is a definitive answer (no result / auth / rate-limit) and is NEVER retried. The
- * whole path stays fail-soft: a still-failing venue throws to its caller, which degrades to empty.
+ * Two RETRYABLE failure classes, each with its own small budget, both fail-soft:
+ *   - a timeout `AbortError` / network `TypeError` → ONE retry (`retries`) after a short backoff;
+ *   - a header-LESS `429` → up to `MAX_RATE_RETRIES` retries (verified live: pmxt's free tier emits
+ *     fast transient burst `429`s that clear on the next call). A `429` WITH `Retry-After` is a real
+ *     cooldown — non-retryable, and it arms the circuit breaker. Any OTHER HTTP status (4xx/5xx) is a
+ *     definitive answer and is never retried. A still-failing venue throws to its caller → empty.
  */
 export async function getJson<T>(
   url: string | URL,
@@ -133,10 +154,11 @@ export async function getJson<T>(
   retries = 1,
 ): Promise<T> {
   // Client-side rate guard: throws PmxtRateLimitError (fail-soft, no network) when over the local cap
-  // or inside a post-429 pause. Reserved ONCE — a transient retry below reuses this slot.
+  // or inside a post-429 pause. Reserved ONCE — the transient retries below reuse this slot.
   reserveSlot();
-  let lastErr: unknown;
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  let netAttempts = 0; // timeout / network retries used
+  let rateAttempts = 0; // transient-429 retries used
+  for (;;) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -146,18 +168,31 @@ export async function getJson<T>(
         signal: controller.signal,
       });
       if (!res.ok) {
-        // A 429 means the whole key is throttled — open the circuit so we stop hammering until the
-        // server's Retry-After elapses (the antidote to the "429-everything-for-a-minute" storm).
-        if (res.status === 429) noteServer429(res.headers?.get?.("retry-after"));
+        if (res.status === 429) {
+          const ra = res.headers?.get?.("retry-after");
+          // A Retry-After means a real cooldown → arm the breaker (pause everything) and DON'T retry.
+          // A header-less 429 is a transient burst rejection → retryable (no pause; clears next call).
+          noteServer429(ra);
+          const hasCooldown = ra != null && Number.isFinite(Number(ra)) && Number(ra) > 0;
+          throw new PmxtError(429, `GET ${redact(url)} → 429 ${res.statusText}`, !hasCooldown);
+        }
         throw new PmxtError(res.status, `GET ${redact(url)} → ${res.status} ${res.statusText}`);
       }
       return (await res.json()) as T;
     } catch (err) {
-      lastErr = err;
-      // A real HTTP status is definitive — surface it immediately, never retry.
-      if (err instanceof PmxtError) throw err;
-      // Transient (timeout abort / network error): one more try after a short backoff.
-      if (attempt < retries) {
+      if (err instanceof PmxtError) {
+        // Transient (header-less) 429 → a few quick retries; the burst window passes almost at once.
+        if (err.status === 429 && err.retryable && rateAttempts < MAX_RATE_RETRIES) {
+          rateAttempts++;
+          clearTimeout(timer);
+          await sleep(rate429BackoffMs * rateAttempts);
+          continue;
+        }
+        throw err; // definitive (non-429, a Retry-After cooldown, or 429 retries exhausted)
+      }
+      // Transient timeout abort / network error: one more try after a short backoff.
+      if (netAttempts < retries) {
+        netAttempts++;
         clearTimeout(timer);
         await sleep(retryBackoffMs);
         continue;
@@ -167,7 +202,6 @@ export async function getJson<T>(
       clearTimeout(timer);
     }
   }
-  throw lastErr; // unreachable (loop returns or throws), but satisfies the type checker
 }
 
 /** Never let a key ride in an error string, even if a future caller puts it in the query. */
