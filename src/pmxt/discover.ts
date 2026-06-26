@@ -259,12 +259,16 @@ export function expandQueries(query: string): string[] {
 }
 
 /**
- * Cap on concurrent pmxt requests. Beyond the 60/min budget, pmxt's free tier also rejects CONCURRENT
- * bursts with a fast transient `429` (verified live: firing 8 at once → ~2 instant header-less 429s,
- * the rest 200). A small cap smooths the burst; the header-less 429s that still slip through are now
- * retried in http.ts (they clear on the next call). 3 trades a hair of stage-2 latency for fewer 429s.
+ * Cap on concurrent pmxt requests — **1 (fully serial)**. This is the decisive reliability fix, from a
+ * head-to-head probe: fired SEQUENTIALLY, every pmxt call returns 200 in 130–450 ms with zero errors;
+ * fired CONCURRENTLY (10 at once), ~20% of calls either fast-429 or HANG the full timeout (12 s) while
+ * the rest succeed. pmxt's free tier simply can't take concurrency. The bot already processes inbound
+ * messages one at a time (the `for await` loop awaits each handler), so serializing a single search's
+ * own fan-out makes ALL pmxt traffic serial → fast + reliable. Cost: stage 1 is 2 sequential calls
+ * (~1 s instead of ~0.5 s) and a rare stage-2 decomposition is a few serial calls (~a couple seconds) —
+ * an imperceptible latency trade for eliminating the hangs/429s. The http.ts retries remain a backstop.
  */
-const PMXT_CONCURRENCY = 3;
+const PMXT_CONCURRENCY = 1;
 
 /** Run thunks with a concurrency cap, returning settled results IN ORDER (never throws). */
 async function runLimited<T>(thunks: (() => Promise<T>)[], limit: number): Promise<PromiseSettledResult<T>[]> {

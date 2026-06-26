@@ -136,9 +136,11 @@ function noteServer429(retryAfterHeader: string | null | undefined): void {
 
 /**
  * GET `url` with the pmxt bearer key and parse JSON. The key is sent as `Authorization: Bearer`
- * (pmxt's canonical scheme). Each attempt times out via AbortController (default 9s — raised from
- * 6s after live bursts tripped the old ceiling on responses that normally land <1s) so a slow
- * enrichment call can never hang a reply.
+ * (pmxt's canonical scheme). Each attempt times out via AbortController (default 6s). Now that pmxt
+ * requests are fully SERIALIZED (PMXT_CONCURRENCY=1, discover.ts), a healthy response lands in
+ * 130–450 ms, so 6s is generous headroom; the only thing it guards is pmxt occasionally HANGING a
+ * connection (seen only under concurrency, now avoided) — a hung attempt aborts at 6s and retries once
+ * rather than stalling the reply for the old 9s. A slow enrichment call can never hang a reply.
  *
  * Two RETRYABLE failure classes, each with its own small budget, both fail-soft:
  *   - a timeout `AbortError` / network `TypeError` → ONE retry (`retries`) after a short backoff;
@@ -150,7 +152,7 @@ function noteServer429(retryAfterHeader: string | null | undefined): void {
 export async function getJson<T>(
   url: string | URL,
   apiKey: string,
-  timeoutMs = 9_000,
+  timeoutMs = 6_000,
   retries = 1,
 ): Promise<T> {
   // Client-side rate guard: throws PmxtRateLimitError (fail-soft, no network) when over the local cap

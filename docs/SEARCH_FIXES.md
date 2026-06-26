@@ -8,7 +8,7 @@ decomposition + a gentler circuit breaker). Issues **9–10 shipped 26-Jun** fro
 exposed the **previous round's 429 fix as the actual culprit** — pmxt's free tier emits **transient
 header-less 429s** that the code wrongly treated as definitive (now retried), and **LOCAL-mode DM follow-ups
 were silently dropped** because the sender handle flaps `+1…` ↔ `unknown` (DM threads now bind to the space).
-Typecheck clean; `npm test` 211 green. Each item has **symptom → evidence → root cause → fix → acceptance**.
+Typecheck clean; `npm test` 213 green. Each item has **symptom → evidence → root cause → fix → acceptance**.
 
 **What shipped (1–4):** `max_tokens 80→256` + defensive JSON extraction (fences/prose/first-`{`-to-last-`}`)
 in `classifyWithLlm`; `look for`/`search for`/`find me`/`look up for` added to the regex `SEARCH_TRIGGERS`;
@@ -381,6 +381,22 @@ retried (`n===1`); the `Retry-After` pause test is retained. Verified live via t
 `"spaceX"`→34 rows, `"Haaland goals"`→25, `"Mbappé goals"`→13, `"spaceX stock price"`/`"SPCX"`→genuine empty —
 **all `errored=false`** (the transient 429s are now retried away).
 
+**⚠️ Follow-on (the retry alone was NOT enough — concurrency is the real culprit).** A second live test still
+showed `failed (timeout)` and `failed (HTTP 429)`, and `"Sawa Messi goals"` came back "couldn't reach" on the
+**first** try but found the market on the **second**. A head-to-head probe nailed it:
+```
+SEQUENTIAL (one at a time):   every call 200 in 130–450 ms, ZERO errors
+CONCURRENT (10 at once):      ~20% of calls fast-429 OR HANG the full 12 s timeout; the rest 200
+```
+pmxt's free tier is fine serially but **chokes on concurrency** — some requests get a fast 429, others a *hung
+connection* (the timeouts), which no retry can rescue. **Decisive fix:** `PMXT_CONCURRENCY` 3→**1** (fully
+serial). The message loop already processes inbound messages one at a time, so serializing a single search's own
+fan-out makes ALL pmxt traffic serial → fast + reliable. Stage 1 is now 2 sequential calls (~1 s); a rare
+stage-2 decomposition is a few serial calls. Timeout also lowered 9s→**6s** (serial responses land <500 ms, so a
+genuine hang fails fast and retries instead of stalling 9s). Re-verified live: 3 rapid back-to-back rounds of
+`Messi goals`/`spcx`/`spaceX stock`/`Haaland goals first half`/`world cup` → **`errored=false` on all 15**, every
+existing market found on the first try.
+
 ---
 
 ## Issue 10 — LOCAL-mode DM follow-ups / clarify answers silently dropped (sender handle flapping) ✅ DONE
@@ -413,7 +429,17 @@ and never needed it.
 
 **Acceptance.** `tests/routing.test.ts`: `threadOwner`/`sessionKey` collapse a DM's `+1…` and `"unknown"` to the
 **same** key; group keys stay per-sender and never collide with the DM key; `canRelaxSender` relaxes any DM
-(incl. unknown handle) but only known group members. 211 green.
+(incl. unknown handle) but only known group members.
+
+**Cloud / business-line compatibility (asked explicitly).** The helpers carry **no local-vs-cloud branch** —
+they take only `isGroup` + `space.id` + the normalized handle, all of which Spectrum delivers identically on
+every provider (local, cloud shared pool, dedicated/business line). On a cloud/business line handles resolve
+reliably (the chat.db flapping that motivated the fix doesn't occur), so: a cloud DM still binds to its stable
+space and its clarify owner matches; a cloud/business GROUP gives each *resolved* member their own thread
+(exactly what a business line is for) and only the asker can answer their own clarify (text or poll button).
+Nothing here is gated on `SAWA_IMESSAGE_LOCAL`; the only local-mode branches in `index.ts` are orthogonal
+(plaintext vs markdown, `richlink`/`poll` capability, and the local-only "hail everywhere" privacy rule). Locked
+by `tests/routing.test.ts` › "cloud / business-line compatibility". 213 green.
 
 ---
 
@@ -438,14 +464,15 @@ and never needed it.
       decompose to the entity that has a market (pmxt `q` is a substring title match, so the full phrase misses);
       the circuit breaker pauses only on an explicit `Retry-After` (no 15 s default blackout), so a transient 429
       no longer kills the useful stage-2 entity query.
-- [x] **9** **Transient header-less 429s retried** — verified live: pmxt's free tier emits fast (~60 ms) burst
-      429s with no `Retry-After` that clear on the next call; `getJson` now retries them (≤2, `retryable` flag),
-      keeps `Retry-After` 429s + non-429 errors definitive, and lowers `PMXT_CONCURRENCY` 4→3. Kills the false
-      "couldn't reach (rate-limit)" empties at the owner's 1–2 calls/min.
+- [x] **9** **pmxt reliability — serialize + retry.** Verified live: pmxt's free tier is fast + error-free
+      SERIALLY but ~20% fast-429/HANG under CONCURRENCY. Decisive fix: `PMXT_CONCURRENCY` 3→**1** (the message
+      loop is already serial, so all pmxt traffic becomes serial → fast + reliable); plus `getJson` retries a
+      header-less 429 (≤2, `retryable` flag), keeps `Retry-After`/non-429 definitive, and timeout 9s→6s. Kills
+      the false "couldn't reach" empties + the 12s hangs at the owner's 1–2 calls/min.
 - [x] **10** **LOCAL-mode DM follow-ups fixed** — DM threads bind to the space (`threadOwner`/`sessionKey`/
       `canRelaxSender` in `routing.ts`), immune to chat.db handle flapping; the `"2"` clarify answer and hail-free
       follow-ups now resolve in a DM even when the inbound's handle didn't resolve. Group behavior unchanged.
-- [x] `npm run typecheck` clean; `npm test` green (211) with new unit tests for items 1–10.
+- [x] `npm run typecheck` clean; `npm test` green (213) with new unit tests for items 1–10 (incl. cloud/business-line compatibility).
 - [ ] **Live group re-test** (pending hardware): World Cup (Sawa lead), `look for Czechia` (Kalshi),
       `look for player props on Raul Jimenez` (Kalshi goals market), `quips off`/`sawa only`/`settings`
       toggles, link follow-up.

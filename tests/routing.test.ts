@@ -86,6 +86,30 @@ describe("canRelaxSender", () => {
   });
 });
 
+describe("cloud / business-line compatibility (the helpers key only on isGroup + space + handle)", () => {
+  // These helpers carry NO local-vs-cloud branch — they take exactly what Spectrum gives every provider
+  // (isGroup, space.id, a normalized handle). On a cloud/business line handles resolve reliably (no
+  // chat.db flapping), so the same logic that fixes LOCAL still does the right thing on cloud.
+  const SPACE = "biz-space";
+
+  it("a cloud DM (handle resolves consistently) keeps one stable thread, and its clarify owner matches", () => {
+    // Both the question and the answer carry the same resolved handle on cloud → same thread + owner.
+    expect(sessionKey(SPACE, "+1555", false)).toBe(sessionKey(SPACE, "+1555", false));
+    expect(threadOwner(SPACE, "+1555", false)).toBe(threadOwner(SPACE, "+1555", false));
+    // …and because a DM binds to the space, it would still match even if cloud ever spelled it differently.
+    expect(threadOwner(SPACE, "+1555", false)).toBe(threadOwner(SPACE, "unknown", false));
+  });
+
+  it("a cloud/business GROUP gives each resolved member their own thread (the reason to use a business line)", () => {
+    const alice = sessionKey(SPACE, "+1alice", true);
+    const bob = sessionKey(SPACE, "+1bob", true);
+    expect(alice).not.toBe(bob); // distinct per-member threads
+    expect(canRelaxSender("+1alice", true)).toBe(true); // resolved members relax hail-free
+    // Only the asker owns their pending clarify; a different member can't answer it.
+    expect(threadOwner(SPACE, "+1alice", true)).not.toBe(threadOwner(SPACE, "+1bob", true));
+  });
+});
+
 describe("actionableWhenRelaxed", () => {
   const intent = (over: Partial<Intent>): Intent => ({ kind: "search", via: "regex", ...over });
 

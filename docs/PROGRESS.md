@@ -5,24 +5,26 @@ status lives in [`../AGENTS.md`](../AGENTS.md); the phased plan in [`BUILD_PLAN.
 
 ---
 
-## 2026-06-26 — the 429 fix WAS the bug + LOCAL-DM follow-ups dropped (Issues 9–10)
+## 2026-06-26 — pmxt is concurrency-fragile (serialize) + LOCAL-DM follow-ups dropped (Issues 9–10)
 
-A live DM/clarify test (the owner's "you created problems instead of solutions" report) plus a direct pmxt
-probe exposed two more bugs — and corrected a mis-diagnosis from the 6–8 round. `npm test` **211** (+8);
-typecheck clean. The LOCAL headless bot was restarted on the fix. Full detail in `docs/SEARCH_FIXES.md`
+Two live tests (the owner's "you created problems instead of solutions" + a follow-up "this fix was bad")
+plus direct pmxt probes exposed two bugs and corrected a mis-diagnosis from the 6–8 round. `npm test` **213**
+(+10); typecheck clean. The LOCAL headless bot was restarted on the fix. Full detail in `docs/SEARCH_FIXES.md`
 Issues 9–10.
 
-1. **Transient header-less 429s were treated as definitive → false "couldn't reach (rate-limit)"**
-   (`src/pmxt/http.ts`). The owner's pmxt dashboard showed **1–2 calls/min**, yet replies claimed a rate-limit.
-   A probe was the smoking gun: at ~3 paced calls, `q="spaceX"` → **429 in 57 ms**, and the *very next* call
-   `q="SpaceX"` → 200/20 rows; an 8-way burst → 2 instant 429s + 6×200, **no `Retry-After` on any**. So pmxt's
-   free-tier 429 is a **fast transient burst/edge rejection that clears on the next call**, unrelated to the
-   60/min budget — and the code's "a 429 is definitive, never retry" assumption was exactly backwards. Fix:
-   `getJson` retries a **header-less** 429 (`PmxtError.retryable`, ≤2, short backoff; the single `reserveSlot`
-   is reused so retries don't spend window budget); a `Retry-After` 429 stays non-retryable + arms the breaker;
-   non-429 stays definitive; `PMXT_CONCURRENCY` 4→3. Verified live via the real `searchExternal`: spaceX (34),
-   Haaland goals (25), Mbappé goals (13) all `errored=false`; SPCX / "spaceX stock price" → clean empty
-   (`errored=false`), so the bot correctly offers to create rather than crying rate-limit.
+1. **pmxt free tier can't take concurrency → false "couldn't reach" + 12s hangs** (`src/pmxt/{http,discover}.ts`).
+   The owner's pmxt dashboard showed **1–2 calls/min**, yet replies claimed a rate-limit, and re-tries of the
+   same query (e.g. "Messi goals") failed-then-worked. First probe found fast header-less 429s (retry added).
+   The retry alone was NOT enough — a **head-to-head probe** was the real smoking gun: fired **SEQUENTIALLY**,
+   every call returns 200 in 130–450 ms with **zero errors**; fired **CONCURRENTLY (10 at once)**, ~20% either
+   `429 in ~57 ms` (no `Retry-After`) OR **HANG the full 12 s timeout**, the rest 200. So concurrency — not the
+   60/min budget — is the root of both the 429s and the timeouts, and the "a 429 is definitive, never retry"
+   assumption was backwards. Fix: **`PMXT_CONCURRENCY` 3→1 (fully serial)** — the `for await` message loop is
+   already serial, so serializing a single search's own fan-out makes ALL pmxt traffic serial → fast +
+   reliable; plus `getJson` retries a header-less 429 (≤2, `PmxtError.retryable`; reused `reserveSlot`) and
+   keeps `Retry-After`/non-429 definitive; timeout 9s→6s. Re-verified live: 3 rapid back-to-back rounds of
+   Messi/spcx/spaceX/Haaland/world-cup → `errored=false` on **all 15**, every existing market found first try
+   (SPCX / "spaceX stock price" → clean empty, so the bot offers to create rather than crying rate-limit).
 
 2. **LOCAL-mode DM follow-ups / clarify answers silently dropped** (`src/routing.ts` + `src/index.ts`). The bot
    asked "Which 'spaceX' market? 1…4", the owner replied `"2"`, and it was **ignored** (`⊘ ignored … from=unknown`).
