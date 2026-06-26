@@ -152,6 +152,13 @@ describe("expandQueries (list + proper-noun entity decomposition)", () => {
     expect(expandQueries("Czechia Mexico")).toEqual(["Czechia Mexico", "Czechia", "Mexico"]);
   });
 
+  it("decomposes ACCENTED proper nouns (Mbappé, Jiménez, Müller) — the live empty-result bug", () => {
+    // The old ASCII `[A-Z][\w…]` dropped accented names, so only the full phrase was searched (0 rows).
+    expect(expandQueries("Mbappé goals")).toContain("Mbappé"); // the entity that actually has a market
+    expect(expandQueries("Jiménez first goal")).toContain("Jiménez");
+    expect(expandQueries("Müller Germany")).toEqual(expect.arrayContaining(["Müller", "Germany"]));
+  });
+
   it("leaves a single proper noun and plain lowercase queries unchanged", () => {
     expect(expandQueries("Czechia")).toEqual(["Czechia"]);
     expect(expandQueries("world cup")).toEqual(["world cup"]);
@@ -224,20 +231,17 @@ describe("client-side rate guard (the 429-storm fix)", () => {
     expect(n).toBe(2); // pause lifted → it hit the wire again
   });
 
-  it("falls back to a default pause when a 429 carries no Retry-After header", async () => {
-    let t = 0;
-    __setHttpClock(() => t);
+  it("does NOT pause on a 429 without Retry-After (a transient blip recovers on the very next call)", async () => {
+    __setHttpClock(() => 0);
     let n = 0;
     stub(() => {
       n += 1;
-      return res({ error: "rate limited" }, 429); // no Retry-After header
+      return n === 1 ? res({ error: "rate limited" }, 429) : res(resp([market()])); // 429 once, then OK
     });
-    await expect(searchVenue(cfg, "kalshi", "Kalshi", "a", 20)).rejects.toBeInstanceOf(PmxtError);
-    await expect(searchVenue(cfg, "kalshi", "Kalshi", "b", 20)).rejects.toBeInstanceOf(PmxtRateLimitError);
-    expect(n).toBe(1); // default 15s pause short-circuits b
-    t += 16_000;
-    await expect(searchVenue(cfg, "kalshi", "Kalshi", "c", 20)).rejects.toBeInstanceOf(PmxtError);
-    expect(n).toBe(2); // default pause elapsed → wire again
+    await expect(searchVenue(cfg, "kalshi", "Kalshi", "a", 20)).rejects.toBeInstanceOf(PmxtError); // transient 429
+    const rows = await searchVenue(cfg, "kalshi", "Kalshi", "b", 20); // NOT paused → hits the wire, succeeds
+    expect(n).toBe(2);
+    expect(rows).toHaveLength(1); // the useful follow-up query is no longer blacked out
   });
 
   it("a 429 on one venue does not pre-empt a sibling call already in flight (fail-soft per slice)", async () => {
@@ -264,6 +268,17 @@ describe("searchExternal staged fan-out (bounds the 429 risk)", () => {
     expect(out.errored).toBe(false);
     expect(out.kalshi).toHaveLength(1);
     expect(calls.length).toBe(2); // full query × 2 venues only — the decomposed fan-out never runs
+  });
+
+  it("surfaces an ACCENTED player's market via stage-2 decomposition (the Mbappé bug)", async () => {
+    // Mirror live pmxt: the phrase "Mbappé goals" matches no title; the bare entity "Mbappé" does.
+    stub((url) => {
+      const q = decodeURIComponent(new URL(url).searchParams.get("q") ?? "");
+      return res(resp(q === "Mbappé" && url.includes("sourceExchange=kalshi") ? [market({ title: "Kylian Mbappé: 2+ goals" })] : []));
+    });
+    const out = await searchExternal(cfg, "Mbappé goals", 20);
+    expect(out.kalshi).toHaveLength(1); // reached only because "Mbappé" now decomposes out of the phrase
+    expect(out.kalshi[0]!.title).toBe("Kylian Mbappé: 2+ goals");
   });
 
   it("falls back to entity sub-queries only when the full query is empty", async () => {

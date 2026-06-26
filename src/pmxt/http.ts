@@ -52,13 +52,17 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 //      that would trip the server cooldown; excess calls are dropped to an empty slice, never queued
 //      (a chat reply must not block on a token), and
 //   2. a Retry-After circuit breaker — if a `429` DOES come back (e.g. the key is shared, or our cap is
-//      a hair generous), pause ALL calls until the server's `Retry-After` elapses instead of hammering.
+//      a hair generous) AND the server tells us how long to wait, pause ALL calls until that
+//      `Retry-After` elapses instead of hammering. A header-LESS 429 gets NO pause: it's treated as a
+//      transient blip so the next query (often the useful decomposed entity) recovers immediately — the
+//      cap, not a fixed blackout, is the standing backstop. (An earlier 15s default pause amplified a
+//      one-off transient 429 into a 15s outage that killed in-search entity sub-queries — verified live.)
 // Injectable clock + reset seam keep it deterministic in tests. The bucket starts full, so normal use
 // (~2 calls/search) never waits — only a sustained burst hits the guard.
 const WINDOW_MS = 60_000;
 const MAX_PER_WINDOW = 55;
-/** Fallback pause when a 429 carries no (or an unparseable) Retry-After header. */
-const DEFAULT_PAUSE_MS = 15_000;
+/** Cap on an honored Retry-After so a hostile/huge header can't blackout enrichment for minutes. */
+const MAX_PAUSE_MS = 30_000;
 
 let httpNow: () => number = () => Date.now();
 let windowStart = 0;
@@ -99,11 +103,16 @@ function reserveSlot(): void {
   windowCount += 1;
 }
 
-/** Open the circuit after a server 429: pause every call until Retry-After (or a default) elapses. */
+/**
+ * Open the circuit after a server 429 — but ONLY when it carries an explicit `Retry-After` (the server
+ * telling us how long to wait). A header-less 429 returns without pausing: it's treated as transient so
+ * the next call recovers immediately, with the sliding-window cap as the standing backstop. The honored
+ * delay is capped (`MAX_PAUSE_MS`) so a hostile/huge header can't blackout enrichment.
+ */
 function noteServer429(retryAfterHeader: string | null | undefined): void {
   const secs = retryAfterHeader != null ? Number(retryAfterHeader) : NaN;
-  const ms = Number.isFinite(secs) && secs > 0 ? secs * 1000 : DEFAULT_PAUSE_MS;
-  pausedUntil = Math.max(pausedUntil, httpNow() + ms);
+  if (!Number.isFinite(secs) || secs <= 0) return; // no explicit Retry-After → no blackout
+  pausedUntil = Math.max(pausedUntil, httpNow() + Math.min(secs * 1000, MAX_PAUSE_MS));
 }
 
 /**

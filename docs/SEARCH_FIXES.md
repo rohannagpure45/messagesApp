@@ -1,10 +1,11 @@
 # Conversational Search — reliability + matching fixes (implementation spec)
 
-**Status:** ALL SEVEN IMPLEMENTED. Issues **1–4** shipped 24-Jun; Issue **5 shipped 25-Jun, generalized into a
-natural-language AGENT SETTINGS framework** (not just quips). Issues **6–7 shipped 26-Jun** from a later live
-group test — a pmxt **429 storm** (client-side rate guard) and a Gemini **follow-up off-schema `{error}`
-hallucination** (prompt hardening). Typecheck clean; `npm test` 201 green. Each item has **symptom → evidence →
-root cause → fix → acceptance**.
+**Status:** ALL EIGHT IMPLEMENTED. Issues **1–4** shipped 24-Jun; Issue **5 shipped 25-Jun, generalized into a
+natural-language AGENT SETTINGS framework** (not just quips). Issues **6–8 shipped 26-Jun** from later live
+tests — a pmxt **429 storm** (client-side rate guard), a Gemini **follow-up off-schema `{error}`
+hallucination** (prompt hardening), and **accented-name empties + an over-aggressive 429 pause** (Unicode
+decomposition + a gentler circuit breaker). Typecheck clean; `npm test` 203 green. Each item has **symptom →
+evidence → root cause → fix → acceptance**.
 
 **What shipped (1–4):** `max_tokens 80→256` + defensive JSON extraction (fences/prose/first-`{`-to-last-`}`)
 in `classifyWithLlm`; `look for`/`search for`/`find me`/`look up for` added to the regex `SEARCH_TRIGGERS`;
@@ -299,6 +300,44 @@ hallucination is dropped and the topic is searched, never surfaced.
 
 ---
 
+## Issue 8 — accented names return empty + a transient 429 blacks out the useful query ✅ DONE
+
+**Symptom.** Two reports from a live DM test (after Issues 6–7 shipped): (a) `"Sawa Mbappé goals"` returned
+*"No live markets for 'Mbappé goals' … yet"* **instantly, with no `[pmxt]` log lines** at all; (b)
+`"Sawa haaland goals first half"` logged `HTTP 429` on `"Haaland goals"` then `rate-capped (local)` on
+`"Haaland"` — *"when there was no actual rate limit."*
+
+**Evidence.** A direct pmxt probe (all `200`, so the server is healthy): `q="Mbappé"`→**5 rows**
+(`"…Kylian Mbappé have more goals…"`), `q="Mbappé goals"`→**0**; `q="Haaland"`→**5** (`"Erling Haaland: 1+
+goals"`), `q="Haaland goals"`→**0**. And the regex test: `PROPER_WORD.test("Mbappé")` → **false** (ASCII),
+**true** under a Unicode pattern. pmxt's `q` is a **substring/ILIKE title match**, so a multi-word phrase
+("Mbappé goals", "Haaland goals") matches no title — only the bare entity does.
+
+**Root cause.** **(a)** `PROPER_WORD = /^[A-Z][\w''-]*$/` ([`src/pmxt/discover.ts`](../src/pmxt/discover.ts)) is
+ASCII-only (`\w` excludes `é`/`ü`/…), so an **accented name never decomposes** — `expandQueries("Mbappé goals")`
+emitted only the full phrase, which matched nothing, and the bare `"Mbappé"` (which has markets) was never
+searched → silent empty (no `[pmxt]` log because the phrase calls *succeeded* with 0 rows). **(b)** Issue 6's
+**circuit breaker imposed a 15 s default pause on a header-less 429**; a *transient* 429 on the throwaway
+phrase `"Haaland goals"` (which returns 0 anyway) opened that pause, which then **blocked the stage-2
+`"Haaland"` query** — the one that would have returned 5 markets. The server had no sustained limit; the guard
+over-reacted.
+
+**Fix** (`src/pmxt/discover.ts` + `src/pmxt/http.ts`):
+- **(a) Unicode-aware decomposition.** `PROPER_WORD` → `/^\p{Lu}[\p{L}\p{N}''-]*$/u`, so "Mbappé"/"Jiménez"/
+  "Müller" decompose to the entity that actually has a market. Existing ASCII names are unchanged.
+- **(b) Gentler circuit breaker.** `noteServer429` now pauses **only when the server sends an explicit
+  `Retry-After`** (capped at `MAX_PAUSE_MS = 30 s`); a **header-less 429 gets NO pause** — it's treated as a
+  transient blip so the next call (often the useful decomposed entity) recovers immediately. The sliding-window
+  cap (Issue 6) remains the standing backstop against actually causing a storm, so dropping the fixed blackout
+  doesn't re-open the 429-storm risk.
+
+**Acceptance.** `tests/pmxt.test.ts`: `expandQueries("Mbappé goals")` contains `"Mbappé"` (and `Jiménez`/
+`Müller` variants); `searchExternal("Mbappé goals")` surfaces the `"Kylian Mbappé: 2+ goals"` market via the
+stage-2 entity; a header-less 429 does **not** pause — the very next call hits the wire and succeeds; an
+explicit `Retry-After` still pauses (Issue 6 test retained). 203 green.
+
+---
+
 ## Consolidated acceptance (for the `/goal`)
 
 - [x] **1** `max_tokens: 256` + defensive JSON extraction; truncated/fenced/prose bodies no longer break intent.
@@ -316,7 +355,11 @@ hallucination is dropped and the topic is searched, never surfaced.
 - [x] **7** Gemini **follow-up off-schema `{error}`** — `FOLLOWUP_SYSTEM_PROMPT` now forbids non-schema/`error`
       fields, declares the model has no market data / must never judge existence, and routes an
       unrelated/mismatched message to `kind:search`; the parser `default→null` backstop stays for defense in depth.
-- [x] `npm run typecheck` clean; `npm test` green (201) with new unit tests for items 1–7.
+- [x] **8** **Accented names + transient-429 blackout** — `PROPER_WORD` is Unicode-aware so "Mbappé"/"Jiménez"
+      decompose to the entity that has a market (pmxt `q` is a substring title match, so the full phrase misses);
+      the circuit breaker pauses only on an explicit `Retry-After` (no 15 s default blackout), so a transient 429
+      no longer kills the useful stage-2 entity query.
+- [x] `npm run typecheck` clean; `npm test` green (203) with new unit tests for items 1–8.
 - [ ] **Live group re-test** (pending hardware): World Cup (Sawa lead), `look for Czechia` (Kalshi),
       `look for player props on Raul Jimenez` (Kalshi goals market), `quips off`/`sawa only`/`settings`
       toggles, link follow-up.

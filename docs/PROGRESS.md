@@ -5,6 +5,31 @@ status lives in [`../AGENTS.md`](../AGENTS.md); the phased plan in [`BUILD_PLAN.
 
 ---
 
+## 2026-06-26 — accented-name empties + over-aggressive 429 pause (follow-on to 6–7)
+
+A live DM test right after Issues 6–7 surfaced two more search-path bugs (`docs/SEARCH_FIXES.md` Issue 8).
+`npm test` **203** (+2); typecheck clean.
+
+1. **Accented names returned empty** (`src/pmxt/discover.ts` `PROPER_WORD`). `"Sawa Mbappé goals"` → *"No live
+   markets … yet"* instantly, **no `[pmxt]` logs**. Root cause: `PROPER_WORD = /^[A-Z][\w''-]*$/` is ASCII-only,
+   so `\w` excludes `é` → "Mbappé" failed the proper-noun test → was never decomposed into an entity sub-query.
+   Since pmxt's `q` is a **substring title match**, only the full phrase `"Mbappé goals"` was searched, which
+   matches no title (probe: `q="Mbappé"`→5 rows, `q="Mbappé goals"`→0), so it returned empty *with no error*
+   (hence no log — calls succeeded). Fix: `/^\p{Lu}[\p{L}\p{N}''-]*$/u` (Unicode), so "Mbappé"/"Jiménez"/"Müller"
+   decompose and reach their markets. ASCII names unchanged.
+2. **A transient 429 blacked out the useful query** (`src/pmxt/http.ts` `noteServer429`). `"Haaland goals"` got a
+   real but **transient** `HTTP 429` (residual minute-window from earlier bursts + the restart resetting our
+   counter while the server's window persisted; the server probed `200` seconds later), and Issue 6's circuit
+   breaker then imposed a **15 s default pause** that `rate-capped (local)` the stage-2 `"Haaland"` query — the
+   one that returns 5 markets. Fix: pause **only on an explicit `Retry-After`** (capped 30 s); a header-less 429
+   gets **no** pause, so a transient blip recovers on the very next call. The sliding-window cap (Issue 6) stays
+   the standing backstop, so removing the fixed blackout doesn't re-open the storm risk.
+
+**Diagnosis method (for the record):** the empty had **no `[pmxt]` log** → pmxt *succeeded* empty (logs fire only
+on failure) → a matching miss, not a rate limit; a direct probe confirmed `q="Mbappé"`/`q="Haaland"` return rows
+while the `… goals` phrase returns 0, and the regex test confirmed the ASCII/Unicode split. Bot restarted on the
+fix; live re-test is the owner's step.
+
 ## 2026-06-26 — pmxt 429 client-side rate guard + Gemini follow-up off-schema hardening
 
 A live group test (LOCAL mode) hit two distinct failures back-to-back: (1) **every** pmxt call returned

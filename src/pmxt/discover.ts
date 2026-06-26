@@ -178,8 +178,14 @@ function rescore(rows: VenueResult[], relevanceQuery: string): VenueResult[] {
 /** Cap on distinct sub-queries per venue (full query + entities) — bounds API calls/credits. */
 const MAX_SUBQUERIES = 6;
 
-/** A "Capitalized" or ALL-CAPS word (e.g. "Mexico", "Jimenez", "FIFA", "BTC") — a proper-noun token. */
-const PROPER_WORD = /^[A-Z][\w''-]*$/;
+/**
+ * A "Capitalized" or ALL-CAPS word (e.g. "Mexico", "Jimenez", "FIFA", "BTC") — a proper-noun token.
+ * UNICODE-aware (`\p{Lu}` + `\p{L}`/`\p{N}`, `u` flag): the old `[A-Z][\w…]` was ASCII-only, so an
+ * ACCENTED name ("Mbappé", "Jiménez", "Müller") failed the test → was never decomposed into an entity
+ * sub-query → only the full phrase ("Mbappé goals") was searched, which pmxt can't substring-match, so a
+ * real player's market came back empty. Verified live: `q="Mbappé"`→5 rows, `q="Mbappé goals"`→0.
+ */
+const PROPER_WORD = /^\p{Lu}[\p{L}\p{N}''-]*$/u;
 
 /**
  * Maximal runs of consecutive proper-noun words in `query` (e.g. "Mexico Raul Jimenez player props"
