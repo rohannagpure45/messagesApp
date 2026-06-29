@@ -82,26 +82,43 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const med = (v: number[]) => [...v].sort((a, b) => a - b)[Math.floor(v.length / 2)]!;
 const r0 = (n: number) => Math.round(n);
 
-console.log(`# bench-flow — full iMessage turn, per-step, cold/as-is — ${config.apiBaseUrl}\n`);
-for (const text of QUERIES) {
+/** COLD = clear caches before each run; CACHED = warm once (so the resolve hits the market-id cache). */
+async function measure(text: string, cached: boolean): Promise<Walk[]> {
   const runs: Walk[] = [];
-  for (let i = 0; i < K; i++) {
+  if (cached) {
     __clearCache();
-    __clearFeedCache(); // cold: a true first-time question
+    __clearFeedCache();
+    await turn(text); // warm: parseIntent extracts the query and runSearch caches it
+  }
+  for (let i = 0; i < K; i++) {
+    if (!cached) {
+      __clearCache();
+      __clearFeedCache();
+    }
     runs.push(await turn(text));
     await sleep(800);
   }
-  const f = runs[0]!;
-  console.log(`QUERY: "${text}"   (DM → always handled; medians over ${K} cold runs)`);
-  console.log(`  0. routing / mention-gate     ~0 ms   (regex; DM always-handled, idempotency Set)`);
-  console.log(`  1. parseIntent                ${r0(med(runs.map((r) => r.intentMs)))} ms\t(via: ${f.intentVia}${f.intentVia === "llm" ? " — Gemini fired" : ""})`);
-  console.log(`  2. runSearch (resolve+price)  ${r0(med(runs.map((r) => r.resolveMs)))} ms\t(matched ${f.venues})`);
-  console.log(`  3. clarify decide (+LLM)      ${r0(med(runs.map((r) => r.clarifyMs)))} ms`);
-  console.log(`  4. render reply               ${r0(med(runs.map((r) => r.renderMs)))} ms`);
-  console.log(`  ----------------------------------------------------`);
-  console.log(`  TOTAL to reply-ready          ${r0(med(runs.map((r) => r.totalMs)))} ms`);
-  console.log(`  5. iMessage send (Spectrum)   ~constant (platform network — not measured here)`);
+  return runs;
+}
+
+console.log(`# bench-flow — full iMessage turn, COLD vs CACHED, per-step — ${config.apiBaseUrl}\n`);
+for (const text of QUERIES) {
+  const cold = await measure(text, false);
+  const warm = await measure(text, true);
+  const f = cold[0]!;
+  const m = (rs: Walk[], sel: (w: Walk) => number) => r0(med(rs.map(sel)));
+  console.log(`QUERY: "${text}"   (DM → always handled; medians over ${K} runs each)`);
+  console.log(`  step                          COLD     CACHED`);
+  console.log(`  0. routing / mention-gate     ~0ms     ~0ms     (regex; DM always-handled)`);
+  console.log(`  1. parseIntent                ${m(cold, (r) => r.intentMs)}ms     ${m(warm, (r) => r.intentMs)}ms     (via ${f.intentVia}; LLM — cache-independent)`);
+  console.log(`  2. runSearch (resolve+price)  ${m(cold, (r) => r.resolveMs)}ms     ${m(warm, (r) => r.resolveMs)}ms     <- market-id cache (matched ${f.venues})`);
+  console.log(`  3. clarify decide (+Gemini)   ${m(cold, (r) => r.clarifyMs)}ms     ${m(warm, (r) => r.clarifyMs)}ms`);
+  console.log(`  4. render reply               ${m(cold, (r) => r.renderMs)}ms     ${m(warm, (r) => r.renderMs)}ms`);
+  console.log(`  ---------------------------------------------------`);
+  console.log(`  TOTAL to reply-ready          ${m(cold, (r) => r.totalMs)}ms     ${m(warm, (r) => r.totalMs)}ms`);
+  console.log(`  5. iMessage send (Spectrum)   ~constant platform hop (not measured)`);
+  console.log(`  → cache shaves the RESOLVE step ~${m(cold, (r) => r.resolveMs) - m(warm, (r) => r.resolveMs)}ms; steps 1 & 3 (Gemini) are cache-independent`);
   console.log(`  path: ${f.path}`);
-  console.log(`  reply: ${JSON.stringify(f.body.slice(0, 200))}`);
-  console.log(`  raw totals ms: ${runs.map((r) => r0(r.totalMs))}\n`);
+  console.log(`  reply: ${JSON.stringify(f.body.slice(0, 160))}`);
+  console.log(`  raw totals  cold: ${cold.map((r) => r0(r.totalMs))}   cached: ${warm.map((r) => r0(r.totalMs))}\n`);
 }
