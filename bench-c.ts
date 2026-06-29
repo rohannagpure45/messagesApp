@@ -14,7 +14,7 @@ import fs from "node:fs";
 import { getConfig, getPmxtConfig } from "./src/sawa/config";
 import { runSearch } from "./src/search";
 import { __clearCache, __setCachePersistence, enableCachePersistence, fileCachePersistence } from "./src/pmxt/discover";
-import { __clearFeedCache } from "./src/sawa/read";
+import { __clearFeedCache, __setFeedCachePersistence, enableFeedCachePersistence, fileFeedCachePersistence } from "./src/sawa/read";
 
 const config = getConfig();
 const pmxt = getPmxtConfig();
@@ -69,41 +69,45 @@ for (const { cls, q } of QUERIES) {
   console.log(`[${cls}] "${q}"  COLD p50 ${r0(c)}ms  →  WARM p50 ${r0(w)}ms   (${r0((1 - w / c) * 100)}% faster)`);
 }
 
-console.log("\n## PART 2 — C: durable pmxt cache survives a restart (avoids the cold 429 burst)\n");
-const cacheFile = `${process.cwd()}/.sawa/bench-pmxt-cache.json`;
-fs.rmSync(cacheFile, { force: true });
+console.log("\n## PART 2 — durable caches survive a restart (full warm cold start)\n");
+const pmxtCacheFile = `${process.cwd()}/.sawa/bench-pmxt-cache.json`;
+const feedCacheFile = `${process.cwd()}/.sawa/bench-feed-cache.json`;
+fs.rmSync(pmxtCacheFile, { force: true });
+fs.rmSync(feedCacheFile, { force: true });
 const q0 = QUERIES[0]!.q;
 
-// Warm WITH persistence enabled (writes the pmxt cache to disk).
+// Warm WITH durable persistence enabled (writes both the pmxt and Sawa-feed caches to disk).
 __clearCache();
 __clearFeedCache();
-enableCachePersistence(fileCachePersistence(cacheFile));
+enableCachePersistence(fileCachePersistence(pmxtCacheFile));
+enableFeedCachePersistence(fileFeedCachePersistence(feedCacheFile));
 await timeOnce(q0);
 await sleep(700);
 
-// Simulate a RESTART: drop all in-memory caches, then rehydrate the pmxt cache from disk.
+// Simulate a RESTART: drop ALL in-memory caches, then rehydrate BOTH from disk.
 __clearCache();
 __clearFeedCache();
-enableCachePersistence(fileCachePersistence(cacheFile));
+enableCachePersistence(fileCachePersistence(pmxtCacheFile));
+enableFeedCachePersistence(fileFeedCachePersistence(feedCacheFile));
 pmxtCalls = 0;
 const restartMs = await timeOnce(q0);
 const restartCalls = pmxtCalls;
 await sleep(700);
 
-// Control: a cold restart WITHOUT persistence.
+// Control: a cold restart WITHOUT any persistence.
 __clearCache();
 __clearFeedCache();
 __setCachePersistence(null);
+__setFeedCachePersistence(null);
 pmxtCalls = 0;
 const coldMs = await timeOnce(q0);
 const coldCalls = pmxtCalls;
-fs.rmSync(cacheFile, { force: true });
+fs.rmSync(pmxtCacheFile, { force: true });
+fs.rmSync(feedCacheFile, { force: true });
 
 console.log(`"${q0}"`);
-console.log(`  restart WITH durable pmxt cache : ${r0(restartMs)}ms,  pmxt network calls = ${restartCalls}`);
-console.log(`  cold restart, no persistence    : ${r0(coldMs)}ms,  pmxt network calls = ${coldCalls}`);
-console.log(`  → pmxt calls avoided on restart : ${coldCalls - restartCalls} (no cold-start burst → no 429 risk)`);
-console.log(
-  `\n(Note: e2e is Sawa-bound on a cold start because the Sawa feed cache (A) is in-process, not disk-`,
-);
-console.log(` persisted; C's win is avoiding the pmxt cold burst + serve-stale-on-error, covered by unit tests.)`);
+console.log(`  restart WITH durable caches (pmxt + feed) : ${r0(restartMs)}ms,  pmxt network calls = ${restartCalls}`);
+console.log(`  cold restart, no persistence              : ${r0(coldMs)}ms,  pmxt network calls = ${coldCalls}`);
+console.log(`  → after restart: ${r0((1 - restartMs / coldMs) * 100)}% faster, ${coldCalls - restartCalls} pmxt calls avoided`);
+console.log(`\n(Both caches rehydrate from disk, so the first query after a restart is served entirely from`);
+console.log(` disk — no Sawa or pmxt network — vs a cold start that re-fetches both.)`);

@@ -27,7 +27,7 @@ import {
   type PmxtConfig,
   type IntentConfig,
 } from "./sawa/config";
-import { listMarkets, getMarket } from "./sawa/read";
+import { listMarkets, getMarket, enableFeedCachePersistence, fileFeedCachePersistence } from "./sawa/read";
 import { formatList, formatMarket } from "./sawa/format";
 import { stubCreate } from "./sawa/createStub";
 import { RecentBuffer, suggestPayload } from "./sawa/suggest";
@@ -196,6 +196,14 @@ if (pmxtConfig) {
   enableCachePersistence(fileCachePersistence(pmxtCacheFile));
   console.warn(`[sawa] pmxt cache: persisting to ${pmxtCacheFile} (survives restart).`);
 }
+
+// Sawa public-feed cache — DURABLE across restart for a WARM cold start: rehydrate the feed page from
+// a bot-local JSON file (gitignored .sawa/, override via SAWA_FEED_CACHE_FILE) so the first query after
+// a redeploy is served from disk in ~ms (stale-while-revalidate refreshes it) instead of paying the
+// ~1s origin GET. Read-only enrichment data, NOT a Sawa write. See src/sawa/read.ts.
+const feedCacheFile = process.env.SAWA_FEED_CACHE_FILE || path.join(process.cwd(), ".sawa", "feed-cache.json");
+enableFeedCachePersistence(fileFeedCachePersistence(feedCacheFile));
+console.warn(`[sawa] feed cache: persisting to ${feedCacheFile} (warm cold start).`);
 
 function needsConfig(): string {
   return "Sawa isn't configured yet (set SAWA_API_BASE_URL).";

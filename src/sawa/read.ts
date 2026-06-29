@@ -19,6 +19,8 @@
  * Search note: the app exposes no server-side text-search param, so `listMarkets({ search })`
  * matches titles client-side over the (small) public feed — see docs/BUILD_PLAN.md §4.
  */
+import fs from "node:fs";
+import path from "node:path";
 import { getJson, UpstreamError } from "./http";
 import type { Config } from "./config";
 import type { Market, Outcome } from "./types";
@@ -149,21 +151,87 @@ export async function listMarkets(cfg: Config, opts: ListOptions = {}): Promise<
   return matches;
 }
 
-// --- Public-feed cache -----------------------------------------------------
-// The feed GET (`/api/predictions?limit=100`) is QUERY-INDEPENDENT — `listMarkets` filters and
-// ranks the returned rows client-side — so one cached page serves EVERY query (and the /markets
-// command) for the TTL window. Measured baseline: this GET is ~1.0s and was paid on every query;
-// caching it removes that floor on warm/repeat traffic (docs/imessage-market-cache-latency.md).
-// Short TTL: the public catalog only changes when a market is created/resolved, and `resolved`
-// is already filtered client-side, so a few seconds' staleness is harmless for discovery.
+// --- Public-feed cache (durable + stale-while-revalidate) ------------------
+// The feed GET (`/api/predictions?limit=100`) is QUERY-INDEPENDENT — `listMarkets` filters/ranks the
+// rows client-side — so one cached page serves EVERY query (and /markets). Measured baseline: this
+// GET is ~1.0s and was paid on every query (docs/imessage-market-cache-latency.md). Three layers:
+//   • FRESH (< FEED_TTL_MS): serve directly.
+//   • STALE (< FEED_STALE_MS): serve the cached page immediately AND refresh in the background
+//     (stale-while-revalidate) — this is what makes a cold start "warm": after a restart the page is
+//     rehydrated from disk (below) and the first query is served from it in ~ms while a refresh runs.
+//   • older / absent: fetch synchronously.
+// DURABLE: like the pmxt cache (src/pmxt/discover.ts) and settings.ts, the page is written through to
+// a bot-local JSON file and rehydrated on startup, so a redeploy doesn't face an empty cache and a
+// ~1s origin fetch on every first query. Off by default (unit tests stay purely in-memory).
 interface FeedCacheEntry {
   at: number;
   res: FeedResponse;
 }
-const FEED_CACHE_TTL_MS = 30_000;
+const FEED_TTL_MS = 30_000; // fresh window — serve directly, no refresh
+const FEED_STALE_MS = 10 * 60_000; // serve-stale ceiling — beyond this a cold entry is refetched synchronously
 const feedCache = new Map<number, FeedCacheEntry>();
+const feedRefreshing = new Set<number>();
 /** Injectable clock for deterministic tests (mirrors src/pmxt/discover.ts). */
 let now: () => number = () => Date.now();
+/** The in-flight background revalidation (test seam — await it to observe the SWR refresh). */
+let lastFeedRevalidation: Promise<void> | null = null;
+
+interface FeedCacheSnapshot {
+  [page: string]: FeedCacheEntry;
+}
+export interface FeedCachePersistence {
+  load(): FeedCacheSnapshot | null;
+  save(data: FeedCacheSnapshot): void;
+}
+let feedPersist: FeedCachePersistence | undefined;
+
+function saveFeedCache(): void {
+  if (!feedPersist) return;
+  const out: FeedCacheSnapshot = {};
+  for (const [k, v] of feedCache) out[String(k)] = v;
+  feedPersist.save(out);
+}
+
+/** Enable durable persistence: rehydrate now (dropping entries past the stale ceiling), then write through. */
+export function enableFeedCachePersistence(adapter: FeedCachePersistence): void {
+  feedPersist = adapter;
+  const snap = adapter.load();
+  if (!snap) return;
+  const t = now();
+  for (const [k, v] of Object.entries(snap)) {
+    if (v && typeof v.at === "number" && v.res && t - v.at < FEED_STALE_MS) feedCache.set(Number(k), v);
+  }
+}
+
+/** File-backed persistence (atomic temp+rename, fail-soft) — mirrors fileSettingsPersistence in settings.ts. */
+export function fileFeedCachePersistence(filePath: string): FeedCachePersistence {
+  return {
+    load() {
+      try {
+        return JSON.parse(fs.readFileSync(filePath, "utf8")) as FeedCacheSnapshot;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT")
+          console.warn(`[feed] could not read cache ${filePath} (${(err as Error).message}) — starting cold.`);
+        return null; // missing file on first run is normal
+      }
+    },
+    save(data) {
+      try {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        const tmp = `${filePath}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(data));
+        fs.renameSync(tmp, filePath); // atomic replace
+      } catch (err) {
+        console.warn(`[feed] could not persist cache ${filePath} (${(err as Error).message}) — kept in memory only.`);
+      }
+    },
+  };
+}
+
+/** Test seam: set/clear the persistence adapter without hydrating (mirrors __setClock). */
+export function __setFeedCachePersistence(p: FeedCachePersistence | null): void {
+  feedPersist = p ?? undefined;
+}
 /** Test helper: override the cache clock. */
 export function __setFeedClock(fn: () => number): void {
   now = fn;
@@ -171,18 +239,49 @@ export function __setFeedClock(fn: () => number): void {
 /** Test/bench helper: clear the public-feed cache between cases. */
 export function __clearFeedCache(): void {
   feedCache.clear();
+  feedRefreshing.clear();
+}
+/** Test seam: await any in-flight stale-while-revalidate refresh. */
+export async function __feedRevalidationSettled(): Promise<void> {
+  await lastFeedRevalidation?.catch(() => {});
 }
 
-/** One page of the public feed (newest first), `FEED_PAGE_LIMIT` rows. Cached for `FEED_CACHE_TTL_MS`. */
-async function fetchFeedPage(cfg: Config, page: number): Promise<FeedResponse> {
-  const hit = feedCache.get(page);
-  if (hit && now() - hit.at < FEED_CACHE_TTL_MS) return hit.res;
+async function fetchFeedNetwork(cfg: Config, page: number): Promise<FeedResponse> {
   const url = apiUrl(cfg, "/api/predictions");
   url.searchParams.set("page", String(page));
   url.searchParams.set("limit", String(FEED_PAGE_LIMIT));
   const res = await getJson<FeedResponse>(url);
   feedCache.set(page, { at: now(), res });
+  saveFeedCache(); // write through so the cache survives a restart
   return res;
+}
+
+async function revalidateFeed(cfg: Config, page: number): Promise<void> {
+  if (feedRefreshing.has(page)) return; // a refresh is already in flight for this page
+  feedRefreshing.add(page);
+  try {
+    await fetchFeedNetwork(cfg, page);
+  } catch (err) {
+    console.warn(`[feed] background refresh of page ${page} failed (${(err as Error).message}) — keeping stale.`);
+  } finally {
+    feedRefreshing.delete(page);
+  }
+}
+
+/**
+ * One page of the public feed (newest first), `FEED_PAGE_LIMIT` rows. Fresh-serve under FEED_TTL_MS;
+ * stale-serve + background refresh under FEED_STALE_MS (so a rehydrated cold start is instant); else
+ * fetch synchronously.
+ */
+async function fetchFeedPage(cfg: Config, page: number): Promise<FeedResponse> {
+  const hit = feedCache.get(page);
+  const age = hit ? now() - hit.at : Infinity;
+  if (hit && age < FEED_TTL_MS) return hit.res; // fresh
+  if (hit && age < FEED_STALE_MS) {
+    lastFeedRevalidation = revalidateFeed(cfg, page); // stale → serve now, refresh in background
+    return hit.res;
+  }
+  return fetchFeedNetwork(cfg, page); // miss / too-old → synchronous
 }
 
 /** Fetch a single public market by id, with current odds. Private/hidden/missing → null. */
