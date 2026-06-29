@@ -149,12 +149,40 @@ export async function listMarkets(cfg: Config, opts: ListOptions = {}): Promise<
   return matches;
 }
 
-/** One page of the public feed (newest first), `FEED_PAGE_LIMIT` rows. */
+// --- Public-feed cache -----------------------------------------------------
+// The feed GET (`/api/predictions?limit=100`) is QUERY-INDEPENDENT — `listMarkets` filters and
+// ranks the returned rows client-side — so one cached page serves EVERY query (and the /markets
+// command) for the TTL window. Measured baseline: this GET is ~1.0s and was paid on every query;
+// caching it removes that floor on warm/repeat traffic (docs/imessage-market-cache-latency.md).
+// Short TTL: the public catalog only changes when a market is created/resolved, and `resolved`
+// is already filtered client-side, so a few seconds' staleness is harmless for discovery.
+interface FeedCacheEntry {
+  at: number;
+  res: FeedResponse;
+}
+const FEED_CACHE_TTL_MS = 30_000;
+const feedCache = new Map<number, FeedCacheEntry>();
+/** Injectable clock for deterministic tests (mirrors src/pmxt/discover.ts). */
+let now: () => number = () => Date.now();
+/** Test helper: override the cache clock. */
+export function __setFeedClock(fn: () => number): void {
+  now = fn;
+}
+/** Test/bench helper: clear the public-feed cache between cases. */
+export function __clearFeedCache(): void {
+  feedCache.clear();
+}
+
+/** One page of the public feed (newest first), `FEED_PAGE_LIMIT` rows. Cached for `FEED_CACHE_TTL_MS`. */
 async function fetchFeedPage(cfg: Config, page: number): Promise<FeedResponse> {
+  const hit = feedCache.get(page);
+  if (hit && now() - hit.at < FEED_CACHE_TTL_MS) return hit.res;
   const url = apiUrl(cfg, "/api/predictions");
   url.searchParams.set("page", String(page));
   url.searchParams.set("limit", String(FEED_PAGE_LIMIT));
-  return getJson<FeedResponse>(url);
+  const res = await getJson<FeedResponse>(url);
+  feedCache.set(page, { at: now(), res });
+  return res;
 }
 
 /** Fetch a single public market by id, with current odds. Private/hidden/missing → null. */

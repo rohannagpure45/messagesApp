@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { runSearch, isBroadQuery, flattenRanked, venuesPresent, __setClock as __setSearchClock } from "../src/search";
 import { __clearCache, __setClock } from "../src/pmxt/discover";
 import { __resetRateGuard, __setHttpClock } from "../src/pmxt/http";
+import { __clearFeedCache } from "../src/sawa/read";
 import type { SearchResults } from "../src/search";
 import type { Config, PmxtConfig } from "../src/sawa/config";
 import type { VenueResult } from "../src/venue";
@@ -73,6 +74,7 @@ function installStub(v: StubVenues) {
 
 beforeEach(() => {
   __clearCache();
+  __clearFeedCache();
   __setClock(() => 0);
   __resetRateGuard(); // pmxt rate guard is global module state — isolate each test
   __setHttpClock(() => 0);

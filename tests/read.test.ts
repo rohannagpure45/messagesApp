@@ -1,5 +1,5 @@
-import { describe, it, expect, afterEach } from "vitest";
-import { listMarkets, getMarket, getTrending } from "../src/sawa/read";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { listMarkets, getMarket, getTrending, __clearFeedCache } from "../src/sawa/read";
 import type { Config } from "../src/sawa/config";
 
 // Behavioral coverage for the discovery read path. read.ts calls `globalThis.fetch` via the
@@ -10,6 +10,9 @@ import type { Config } from "../src/sawa/config";
 const cfg: Config = { apiBaseUrl: "https://sawa.test", marketUrlTemplate: "https://sawa.test/market/{id}" };
 
 const realFetch = globalThis.fetch;
+// The public-feed fetch is cached (read.ts); clear it between cases so a prior test's stubbed
+// page can't bleed into the next.
+beforeEach(() => __clearFeedCache());
 afterEach(() => {
   globalThis.fetch = realFetch;
 });

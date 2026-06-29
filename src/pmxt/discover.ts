@@ -13,6 +13,8 @@
  * (venue, query) cache, a STAGED fan-out (full query first; entities only if it found nothing), and a
  * concurrency cap. A 429/timeout is fail-soft (an empty venue) and flagged via `errored`.
  */
+import fs from "node:fs";
+import path from "node:path";
 import { getJson, PmxtError, PmxtRateLimitError } from "./http";
 import type { PmxtConfig } from "../sawa/config";
 import { type Venue, type VenueResult, scoreRelevance } from "../venue";
@@ -85,6 +87,70 @@ export function __setClock(fn: () => number): void {
 
 function cacheKey(venue: string, query: string): string {
   return `${venue}::${query.trim().toLowerCase()}`;
+}
+
+// --- durable cache persistence (follow-up C) ----------------------------------------------------
+// Optional, fail-soft disk persistence so the (venue,query) cache survives a restart/redeploy — a
+// cold process otherwise starts with an empty cache and re-bursts pmxt (the 429 source). Mirrors
+// src/sawa/settings.ts (atomic temp+rename, fully fail-soft). Entries older than STALE_MAX_MS are
+// never served — not even as a stale fallback — and are dropped on hydrate. Off by default, so unit
+// tests stay purely in-memory (only index.ts opts in).
+const STALE_MAX_MS = 60 * 60_000; // 1h — also the bound for serve-stale-on-error in searchVenue
+interface CacheSnapshot {
+  [key: string]: CacheEntry;
+}
+export interface CachePersistence {
+  load(): CacheSnapshot | null;
+  save(data: CacheSnapshot): void;
+}
+let persist: CachePersistence | undefined;
+
+function saveCache(): void {
+  if (!persist) return;
+  const out: CacheSnapshot = {};
+  for (const [k, v] of cache) out[k] = v;
+  persist.save(out);
+}
+
+/** Enable durable persistence: rehydrate the cache now (dropping too-stale entries), then write through on each set. */
+export function enableCachePersistence(adapter: CachePersistence): void {
+  persist = adapter;
+  const snap = adapter.load();
+  if (!snap) return;
+  const t = now();
+  for (const [k, v] of Object.entries(snap)) {
+    if (v && typeof v.at === "number" && Array.isArray(v.results) && t - v.at < STALE_MAX_MS) cache.set(k, v);
+  }
+}
+
+/** File-backed persistence (atomic temp+rename, fail-soft) — mirrors fileSettingsPersistence in settings.ts. */
+export function fileCachePersistence(filePath: string): CachePersistence {
+  return {
+    load() {
+      try {
+        return JSON.parse(fs.readFileSync(filePath, "utf8")) as CacheSnapshot;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT")
+          console.warn(`[pmxt] could not read cache ${filePath} (${(err as Error).message}) — starting cold.`);
+        return null; // missing file on first run is normal
+      }
+    },
+    save(data) {
+      try {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        const tmp = `${filePath}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(data));
+        fs.renameSync(tmp, filePath); // atomic replace
+      } catch (err) {
+        console.warn(`[pmxt] could not persist cache ${filePath} (${(err as Error).message}) — kept in memory only.`);
+      }
+    },
+  };
+}
+
+/** Test seam: set/clear the persistence adapter without hydrating (mirrors __setClock). */
+export function __setCachePersistence(p: CachePersistence | null): void {
+  persist = p ?? undefined;
 }
 
 /** Labels for the "No"/"Not" side of a binary market — never the headline we want to show. */
@@ -160,13 +226,29 @@ export async function searchVenue(
   url.searchParams.set("closed", "false"); // open markets only
   url.searchParams.set("limit", String(Math.max(1, Math.min(limit, 50))));
 
-  const res = await getJson<MarketsResponse>(url, cfg.apiKey);
+  let res: MarketsResponse;
+  try {
+    res = await getJson<MarketsResponse>(url, cfg.apiKey);
+  } catch (err) {
+    // Serve-stale-on-error (follow-up C): pmxt's free tier 429s/times out under load. Rather than
+    // drop the venue, fall back to the last cached rows for this (venue, query) when they're within
+    // STALE_MAX_MS — a slightly-stale favorite beats "couldn't reach Kalshi". Re-throw only when
+    // there's no usable fallback, preserving the existing fail-soft-to-empty behavior at the caller.
+    if (hit && now() - hit.at < STALE_MAX_MS) {
+      console.warn(
+        `[pmxt] ${venue} "${query}" failed (${(err as Error).message}) — serving cache ${Math.round((now() - hit.at) / 1000)}s old.`,
+      );
+      return rescore(hit.results, relevanceQuery);
+    }
+    throw err;
+  }
   // Drop RESOLVED/settled markets up front — pmxt returns them even with `closed=false` (verified live:
   // a `status=finalized` "BTC price up in next 15 mins?" at 100¢). A done market is never a useful answer.
   const results = (res.data ?? [])
     .filter((m) => !isResolvedStatus(m.status))
     .map((m) => toVenueResult(m, label, relevanceQuery));
   cache.set(key, { at: now(), results });
+  saveCache(); // write through so the cache survives a restart (no-op unless persistence is enabled)
   return results;
 }
 

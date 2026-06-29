@@ -1,5 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { searchVenue, searchExternal, expandQueries, __setClock, __clearCache } from "../src/pmxt/discover";
+import {
+  searchVenue,
+  searchExternal,
+  expandQueries,
+  __setClock,
+  __clearCache,
+  __setCachePersistence,
+  enableCachePersistence,
+} from "../src/pmxt/discover";
+import type { CachePersistence } from "../src/pmxt/discover";
 import {
   PmxtError,
   PmxtRateLimitError,
@@ -69,6 +78,57 @@ afterEach(() => {
   __setRate429BackoffMs(200);
   __resetRateGuard();
   __setHttpClock(() => Date.now());
+});
+
+describe("durable cache & serve-stale-on-error (follow-up C)", () => {
+  const CACHE_TTL_MS = 180_000;
+  afterEach(() => __setCachePersistence(null));
+
+  it("serves STALE cache when a refetch fails (instead of dropping the venue)", async () => {
+    stub(() => res(resp([market({ title: "World Cup Winner" })])));
+    const first = await searchVenue(cfg, "kalshi", "Kalshi", "world cup", 20);
+    expect(first).toHaveLength(1);
+
+    // Past the fresh TTL (so it refetches) but well within the 1h stale bound:
+    __setClock(() => CACHE_TTL_MS + 60_000);
+    stub(() => res(resp([]), 500)); // refetch fails
+    const stale = await searchVenue(cfg, "kalshi", "Kalshi", "world cup", 20);
+
+    expect(stale).toHaveLength(1); // fell back to the cached row, did NOT throw
+    expect(stale[0]!.title).toBe("World Cup Winner");
+    expect(calls).toHaveLength(1); // the failed refetch was actually attempted
+  });
+
+  it("re-throws (fail-soft to empty at the caller) when a fetch fails with NO cached fallback", async () => {
+    stub(() => res(resp([]), 500));
+    await expect(searchVenue(cfg, "kalshi", "Kalshi", "never cached", 20)).rejects.toBeInstanceOf(PmxtError);
+  });
+
+  it("writes through to persistence on success, and rehydrates the cache on load", async () => {
+    let snapshot: ReturnType<CachePersistence["load"]> = null;
+    const adapter: CachePersistence = {
+      load: () => snapshot,
+      save: (d) => {
+        snapshot = JSON.parse(JSON.stringify(d)) as typeof snapshot; // round-trip like the file adapter
+      },
+    };
+    __setCachePersistence(adapter);
+    stub(() => res(resp([market({ title: "Persisted Market" })])));
+    await searchVenue(cfg, "kalshi", "Kalshi", "persist me", 20);
+    expect(snapshot).not.toBeNull();
+    expect(Object.keys(snapshot!)).toContain("kalshi::persist me");
+
+    // Simulate a cold process: drop the in-memory map, rehydrate from the snapshot, and confirm the
+    // next search is served from cache with NO network call (the stubbed 500 would throw otherwise).
+    __clearCache();
+    enableCachePersistence(adapter);
+    stub(() => res(resp([]), 500));
+    const hit = await searchVenue(cfg, "kalshi", "Kalshi", "persist me", 20);
+
+    expect(hit).toHaveLength(1);
+    expect(hit[0]!.title).toBe("Persisted Market");
+    expect(calls).toHaveLength(0); // served from the hydrated cache
+  });
 });
 
 describe("searchVenue", () => {

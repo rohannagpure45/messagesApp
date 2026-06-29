@@ -33,6 +33,7 @@ import { stubCreate } from "./sawa/createStub";
 import { RecentBuffer, suggestPayload } from "./sawa/suggest";
 import { parseIntent, stripAddress, refineClarify } from "./sawa/intent";
 import { runSearch, flattenRanked } from "./search";
+import { enableCachePersistence, fileCachePersistence } from "./pmxt/discover";
 import type { VenueResult } from "./venue";
 import { toPlainText } from "./sawa/cards";
 import { ConversationStore, toContext, nextTurn, clarifyState, resolveClarifyTurn, pickedAnswer } from "./sawa/conversation";
@@ -185,6 +186,16 @@ const settings = new SpaceSettings(
   { persist: fileSettingsPersistence(settingsFile) },
 );
 console.warn(`[sawa] agent settings: persisting per-space toggles to ${settingsFile} (survives restart).`);
+
+// pmxt (venue,query) cache — DURABLE across restart (follow-up C): rehydrate from a bot-local JSON
+// file (gitignored .sawa/, override via SAWA_PMXT_CACHE_FILE) so a cold redeploy doesn't start with an
+// empty cache and re-burst pmxt (the 429 source). Read-only enrichment data, NOT a Sawa write. Only
+// when pmxt is configured (no key → the cache is never used).
+if (pmxtConfig) {
+  const pmxtCacheFile = process.env.SAWA_PMXT_CACHE_FILE || path.join(process.cwd(), ".sawa", "pmxt-cache.json");
+  enableCachePersistence(fileCachePersistence(pmxtCacheFile));
+  console.warn(`[sawa] pmxt cache: persisting to ${pmxtCacheFile} (survives restart).`);
+}
 
 function needsConfig(): string {
   return "Sawa isn't configured yet (set SAWA_API_BASE_URL).";
