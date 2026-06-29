@@ -76,7 +76,7 @@ async function turn(text: string): Promise<Walk> {
   };
 }
 
-const QUERIES = ["Wu versus Djokovic", "Netherlands versus Monaco"];
+const QUERIES = ["Wu versus Djokovic", "Netherlands versus Monaco", "Netherlands vs Morocco to advance"];
 const K = 3;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const med = (v: number[]) => [...v].sort((a, b) => a - b)[Math.floor(v.length / 2)]!;
