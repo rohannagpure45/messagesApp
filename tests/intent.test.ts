@@ -1,6 +1,17 @@
-import { describe, it, expect, afterEach } from "vitest";
-import { classify, classifyFollowup, parseIntent, refineClarify, __setClient } from "../src/sawa/intent";
-import type { FollowupContext } from "../src/sawa/intent";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import {
+  classify,
+  classifyFollowup,
+  parseIntent,
+  refineClarify,
+  __setClient,
+  __setIntentClock,
+  __clearIntentCache,
+  __clearClarifyCache,
+  __setIntentCachePersistence,
+  enableIntentCachePersistence,
+} from "../src/sawa/intent";
+import type { FollowupContext, IntentCachePersistence } from "../src/sawa/intent";
 import type { IntentConfig } from "../src/sawa/config";
 import type { ClarifyQuestion } from "../src/sawa/clarify";
 import type { VenueResult } from "../src/venue";
@@ -39,6 +50,14 @@ function capturingStub(content: string) {
   return { client, calls };
 }
 
+// The intent + clarify caches are module-level singletons — clear them (and reset the clock) before
+// every case so a cached classification from one test can't satisfy (and silence the LLM stub of) the
+// next. Mirrors the __clearCache/__setClock beforeEach in pmxt.test.ts / read.test.ts.
+beforeEach(() => {
+  __clearIntentCache();
+  __clearClarifyCache();
+  __setIntentClock(() => Date.now());
+});
 afterEach(() => __setClient(null));
 
 describe("classify (regex-first gate)", () => {
@@ -364,5 +383,167 @@ describe("refineClarify (LLM drop-noise / relabel / veto, fail-soft)", () => {
       throw new Error("network down");
     }));
     expect(await refineClarify("Lionel messi", question, cfg)).toBe(question);
+  });
+});
+
+describe("cold-start intent cache (durable, time-invariant)", () => {
+  afterEach(() => __setIntentCachePersistence(null));
+
+  it("caches a cold-start classification → a second identical message skips the LLM", async () => {
+    let called = 0;
+    __setClient(stubClient('{"kind":"search","query":"Los Angeles mayor"}', () => (called += 1)));
+    const a = await parseIntent("sawa la mayor race thoughts", BOT, cfg);
+    const b = await parseIntent("sawa la mayor race thoughts", BOT, cfg);
+    expect(a).toEqual({ kind: "search", query: "Los Angeles mayor", via: "llm" });
+    expect(b).toEqual(a); // served from cache, identical result (still via:"llm")
+    expect(called).toBe(1); // LLM consulted exactly ONCE
+  });
+
+  it("normalizes the key (case / whitespace / trailing punctuation) so variants share one entry", async () => {
+    let called = 0;
+    __setClient(stubClient('{"kind":"search","query":"Bitcoin"}', () => (called += 1)));
+    await parseIntent("sawa hmm thoughts on BTC", BOT, cfg);
+    await parseIntent("sawa   hmm   thoughts on btc???", BOT, cfg); // different case / spacing / punctuation
+    expect(called).toBe(1);
+  });
+
+  it("caches an LLM 'other' result too (negative caching for repeated non-search chatter)", async () => {
+    let called = 0;
+    __setClient(stubClient('{"kind":"other","query":""}', () => (called += 1)));
+    await parseIntent("sawa hmm what do you reckon", BOT, cfg);
+    const second = await parseIntent("sawa hmm what do you reckon", BOT, cfg);
+    expect(second.kind).toBe("other");
+    expect(called).toBe(1);
+  });
+
+  it("does NOT cache the active-market follow-up path (it depends on the shown market)", async () => {
+    let called = 0;
+    __setClient(
+      stubClient('{"kind":"answer","reply":"That\'s the World Cup market on Kalshi.","query":"","venue":""}', () => (called += 1)),
+    );
+    await parseIntent("what are the odds", BOT, cfg, activeCtx);
+    await parseIntent("what are the odds", BOT, cfg, activeCtx);
+    expect(called).toBe(2); // every follow-up re-consults the LLM (same text, different shown market)
+  });
+
+  it("does NOT cache a failed/unusable classification (transient, not a stable mapping)", async () => {
+    let called = 0;
+    __setClient(
+      stubClient(() => {
+        throw new Error("503");
+      }, () => (called += 1)),
+    );
+    await parseIntent("sawa some ambiguous thing", BOT, cfg);
+    await parseIntent("sawa some ambiguous thing", BOT, cfg);
+    expect(called).toBe(2); // an error is never cached → both attempts hit the LLM
+  });
+
+  it("expires entries past the 24h TTL", async () => {
+    let called = 0;
+    let t = 0;
+    __setIntentClock(() => t);
+    __setClient(stubClient('{"kind":"search","query":"Bitcoin"}', () => (called += 1)));
+    await parseIntent("sawa thoughts on btc later", BOT, cfg);
+    t = 24 * 60 * 60_000 + 1; // just past the TTL
+    await parseIntent("sawa thoughts on btc later", BOT, cfg);
+    expect(called).toBe(2); // stale → re-classified
+  });
+
+  it("writes through to persistence and rehydrates on load (a cold process skips the LLM)", async () => {
+    let snapshot: ReturnType<IntentCachePersistence["load"]> = null;
+    const adapter: IntentCachePersistence = {
+      load: () => snapshot,
+      save: (d) => {
+        snapshot = JSON.parse(JSON.stringify(d)) as typeof snapshot; // round-trip like the file adapter
+      },
+    };
+    __setIntentCachePersistence(adapter);
+    let called = 0;
+    __setClient(stubClient('{"kind":"search","query":"Argentina"}', () => (called += 1)));
+    await parseIntent("sawa thoughts on argentina", BOT, cfg);
+    expect(snapshot).not.toBeNull();
+    expect(Object.keys(snapshot!.intent ?? {})).toContain("thoughts on argentina");
+
+    // Simulate a cold process: drop the in-memory cache, rehydrate from the snapshot, confirm no LLM call.
+    __clearIntentCache();
+    enableIntentCachePersistence(adapter);
+    const hit = await parseIntent("sawa thoughts on argentina", BOT, cfg);
+    expect(hit).toMatchObject({ kind: "search", query: "Argentina" });
+    expect(called).toBe(1); // served from the hydrated cache, LLM not called again
+  });
+});
+
+describe("refineClarify cache (decision cached; prices re-bound fresh)", () => {
+  const row = (title: string, price = 0.5): VenueResult => ({
+    venue: "kalshi", sourceLabel: "Kalshi", realMoney: true, title, url: "https://k/x",
+    top: { label: "Yes", price }, relevance: 1,
+  });
+  const makeQuestion = (price1: number): ClarifyQuestion => ({
+    question: 'Which "Lionel messi" market did you mean?',
+    options: [
+      { label: "Score or assist", result: row("Lionel Messi to score or assist", price1) },
+      { label: "Trump praise Messi", result: row("Trump praise Messi") },
+      { label: "1+ goals", result: row("Lionel Messi 1+ goals") },
+    ],
+  });
+  afterEach(() => __setIntentCachePersistence(null));
+
+  it("caches the decision → a second identical refine skips the LLM", async () => {
+    let called = 0;
+    __setClient(
+      stubClient('{"ambiguous":true,"options":[{"n":1,"label":"Score or assist"},{"n":3,"label":"1+ goals"}]}', () => (called += 1)),
+    );
+    const a = await refineClarify("Lionel messi", makeQuestion(0.5), cfg);
+    const b = await refineClarify("Lionel messi", makeQuestion(0.5), cfg);
+    expect(a!.options.map((o) => o.result.title)).toEqual(["Lionel Messi to score or assist", "Lionel Messi 1+ goals"]);
+    expect(b!.options.map((o) => o.result.title)).toEqual(a!.options.map((o) => o.result.title));
+    expect(called).toBe(1);
+  });
+
+  it("re-binds the decision onto the CURRENT question so prices stay fresh on a cache hit", async () => {
+    let called = 0;
+    __setClient(stubClient('{"ambiguous":true,"options":[{"n":1,"label":"Score or assist"}]}', () => (called += 1)));
+    await refineClarify("Lionel messi", makeQuestion(0.4), cfg); // first: 40¢
+    const hit = await refineClarify("Lionel messi", makeQuestion(0.55), cfg); // same titles, new price 55¢
+    expect(called).toBe(1); // LLM skipped
+    expect(hit!.options[0]!.result.top!.price).toBe(0.55); // fresh price, NOT the cached 0.40
+  });
+
+  it("caches a VETO decision (answer directly without re-asking the LLM)", async () => {
+    let called = 0;
+    __setClient(stubClient('{"ambiguous":false}', () => (called += 1)));
+    expect(await refineClarify("Lionel messi", makeQuestion(0.5), cfg)).toBeNull();
+    expect(await refineClarify("Lionel messi", makeQuestion(0.5), cfg)).toBeNull();
+    expect(called).toBe(1);
+  });
+
+  it("does NOT cache a fail-soft (unparseable) response", async () => {
+    let called = 0;
+    __setClient(stubClient("not json at all", () => (called += 1)));
+    const q = makeQuestion(0.5);
+    expect(await refineClarify("Lionel messi", q, cfg)).toBe(q); // deterministic question kept
+    expect(await refineClarify("Lionel messi", q, cfg)).toBe(q);
+    expect(called).toBe(2); // error path never cached → both retried
+  });
+
+  it("writes the decision through to persistence and rehydrates it on load", async () => {
+    let snapshot: ReturnType<IntentCachePersistence["load"]> = null;
+    const adapter: IntentCachePersistence = {
+      load: () => snapshot,
+      save: (d) => {
+        snapshot = JSON.parse(JSON.stringify(d)) as typeof snapshot;
+      },
+    };
+    __setIntentCachePersistence(adapter);
+    let called = 0;
+    __setClient(stubClient('{"ambiguous":true,"options":[{"n":3,"label":"1+ goals"}]}', () => (called += 1)));
+    await refineClarify("Lionel messi", makeQuestion(0.5), cfg);
+    expect(Object.keys(snapshot!.clarify ?? {}).length).toBe(1);
+
+    __clearClarifyCache();
+    enableIntentCachePersistence(adapter);
+    const hit = await refineClarify("Lionel messi", makeQuestion(0.5), cfg);
+    expect(hit!.options[0]!.result.title).toBe("Lionel Messi 1+ goals");
+    expect(called).toBe(1); // served from the hydrated decision, LLM not called again
   });
 });

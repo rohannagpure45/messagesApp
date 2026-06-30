@@ -31,7 +31,13 @@ import { listMarkets, getMarket, enableFeedCachePersistence, fileFeedCachePersis
 import { formatList, formatMarket } from "./sawa/format";
 import { stubCreate } from "./sawa/createStub";
 import { RecentBuffer, suggestPayload } from "./sawa/suggest";
-import { parseIntent, stripAddress, refineClarify } from "./sawa/intent";
+import {
+  parseIntent,
+  stripAddress,
+  refineClarify,
+  enableIntentCachePersistence,
+  fileIntentCachePersistence,
+} from "./sawa/intent";
 import { runSearch, flattenRanked } from "./search";
 import { enableCachePersistence, fileCachePersistence } from "./pmxt/discover";
 import type { VenueResult } from "./venue";
@@ -204,6 +210,17 @@ if (pmxtConfig) {
 const feedCacheFile = process.env.SAWA_FEED_CACHE_FILE || path.join(process.cwd(), ".sawa", "feed-cache.json");
 enableFeedCachePersistence(fileFeedCachePersistence(feedCacheFile));
 console.warn(`[sawa] feed cache: persisting to ${feedCacheFile} (warm cold start).`);
+
+// Intent cache — DURABLE across restart: the COLD-START intent classification and the clarify
+// refinement are a time-invariant function of the message text (see src/sawa/intent.ts), so caching
+// them skips the Gemini round-trip on a repeated message. Rehydrate from a bot-local JSON file
+// (gitignored .sawa/, override via SAWA_INTENT_CACHE_FILE). Only when an intent LLM is configured
+// (no key → the LLM is never called, so there is nothing to cache).
+if (intentConfig) {
+  const intentCacheFile = process.env.SAWA_INTENT_CACHE_FILE || path.join(process.cwd(), ".sawa", "intent-cache.json");
+  enableIntentCachePersistence(fileIntentCachePersistence(intentCacheFile));
+  console.warn(`[sawa] intent cache: persisting to ${intentCacheFile} (survives restart).`);
+}
 
 function needsConfig(): string {
   return "Sawa isn't configured yet (set SAWA_API_BASE_URL).";

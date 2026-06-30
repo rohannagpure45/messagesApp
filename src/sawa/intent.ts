@@ -12,6 +12,8 @@
  * v1 scope is intentionally small: `search` vs `other`. Create/odds/bet land in later phases, so
  * the schema is forward-compatible (an unknown kind clamps to `other`).
  */
+import fs from "node:fs";
+import path from "node:path";
 import OpenAI from "openai";
 import type { IntentConfig } from "./config";
 import type { Venue } from "../venue";
@@ -345,8 +347,171 @@ export function __setClient(c: OpenAI | null): void {
   client = c;
 }
 
+// --- intent + clarify caches (durable, time-invariant) ------------------------------------------
+// The COLD-START intent classification (SYSTEM_PROMPT path) and the clarify REFINEMENT decision are
+// each a pure function of their text inputs: "Wu versus Djokovic" → {search,"Wu Djokovic"}, and
+// ("Lionel messi", [those candidate titles]) → keep #1/#3, drop #2 — regardless of WHEN asked. Unlike
+// the market-id / feed caches (whose prices go stale), these mappings are TIME-INVARIANT, so the TTL
+// is long and there is no revalidation. Two deliberate exclusions keep them correct:
+//   • The active-market FOLLOW-UP path is NOT cached — its answer depends on the currently-shown
+//     market (a context digest), so it is not a function of the message text alone.
+//   • The clarify cache stores only the LLM's STRUCTURAL decision (which candidates to keep + labels,
+//     or veto) — never the market `result` objects, which carry live PRICES. On a hit the decision is
+//     re-bound onto the CURRENT question, so prices stay fresh; only the Gemini round-trip is skipped.
+// Bounded by an LRU cap (message/clarify text is unbounded, unlike the finite market set). Off by
+// default (unit tests stay in-memory); index.ts opts into disk persistence. The 24h TTL also bounds a
+// rare nondeterministic mis-parse and any prompt-change staleness that survives on disk across a deploy.
+const INTENT_TTL_MS = 24 * 60 * 60_000; // 24h
+const INTENT_CACHE_MAX = 500; // LRU cap, per cache
+
+interface IntentCacheEntry {
+  at: number;
+  intent: Intent;
+}
+const intentCache = new Map<string, IntentCacheEntry>();
+
+/** The LLM's structural clarify decision: a veto, or the kept candidate indices + (optional) relabels. */
+type ClarifyDecision = { veto: true } | { veto: false; picks: { idx: number; label?: string }[] };
+interface ClarifyCacheEntry {
+  at: number;
+  decision: ClarifyDecision;
+}
+const clarifyCache = new Map<string, ClarifyCacheEntry>();
+
+/** Injectable clock for deterministic tests (mirrors src/pmxt/discover.ts; shared by both caches). */
+let intentNow: () => number = () => Date.now();
+export function __setIntentClock(fn: () => number): void {
+  intentNow = fn;
+}
+
+/** Normalize a message into a stable key: lowercase, collapse whitespace, drop trailing punctuation. */
+function intentCacheKey(text: string): string {
+  return text.trim().toLowerCase().replace(/\s+/g, " ").replace(/[?!.]+$/g, "");
+}
+
+/** Key the clarify cache by the only inputs the model sees: the topic + the candidate titles. */
+function clarifyCacheKey(query: string, question: ClarifyQuestion): string {
+  const titles = question.options.map((o) => o.result.title.trim().toLowerCase()).join("|");
+  return `${query.trim().toLowerCase()}::${titles}`;
+}
+
+/**
+ * Re-bind a cached clarify decision onto the CURRENT question (so option prices are fresh, never
+ * cached). Returns the RELEVANT subset to ask (≥2 options), the single market to answer with (1), or
+ * null to fall back to the top candidate — byte-identical to the original inline mapping.
+ */
+function applyClarifyDecision(decision: ClarifyDecision, question: ClarifyQuestion): ClarifyQuestion | null {
+  if (decision.veto) return null;
+  const kept: ClarifyOption[] = [];
+  for (const { idx, label } of decision.picks) {
+    const orig = idx >= 0 && idx < question.options.length ? question.options[idx] : undefined;
+    if (!orig || kept.some((k) => k.result === orig.result)) continue;
+    kept.push({ label: label ?? orig.label, result: orig.result });
+    if (kept.length >= 4) break;
+  }
+  return kept.length >= 1 ? { ...question, options: kept } : null;
+}
+
+/** Move an entry to the end of its Map (most-recently-used) WITHOUT resetting its TTL anchor. */
+function touchLru<V>(map: Map<string, V>, key: string, entry: V): void {
+  map.delete(key);
+  map.set(key, entry);
+}
+
+/** Insert with write-through persistence + LRU eviction of the oldest entry once past the cap. */
+function setWithCap<V>(map: Map<string, V>, key: string, entry: V): void {
+  map.set(key, entry);
+  if (map.size > INTENT_CACHE_MAX) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  saveIntentModuleCache();
+}
+
+// --- durable persistence (one file backs BOTH intent-module caches) -----------------------------
+interface IntentModuleSnapshot {
+  intent?: { [key: string]: IntentCacheEntry };
+  clarify?: { [key: string]: ClarifyCacheEntry };
+}
+export interface IntentCachePersistence {
+  load(): IntentModuleSnapshot | null;
+  save(data: IntentModuleSnapshot): void;
+}
+let intentPersist: IntentCachePersistence | undefined;
+
+function saveIntentModuleCache(): void {
+  if (!intentPersist) return;
+  const intent: { [key: string]: IntentCacheEntry } = {};
+  for (const [k, v] of intentCache) intent[k] = v;
+  const clarify: { [key: string]: ClarifyCacheEntry } = {};
+  for (const [k, v] of clarifyCache) clarify[k] = v;
+  intentPersist.save({ intent, clarify });
+}
+
+/** Enable durable persistence: rehydrate both caches now (dropping too-stale entries), then write through. */
+export function enableIntentCachePersistence(adapter: IntentCachePersistence): void {
+  intentPersist = adapter;
+  const snap = adapter.load();
+  if (!snap) return;
+  const t = intentNow();
+  for (const [k, v] of Object.entries(snap.intent ?? {})) {
+    if (v && typeof v.at === "number" && v.intent && t - v.at < INTENT_TTL_MS) intentCache.set(k, v);
+  }
+  for (const [k, v] of Object.entries(snap.clarify ?? {})) {
+    if (v && typeof v.at === "number" && v.decision && t - v.at < INTENT_TTL_MS) clarifyCache.set(k, v);
+  }
+}
+
+/** File-backed persistence (atomic temp+rename, fail-soft) — mirrors fileCachePersistence in discover.ts. */
+export function fileIntentCachePersistence(filePath: string): IntentCachePersistence {
+  return {
+    load() {
+      try {
+        return JSON.parse(fs.readFileSync(filePath, "utf8")) as IntentModuleSnapshot;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT")
+          console.warn(`[intent] could not read cache ${filePath} (${(err as Error).message}) — starting cold.`);
+        return null; // missing file on first run is normal
+      }
+    },
+    save(data) {
+      try {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        const tmp = `${filePath}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(data));
+        fs.renameSync(tmp, filePath); // atomic replace
+      } catch (err) {
+        console.warn(`[intent] could not persist cache ${filePath} (${(err as Error).message}) — kept in memory only.`);
+      }
+    },
+  };
+}
+
+/** Test seam: set/clear the persistence adapter without hydrating (mirrors __setCachePersistence). */
+export function __setIntentCachePersistence(p: IntentCachePersistence | null): void {
+  intentPersist = p ?? undefined;
+}
+/** Test/bench helper: clear the cold-start intent cache between cases. */
+export function __clearIntentCache(): void {
+  intentCache.clear();
+}
+/** Test/bench helper: clear the clarify-decision cache between cases. */
+export function __clearClarifyCache(): void {
+  clarifyCache.clear();
+}
+
 async function classifyWithLlm(text: string, cfg: IntentConfig, ctx?: FollowupContext): Promise<Intent | null> {
   const useCtx = ctx?.hasActiveMarket === true;
+  // Cold-start classification is a pure function of the text → cacheable. The active-market path
+  // depends on the shown market (context digest), so it is NEVER cached (the text-only key is wrong).
+  const key = useCtx ? null : intentCacheKey(text);
+  if (key !== null) {
+    const hit = intentCache.get(key);
+    if (hit && intentNow() - hit.at < INTENT_TTL_MS) {
+      touchLru(intentCache, key, hit);
+      return hit.intent; // a cached cold-start result keeps via:"llm" (it WAS an LLM result)
+    }
+  }
   try {
     const messages = useCtx
       ? [
@@ -377,7 +542,11 @@ async function classifyWithLlm(text: string, cfg: IntentConfig, ctx?: FollowupCo
       );
       return null;
     }
-    return useCtx ? interpretFollowupLlm(parsed) : interpretColdLlm(parsed);
+    const result = useCtx ? interpretFollowupLlm(parsed) : interpretColdLlm(parsed);
+    // Cache only a SUCCESSFUL cold-start classification — never null (a transient bad parse / unusable
+    // query is not a stable property of the text), and never the context path.
+    if (key !== null && result) setWithCap(intentCache, key, { at: intentNow(), intent: result });
+    return result;
   } catch (err) {
     console.warn(`[intent] LLM classify failed — using regex gate. ${(err as Error).message}`);
     return null;
@@ -425,6 +594,16 @@ export async function refineClarify(
   question: ClarifyQuestion,
   cfg: IntentConfig,
 ): Promise<ClarifyQuestion | null> {
+  // Cache the LLM's structural decision keyed by (topic + candidate titles) — the only inputs the
+  // model sees, and a time-invariant keep/drop/relabel/veto choice. On a hit, re-bind onto the CURRENT
+  // question so option prices stay fresh; only the Gemini round-trip is skipped. (See the cache block.)
+  const key = clarifyCacheKey(query, question);
+  const cached = clarifyCache.get(key);
+  if (cached && intentNow() - cached.at < INTENT_TTL_MS) {
+    touchLru(clarifyCache, key, cached);
+    return applyClarifyDecision(cached.decision, question);
+  }
+
   const list = question.options.map((o, i) => `${i + 1}. ${o.result.title}`).join("\n");
   try {
     const resp = await getClient(cfg).chat.completions.create(
@@ -448,24 +627,31 @@ export async function refineClarify(
     } catch {
       return question; // unparseable → keep the deterministic question
     }
-    // VETO: the model says these are one market's outcomes → don't ask, answer directly.
-    if (parsed.ambiguous === false || parsed.ambiguous === "false" || parsed.ambiguous === 0) return null;
-    if (!Array.isArray(parsed.options)) return question; // unexpected shape → keep deterministic question
-    // Map each {n,label} back to the ORIGINAL option's market (n is 1-based), dropping noise + dupes.
-    const kept: ClarifyOption[] = [];
+    // VETO: the model says these are one market's outcomes → don't ask, answer directly. Cacheable.
+    if (parsed.ambiguous === false || parsed.ambiguous === "false" || parsed.ambiguous === 0) {
+      const decision: ClarifyDecision = { veto: true };
+      setWithCap(clarifyCache, key, { at: intentNow(), decision });
+      return applyClarifyDecision(decision, question);
+    }
+    if (!Array.isArray(parsed.options)) return question; // unexpected shape → deterministic (transient, not cached)
+    // Validate the LLM's {n,label} picks into stable 0-based indices + (optional) relabels, dropping
+    // out-of-range numbers and dupes. Indices (not market objects) are cached, so prices re-bind fresh.
+    const picks: { idx: number; label?: string }[] = [];
+    const seen = new Set<number>();
     for (const raw of parsed.options as RawClarifyOption[]) {
       const n = typeof raw?.n === "number" ? raw.n : Number(raw?.n);
       const idx = Number.isFinite(n) ? n - 1 : -1;
-      const orig = idx >= 0 && idx < question.options.length ? question.options[idx] : undefined;
-      if (!orig || kept.some((k) => k.result === orig.result)) continue;
-      const label =
-        typeof raw?.label === "string" && raw.label.trim() ? raw.label.trim().slice(0, 44) : orig.label;
-      kept.push({ label, result: orig.result });
-      if (kept.length >= 4) break;
+      if (idx < 0 || idx >= question.options.length || seen.has(idx)) continue;
+      seen.add(idx);
+      const label = typeof raw?.label === "string" && raw.label.trim() ? raw.label.trim().slice(0, 44) : undefined;
+      picks.push({ idx, label });
+      if (picks.length >= 4) break;
     }
-    // Return the RELEVANT subset (1 = answer with that market; ≥2 = ask). The caller distinguishes by
-    // length. `null` ONLY when the model dropped everything → fall back to the top candidate.
-    return kept.length >= 1 ? { ...question, options: kept } : null;
+    // Cache the decision, then return the RELEVANT subset (1 = answer with that market; ≥2 = ask; the
+    // caller distinguishes by length). `null` ONLY when the model dropped everything → top candidate.
+    const decision: ClarifyDecision = { veto: false, picks };
+    setWithCap(clarifyCache, key, { at: intentNow(), decision });
+    return applyClarifyDecision(decision, question);
   } catch (err) {
     console.warn(`[clarify] LLM refine failed — using deterministic question. ${(err as Error).message}`);
     return question;
