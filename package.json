@@ -8,15 +8,18 @@
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc",
-    "test": "vitest run"
+    "test": "vitest run",
+    "postinstall": "patch-package"
   },
   "dependencies": {
-    "spectrum-ts": "^4.2.0"
+    "openai": "^4.104.0",
+    "spectrum-ts": "^5.2.0"
   },
   "devDependencies": {
-    "typescript": "^5",
     "@types/node": "^22",
+    "patch-package": "^8",
     "tsx": "^4",
+    "typescript": "^5",
     "vitest": "^4"
   }
 }

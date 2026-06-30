@@ -1,0 +1,38 @@
+diff --git a/node_modules/@photon-ai/imessage-kit/dist/index.js b/node_modules/@photon-ai/imessage-kit/dist/index.js
+index 184d04c..5427aab 100644
+--- a/node_modules/@photon-ai/imessage-kit/dist/index.js
++++ b/node_modules/@photon-ai/imessage-kit/dist/index.js
+@@ -413,7 +413,7 @@ var MESSAGE_FIELDS = [
+   "message.expressive_send_style_id",
+   "message.balloon_bundle_id",
+   "message.destination_caller_id",
+-  "message.ck_chat_id as ck_chat_id",
++  "NULL as ck_chat_id",
+   "message.was_detonated",
+   "message.expire_state",
+   "message.share_status",
+@@ -1628,8 +1628,23 @@ function inspectAttachment(localPath) {
+ function buildSendScript(params) {
+   const { method, identifier, text, attachment } = params;
+   const escapedId = escapeAppleScriptString(identifier);
++  const groupSuffix = escapedId.includes(";+;") ? escapedId.slice(escapedId.indexOf(";+;")) : escapedId;
+   const targetSetup = method === "buddy" ? `    set targetService to 1st service whose service type = iMessage
+-    set targetBuddy to buddy "${escapedId}" of targetService` : `    set targetChat to chat id "${escapedId}"`;
++    set targetBuddy to buddy "${escapedId}" of targetService` : `    set targetChat to missing value
++    try
++      set targetChat to chat id "${escapedId}"
++    end try
++    if targetChat is missing value then
++      repeat with _c in chats
++        try
++          if (id of _c) ends with "${groupSuffix}" then
++            set targetChat to _c
++            exit repeat
++          end if
++        end try
++      end repeat
++    end if
++    if targetChat is missing value then error "imessage-kit (patched): no addressable Messages chat for ${groupSuffix}"`;
+   const targetVar = method === "buddy" ? "targetBuddy" : "targetChat";
+   const bodyLines = [];
+   if (text) {

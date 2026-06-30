@@ -1,6 +1,16 @@
-import { describe, it, expect, afterEach } from "vitest";
-import { listMarkets, getMarket, getTrending } from "../src/sawa/read";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import {
+  listMarkets,
+  getMarket,
+  getTrending,
+  __clearFeedCache,
+  __setFeedClock,
+  __setFeedCachePersistence,
+  enableFeedCachePersistence,
+  __feedRevalidationSettled,
+} from "../src/sawa/read";
 import type { Config } from "../src/sawa/config";
+import type { FeedCachePersistence } from "../src/sawa/read";
 
 // Behavioral coverage for the discovery read path. read.ts calls `globalThis.fetch` via the
 // getJson helper, so we stub fetch with payloads shaped exactly like the SHIPPED Sawa-app routes
@@ -10,6 +20,9 @@ import type { Config } from "../src/sawa/config";
 const cfg: Config = { apiBaseUrl: "https://sawa.test", marketUrlTemplate: "https://sawa.test/market/{id}" };
 
 const realFetch = globalThis.fetch;
+// The public-feed fetch is cached (read.ts); clear it between cases so a prior test's stubbed
+// page can't bleed into the next.
+beforeEach(() => __clearFeedCache());
 afterEach(() => {
   globalThis.fetch = realFetch;
 });
@@ -111,6 +124,64 @@ describe("listMarkets", () => {
     const markets = await listMarkets(cfg, { limit: 2 });
     expect(markets.length).toBe(2);
     expect(pagesFetched).toBe(1); // filled from page 1; never fetched page 2
+  });
+});
+
+describe("feed cache — durable + stale-while-revalidate (warm cold start)", () => {
+  afterEach(() => {
+    __setFeedCachePersistence(null);
+    __setFeedClock(() => Date.now());
+  });
+
+  it("persists the feed page and rehydrates it on a cold start (served from disk, no fetch)", async () => {
+    __setFeedClock(() => 0);
+    let snapshot: ReturnType<FeedCachePersistence["load"]> = null;
+    const adapter: FeedCachePersistence = {
+      load: () => snapshot,
+      save: (d) => {
+        snapshot = JSON.parse(JSON.stringify(d)) as typeof snapshot; // round-trip like the file adapter
+      },
+    };
+    __setFeedCachePersistence(adapter);
+    stub(() => res({ predictions: [feedRow("a1", "Alpha", { Yes: 10 })] }));
+    await listMarkets(cfg, { limit: 5 });
+    expect(snapshot).not.toBeNull();
+    expect(Object.keys(snapshot!)).toContain("1"); // page 1 written through
+
+    // Cold process: drop memory, rehydrate from disk, confirm the next read is served from cache.
+    __clearFeedCache();
+    enableFeedCachePersistence(adapter);
+    let fetches = 0;
+    stub(() => {
+      fetches++;
+      return res({ predictions: [feedRow("zz", "should-not-be-served", {})] });
+    });
+    const markets = await listMarkets(cfg, { limit: 5 });
+    expect(markets.map((m) => m.id)).toEqual(["a1"]); // from the rehydrated cache
+    expect(fetches).toBe(0); // no network — served from disk
+  });
+
+  it("serves STALE immediately then refreshes in the background (stale-while-revalidate)", async () => {
+    __setFeedClock(() => 0);
+    let current = { predictions: [feedRow("a1", "Alpha", { Yes: 10 })] };
+    let fetches = 0;
+    stub(() => {
+      fetches++;
+      return res(current);
+    });
+    await listMarkets(cfg, { limit: 5 }); // populate {at:0} → fetch #1
+    expect(fetches).toBe(1);
+
+    __setFeedClock(() => 60_000); // 60s: past FEED_TTL (30s), within FEED_STALE (10m)
+    current = { predictions: [feedRow("b1", "Bravo", { Yes: 10 })] };
+    const stale = await listMarkets(cfg, { limit: 5 }); // serve stale now + kick off a background refresh
+    expect(stale.map((m) => m.id)).toEqual(["a1"]); // STALE data returned immediately
+
+    await __feedRevalidationSettled(); // let the background refresh land (fetch #2)
+    expect(fetches).toBe(2);
+    const fresh = await listMarkets(cfg, { limit: 5 }); // now fresh from the refresh
+    expect(fresh.map((m) => m.id)).toEqual(["b1"]);
+    expect(fetches).toBe(2); // the last read was a fresh cache hit — no extra fetch
   });
 });
 

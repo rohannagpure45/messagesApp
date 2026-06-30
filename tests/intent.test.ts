@@ -1,0 +1,549 @@
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import {
+  classify,
+  classifyFollowup,
+  parseIntent,
+  refineClarify,
+  __setClient,
+  __setIntentClock,
+  __clearIntentCache,
+  __clearClarifyCache,
+  __setIntentCachePersistence,
+  enableIntentCachePersistence,
+} from "../src/sawa/intent";
+import type { FollowupContext, IntentCachePersistence } from "../src/sawa/intent";
+import type { IntentConfig } from "../src/sawa/config";
+import type { ClarifyQuestion } from "../src/sawa/clarify";
+import type { VenueResult } from "../src/venue";
+
+const BOT = "sawa";
+const cfg: IntentConfig = { apiKey: "k", model: "m", baseUrl: "https://x" };
+
+/** Minimal OpenAI-shaped stub. `onCall` lets a test count invocations / throw. */
+function stubClient(content: string | (() => never), onCall?: () => void) {
+  return {
+    chat: {
+      completions: {
+        create: async () => {
+          onCall?.();
+          if (typeof content === "function") content();
+          return { choices: [{ message: { content } }] };
+        },
+      },
+    },
+  } as unknown as Parameters<typeof __setClient>[0];
+}
+
+/** Like `stubClient` but records the args each `create` call is invoked with (to assert params). */
+function capturingStub(content: string) {
+  const calls: Record<string, unknown>[] = [];
+  const client = {
+    chat: {
+      completions: {
+        create: async (args: Record<string, unknown>) => {
+          calls.push(args);
+          return { choices: [{ message: { content } }] };
+        },
+      },
+    },
+  } as unknown as Parameters<typeof __setClient>[0];
+  return { client, calls };
+}
+
+// The intent + clarify caches are module-level singletons — clear them (and reset the clock) before
+// every case so a cached classification from one test can't satisfy (and silence the LLM stub of) the
+// next. Mirrors the __clearCache/__setClock beforeEach in pmxt.test.ts / read.test.ts.
+beforeEach(() => {
+  __clearIntentCache();
+  __clearClarifyCache();
+  __setIntentClock(() => Date.now());
+});
+afterEach(() => __setClient(null));
+
+describe("classify (regex-first gate)", () => {
+  it("extracts the subject from explicit search triggers, stripping the address + filler + article", () => {
+    expect(classify("sawa where can I bet on the FIFA World Cup", BOT)).toMatchObject({
+      kind: "search",
+      query: "FIFA World Cup",
+      confident: true,
+      via: "regex",
+    });
+    expect(classify("find world cup", BOT)).toMatchObject({ kind: "search", query: "world cup" });
+    expect(classify("odds on bitcoin", BOT)).toMatchObject({ kind: "search", query: "bitcoin" });
+    expect(classify("@sawa markets about the election", BOT)).toMatchObject({
+      kind: "search",
+      query: "election",
+    });
+  });
+
+  it("treats greetings, create, account, and help as 'other'", () => {
+    for (const msg of ["hey sawa", "hi", "thanks", "make a market on rain tomorrow", "my balance", "/help help"]) {
+      expect(classify(msg, BOT).kind).toBe("other");
+    }
+  });
+
+  it("treats an addressed bare topic as a (non-confident) search candidate", () => {
+    const c = classify("sawa world cup", BOT);
+    expect(c.kind).toBe("search");
+    expect(c.query).toBe("world cup");
+    expect(c.confident).toBe(false);
+    expect(c.via).toBe("fallback");
+  });
+
+  it("resolves 'look for' / 'search for' / 'find me' phrasings at the regex gate (no LLM)", () => {
+    expect(classify("look for Czechia Mexico", BOT)).toMatchObject({
+      kind: "search",
+      query: "Czechia Mexico",
+      confident: true,
+      via: "regex",
+    });
+    expect(classify("search for bitcoin", BOT)).toMatchObject({ kind: "search", query: "bitcoin", confident: true });
+    expect(classify("find me the world cup", BOT)).toMatchObject({ kind: "search", query: "world cup", confident: true });
+    expect(classify("sawa look for player props on Raul Jimenez", BOT)).toMatchObject({
+      kind: "search",
+      query: "player props on Raul Jimenez",
+      confident: true,
+      via: "regex",
+    });
+    // The bare verb "find" still works (longest-first alternation never swallows the subject).
+    expect(classify("find world cup", BOT)).toMatchObject({ kind: "search", query: "world cup" });
+  });
+
+  it("peels a residual role phrase the first verb-trigger leaves behind (the bitcoin/oil bug)", () => {
+    // "find me" strips only itself → "a market on bitcoin"; cleanQuery peels "a market on" → "bitcoin",
+    // so the role-word "market" can no longer match an unrelated Sawa market ("…damage at the market").
+    expect(classify("sawa find me a market on bitcoin", BOT)).toMatchObject({ kind: "search", query: "bitcoin" });
+    expect(classify("find market on oil prices", BOT)).toMatchObject({ kind: "search", query: "oil prices" });
+    expect(classify("sawa find me a market on the election", BOT)).toMatchObject({ kind: "search", query: "election" });
+    expect(classify("get me a prediction for the super bowl", BOT)).toMatchObject({
+      kind: "search",
+      query: "super bowl",
+    });
+    // A legitimate "market" content word (no on/for/about/of right after it) is preserved untouched.
+    expect(classify("sawa market cap of bitcoin", BOT)).toMatchObject({ kind: "search", query: "market cap of bitcoin" });
+  });
+
+  it("strips a trailing venue word that leaked into the subject (the 'spaceX stock price kalshi' bug)", () => {
+    // A venue name is never a legit search subject; peel it so we don't search "… kalshi" (→ 0 matches).
+    expect(classify("sawa find a market on spaceX stock price kalshi", BOT)).toMatchObject({
+      kind: "search",
+      query: "spaceX stock price",
+    });
+    expect(classify("sawa bitcoin on polymarket", BOT)).toMatchObject({ kind: "search", query: "bitcoin" });
+    expect(classify("sawa world cup poly", BOT)).toMatchObject({ kind: "search", query: "world cup" });
+    // Only a TRAILING whole-word venue is peeled — "Poland" / a mid-phrase mention stay intact.
+    expect(classify("sawa Poland", BOT)).toMatchObject({ kind: "search", query: "Poland" });
+  });
+});
+
+describe("parseIntent", () => {
+  it("returns the confident regex result WITHOUT calling the LLM", async () => {
+    let called = 0;
+    __setClient(stubClient('{"kind":"other"}', () => (called += 1)));
+    const intent = await parseIntent("find world cup", BOT, cfg);
+    expect(intent).toEqual({ kind: "search", query: "world cup", via: "regex" });
+    expect(called).toBe(0);
+  });
+
+  it("consults the LLM when the gate is unsure, and uses its refined query", async () => {
+    __setClient(stubClient('{"kind":"search","query":"Los Angeles mayor"}'));
+    const intent = await parseIntent("sawa la mayor race thoughts", BOT, cfg);
+    expect(intent).toEqual({ kind: "search", query: "Los Angeles mayor", via: "llm" });
+  });
+
+  it("falls back to the regex guess when the LLM errors", async () => {
+    __setClient(
+      stubClient(() => {
+        throw new Error("503");
+      }),
+    );
+    const intent = await parseIntent("sawa some ambiguous thing", BOT, cfg);
+    expect(intent.via).toBe("fallback");
+    expect(intent.kind).toBe("search");
+    expect(intent.query).toBe("some ambiguous thing");
+  });
+
+  it("skips the LLM entirely when no intent config is provided", async () => {
+    const intent = await parseIntent("sawa bare topic here", BOT, null);
+    expect(intent.kind).toBe("search");
+    expect(intent.query).toBe("bare topic here");
+    expect(intent.via).toBe("fallback");
+  });
+
+  it("honors an LLM 'other' classification", async () => {
+    __setClient(stubClient('{"kind":"other","query":""}'));
+    const intent = await parseIntent("sawa hmm what do you think", BOT, cfg);
+    expect(intent.kind).toBe("other");
+    expect(intent.via).toBe("llm");
+  });
+});
+
+const activeCtx: FollowupContext = {
+  hasActiveMarket: true,
+  query: "world cup",
+  currentVenue: "sawa",
+  venuesPresent: ["sawa", "kalshi"],
+};
+const coldCtx: FollowupContext = { hasActiveMarket: false, venuesPresent: [] };
+
+describe("classifyFollowup", () => {
+  it("returns null without an active market (a cold 'next'/'link' is never a follow-up)", () => {
+    expect(classifyFollowup("not that", BOT, coldCtx)).toBeNull();
+    expect(classifyFollowup("kalshi link", BOT, coldCtx)).toBeNull();
+  });
+
+  it("classifies rejection phrases as 'next'", () => {
+    for (const m of ["not that", "nah", "different one", "another", "next", "more", "wrong one", "show me another"]) {
+      expect(classifyFollowup(m, BOT, activeCtx)).toMatchObject({ kind: "next", confident: true });
+    }
+  });
+
+  it("classifies link requests and extracts the venue", () => {
+    expect(classifyFollowup("send the kalshi link", BOT, activeCtx)).toMatchObject({ kind: "link", venue: "kalshi" });
+    expect(classifyFollowup("got a polymarket one?", BOT, activeCtx)).toMatchObject({ kind: "link", venue: "polymarket" });
+    expect(classifyFollowup("poly?", BOT, activeCtx)).toMatchObject({ kind: "link", venue: "polymarket" });
+    expect(classifyFollowup("kalshi", BOT, activeCtx)).toMatchObject({ kind: "link", venue: "kalshi" });
+    const generic = classifyFollowup("link", BOT, activeCtx);
+    expect(generic).toMatchObject({ kind: "link" });
+    expect(generic!.venue).toBeUndefined();
+  });
+
+  it("returns null for an ambiguous / new-topic message (defers to the gate or context LLM)", () => {
+    expect(classifyFollowup("what about the nba finals", BOT, activeCtx)).toBeNull();
+  });
+
+  it("does NOT treat a rejection-prefixed real request as 'next' (precision over recall)", () => {
+    for (const m of ["no idea what that is", "more info please", "show me more about it", "next election"]) {
+      expect(classifyFollowup(m, BOT, activeCtx)).toBeNull();
+    }
+  });
+
+  it("still matches a rejection that ends in a benign filler", () => {
+    for (const m of ["not that one", "another one", "next market", "more please"]) {
+      expect(classifyFollowup(m, BOT, activeCtx)).toMatchObject({ kind: "next" });
+    }
+  });
+});
+
+describe("parseIntent with active-market context", () => {
+  it("prefers a regex follow-up over a new search, without calling the LLM", async () => {
+    let called = 0;
+    __setClient(stubClient('{"kind":"search","query":"kalshi"}', () => (called += 1)));
+    const intent = await parseIntent("not that", BOT, cfg, activeCtx);
+    expect(intent).toEqual({ kind: "next", via: "regex" });
+    expect(called).toBe(0);
+  });
+
+  it("routes a bare venue word to a link follow-up (no LLM needed)", async () => {
+    const intent = await parseIntent("kalshi", BOT, null, activeCtx);
+    expect(intent).toMatchObject({ kind: "link", venue: "kalshi", via: "regex" });
+  });
+
+  it("uses the context LLM to disambiguate an ambiguous follow-up as a link", async () => {
+    __setClient(stubClient('{"kind":"link","venue":"kalshi","query":""}'));
+    const intent = await parseIntent("what about kalshi", BOT, cfg, activeCtx);
+    expect(intent).toEqual({ kind: "link", venue: "kalshi", via: "llm" });
+  });
+
+  it("still treats a confident new-search trigger as a search mid-thread", async () => {
+    const intent = await parseIntent("find nba finals", BOT, cfg, activeCtx);
+    expect(intent).toMatchObject({ kind: "search", query: "nba finals", via: "regex" });
+  });
+
+  it("ANSWERS a question about the shown market via the LLM instead of searching it", async () => {
+    __setClient(stubClient('{"kind":"answer","reply":"That\'s the Lionel Messi 1+ goals prop on Kalshi.","query":"","venue":""}'));
+    const intent = await parseIntent("what game is that for", BOT, cfg, activeCtx);
+    expect(intent.kind).toBe("answer");
+    expect(intent.reply).toContain("Messi");
+    expect(intent.via).toBe("llm");
+  });
+
+  it("falls back to the gate (not an 'answer') when the LLM answer has no usable reply", async () => {
+    __setClient(stubClient('{"kind":"answer","reply":""}'));
+    const intent = await parseIntent("what game is that for", BOT, cfg, activeCtx);
+    expect(intent.kind).not.toBe("answer"); // empty reply → null → keep the regex gate's guess
+  });
+
+  it("falls back to a SEARCH when the follow-up LLM hallucinates an off-schema {error} object (the Solana/Haaland bug)", async () => {
+    // With a stale active-market context (e.g. Solana) and an UNRELATED new topic, flash-lite would emit
+    // {"error":"No market found..."} — it has no `kind`, so interpretFollowupLlm returns null and the
+    // regex gate's guess (a search for the raw topic) is used. The hallucination never reaches the user.
+    __setClient(stubClient('{"error":"No market found for \'Haaland goals first half\' on the specified venues."}'));
+    const intent = await parseIntent("Haaland goals first half", BOT, cfg, activeCtx);
+    expect(intent.kind).toBe("search");
+    expect(intent.query).toBe("Haaland goals first half");
+    expect(intent.via).toBe("fallback");
+  });
+});
+
+describe("classifyWithLlm JSON robustness (Issue 1)", () => {
+  it("requests max_tokens 256 (was 80 — the truncation cause)", async () => {
+    const { client, calls } = capturingStub('{"kind":"search","query":"bitcoin"}');
+    __setClient(client);
+    await parseIntent("sawa hmm thoughts on btc", BOT, cfg);
+    expect(calls[0]!.max_tokens).toBe(256);
+  });
+
+  it("parses multi-line / pretty-printed JSON (the live failure shape)", async () => {
+    __setClient(stubClient('{\n  "kind": "search",\n  "query": "World Cup"\n}'));
+    const intent = await parseIntent("sawa thoughts on the cup", BOT, cfg);
+    expect(intent).toMatchObject({ kind: "search", query: "World Cup", via: "llm" });
+  });
+
+  it("parses a ```json fenced body", async () => {
+    __setClient(stubClient('```json\n{"kind":"search","query":"Bitcoin"}\n```'));
+    const intent = await parseIntent("sawa thoughts on btc", BOT, cfg);
+    expect(intent).toMatchObject({ kind: "search", query: "Bitcoin", via: "llm" });
+  });
+
+  it("parses a body with leading prose around the object", async () => {
+    __setClient(stubClient('Sure! Here you go: {"kind":"other","query":""} hope that helps'));
+    const intent = await parseIntent("sawa what do you reckon", BOT, cfg);
+    expect(intent).toMatchObject({ kind: "other", via: "llm" });
+  });
+
+  it("unwraps an array-wrapped object (gemini returns [ {…} ] despite json_object mode)", async () => {
+    __setClient(stubClient('[{"kind":"search","query":"Argentina"}]'));
+    const intent = await parseIntent("sawa thoughts on argentina", BOT, cfg);
+    expect(intent).toMatchObject({ kind: "search", query: "Argentina", via: "llm" });
+  });
+
+  it("unwraps a multi-line array (the live failure: body started with '[')", async () => {
+    __setClient(stubClient('[\n  {"kind": "search", "query": "World Cup"},\n  {"kind": "other"}\n]'));
+    const intent = await parseIntent("sawa hmm the cup", BOT, cfg);
+    expect(intent).toMatchObject({ kind: "search", query: "World Cup", via: "llm" });
+  });
+
+  it("falls back to the regex gate (never throws) on a truncated/unparseable body", async () => {
+    __setClient(stubClient('{"kind":"search","query":"World C')); // cut off mid-string
+    const intent = await parseIntent("sawa some ambiguous thing", BOT, cfg);
+    expect(intent.via).toBe("fallback");
+    expect(intent).toMatchObject({ kind: "search", query: "some ambiguous thing" });
+  });
+});
+
+describe("refineClarify (LLM drop-noise / relabel / veto, fail-soft)", () => {
+  const row = (title: string): VenueResult => ({
+    venue: "kalshi", sourceLabel: "Kalshi", realMoney: true, title, url: "https://k/x",
+    top: { label: "Yes", price: 0.5 }, relevance: 1,
+  });
+  // 3 candidates, #2 is off-topic noise (the "Lionel messi" → "Trump praise Messi" case).
+  const question: ClarifyQuestion = {
+    question: 'Which "Lionel messi" market did you mean?',
+    options: [
+      { label: "Lionel Messi to score or assist", result: row("Lionel Messi to score or assist") },
+      { label: "Trump praise Messi", result: row("Trump praise Messi") },
+      { label: "Lionel Messi 1+ goals", result: row("Lionel Messi 1+ goals") },
+    ],
+  };
+
+  it("VETOES when the model says these are one market's outcomes (→ answer directly)", async () => {
+    __setClient(stubClient('{"ambiguous":false}'));
+    expect(await refineClarify("Lionel messi", question, cfg)).toBeNull();
+  });
+
+  it("keeps only the relevant options the model returns, relabeled, dropping off-topic noise", async () => {
+    // Model keeps #1 and #3 (drops #2 "Trump praise Messi"), with clean labels.
+    __setClient(stubClient('{"ambiguous":true,"options":[{"n":1,"label":"Score or assist"},{"n":3,"label":"Score 1+ goals"}]}'));
+    const out = await refineClarify("Lionel messi", question, cfg);
+    expect(out!.options.map((o) => o.label)).toEqual(["Score or assist", "Score 1+ goals"]);
+    expect(out!.options.map((o) => o.result.title)).toEqual([
+      "Lionel Messi to score or assist",
+      "Lionel Messi 1+ goals",
+    ]); // result mapping preserved; noise dropped
+  });
+
+  it("returns a SINGLE-option question when the filter narrows to one relevant market", async () => {
+    // Caller shows that one market directly (not candidates[0], which may be the rejected noise).
+    __setClient(stubClient('{"ambiguous":true,"options":[{"n":3,"label":"Score 1+ goals"}]}'));
+    const out = await refineClarify("Lionel messi", question, cfg);
+    expect(out!.options).toHaveLength(1);
+    expect(out!.options[0]!.result.title).toBe("Lionel Messi 1+ goals");
+  });
+
+  it("ignores out-of-range option numbers (never fabricates a market)", async () => {
+    __setClient(stubClient('{"ambiguous":true,"options":[{"n":1,"label":"a"},{"n":9,"label":"b"}]}'));
+    const out = await refineClarify("Lionel messi", question, cfg);
+    expect(out!.options).toHaveLength(1); // n=1 kept; n=9 dropped (never fabricated)
+    expect(out!.options[0]!.result.title).toBe("Lionel Messi to score or assist");
+  });
+
+  it("answers directly (null) only when the model keeps NO valid options", async () => {
+    __setClient(stubClient('{"ambiguous":true,"options":[{"n":9,"label":"x"}]}')); // all out of range
+    expect(await refineClarify("Lionel messi", question, cfg)).toBeNull();
+  });
+
+  it("is fail-soft: an unparseable body keeps the deterministic question (we still ask)", async () => {
+    __setClient(stubClient("not json at all"));
+    expect(await refineClarify("Lionel messi", question, cfg)).toBe(question);
+  });
+
+  it("is fail-soft: a thrown LLM error keeps the deterministic question", async () => {
+    __setClient(stubClient(() => {
+      throw new Error("network down");
+    }));
+    expect(await refineClarify("Lionel messi", question, cfg)).toBe(question);
+  });
+});
+
+describe("cold-start intent cache (durable, time-invariant)", () => {
+  afterEach(() => __setIntentCachePersistence(null));
+
+  it("caches a cold-start classification → a second identical message skips the LLM", async () => {
+    let called = 0;
+    __setClient(stubClient('{"kind":"search","query":"Los Angeles mayor"}', () => (called += 1)));
+    const a = await parseIntent("sawa la mayor race thoughts", BOT, cfg);
+    const b = await parseIntent("sawa la mayor race thoughts", BOT, cfg);
+    expect(a).toEqual({ kind: "search", query: "Los Angeles mayor", via: "llm" });
+    expect(b).toEqual(a); // served from cache, identical result (still via:"llm")
+    expect(called).toBe(1); // LLM consulted exactly ONCE
+  });
+
+  it("normalizes the key (case / whitespace / trailing punctuation) so variants share one entry", async () => {
+    let called = 0;
+    __setClient(stubClient('{"kind":"search","query":"Bitcoin"}', () => (called += 1)));
+    await parseIntent("sawa hmm thoughts on BTC", BOT, cfg);
+    await parseIntent("sawa   hmm   thoughts on btc???", BOT, cfg); // different case / spacing / punctuation
+    expect(called).toBe(1);
+  });
+
+  it("caches an LLM 'other' result too (negative caching for repeated non-search chatter)", async () => {
+    let called = 0;
+    __setClient(stubClient('{"kind":"other","query":""}', () => (called += 1)));
+    await parseIntent("sawa hmm what do you reckon", BOT, cfg);
+    const second = await parseIntent("sawa hmm what do you reckon", BOT, cfg);
+    expect(second.kind).toBe("other");
+    expect(called).toBe(1);
+  });
+
+  it("does NOT cache the active-market follow-up path (it depends on the shown market)", async () => {
+    let called = 0;
+    __setClient(
+      stubClient('{"kind":"answer","reply":"That\'s the World Cup market on Kalshi.","query":"","venue":""}', () => (called += 1)),
+    );
+    await parseIntent("what are the odds", BOT, cfg, activeCtx);
+    await parseIntent("what are the odds", BOT, cfg, activeCtx);
+    expect(called).toBe(2); // every follow-up re-consults the LLM (same text, different shown market)
+  });
+
+  it("does NOT cache a failed/unusable classification (transient, not a stable mapping)", async () => {
+    let called = 0;
+    __setClient(
+      stubClient(() => {
+        throw new Error("503");
+      }, () => (called += 1)),
+    );
+    await parseIntent("sawa some ambiguous thing", BOT, cfg);
+    await parseIntent("sawa some ambiguous thing", BOT, cfg);
+    expect(called).toBe(2); // an error is never cached → both attempts hit the LLM
+  });
+
+  it("expires entries past the 24h TTL", async () => {
+    let called = 0;
+    let t = 0;
+    __setIntentClock(() => t);
+    __setClient(stubClient('{"kind":"search","query":"Bitcoin"}', () => (called += 1)));
+    await parseIntent("sawa thoughts on btc later", BOT, cfg);
+    t = 24 * 60 * 60_000 + 1; // just past the TTL
+    await parseIntent("sawa thoughts on btc later", BOT, cfg);
+    expect(called).toBe(2); // stale → re-classified
+  });
+
+  it("writes through to persistence and rehydrates on load (a cold process skips the LLM)", async () => {
+    let snapshot: ReturnType<IntentCachePersistence["load"]> = null;
+    const adapter: IntentCachePersistence = {
+      load: () => snapshot,
+      save: (d) => {
+        snapshot = JSON.parse(JSON.stringify(d)) as typeof snapshot; // round-trip like the file adapter
+      },
+    };
+    __setIntentCachePersistence(adapter);
+    let called = 0;
+    __setClient(stubClient('{"kind":"search","query":"Argentina"}', () => (called += 1)));
+    await parseIntent("sawa thoughts on argentina", BOT, cfg);
+    expect(snapshot).not.toBeNull();
+    expect(Object.keys(snapshot!.intent ?? {})).toContain("thoughts on argentina");
+
+    // Simulate a cold process: drop the in-memory cache, rehydrate from the snapshot, confirm no LLM call.
+    __clearIntentCache();
+    enableIntentCachePersistence(adapter);
+    const hit = await parseIntent("sawa thoughts on argentina", BOT, cfg);
+    expect(hit).toMatchObject({ kind: "search", query: "Argentina" });
+    expect(called).toBe(1); // served from the hydrated cache, LLM not called again
+  });
+});
+
+describe("refineClarify cache (decision cached; prices re-bound fresh)", () => {
+  const row = (title: string, price = 0.5): VenueResult => ({
+    venue: "kalshi", sourceLabel: "Kalshi", realMoney: true, title, url: "https://k/x",
+    top: { label: "Yes", price }, relevance: 1,
+  });
+  const makeQuestion = (price1: number): ClarifyQuestion => ({
+    question: 'Which "Lionel messi" market did you mean?',
+    options: [
+      { label: "Score or assist", result: row("Lionel Messi to score or assist", price1) },
+      { label: "Trump praise Messi", result: row("Trump praise Messi") },
+      { label: "1+ goals", result: row("Lionel Messi 1+ goals") },
+    ],
+  });
+  afterEach(() => __setIntentCachePersistence(null));
+
+  it("caches the decision → a second identical refine skips the LLM", async () => {
+    let called = 0;
+    __setClient(
+      stubClient('{"ambiguous":true,"options":[{"n":1,"label":"Score or assist"},{"n":3,"label":"1+ goals"}]}', () => (called += 1)),
+    );
+    const a = await refineClarify("Lionel messi", makeQuestion(0.5), cfg);
+    const b = await refineClarify("Lionel messi", makeQuestion(0.5), cfg);
+    expect(a!.options.map((o) => o.result.title)).toEqual(["Lionel Messi to score or assist", "Lionel Messi 1+ goals"]);
+    expect(b!.options.map((o) => o.result.title)).toEqual(a!.options.map((o) => o.result.title));
+    expect(called).toBe(1);
+  });
+
+  it("re-binds the decision onto the CURRENT question so prices stay fresh on a cache hit", async () => {
+    let called = 0;
+    __setClient(stubClient('{"ambiguous":true,"options":[{"n":1,"label":"Score or assist"}]}', () => (called += 1)));
+    await refineClarify("Lionel messi", makeQuestion(0.4), cfg); // first: 40¢
+    const hit = await refineClarify("Lionel messi", makeQuestion(0.55), cfg); // same titles, new price 55¢
+    expect(called).toBe(1); // LLM skipped
+    expect(hit!.options[0]!.result.top!.price).toBe(0.55); // fresh price, NOT the cached 0.40
+  });
+
+  it("caches a VETO decision (answer directly without re-asking the LLM)", async () => {
+    let called = 0;
+    __setClient(stubClient('{"ambiguous":false}', () => (called += 1)));
+    expect(await refineClarify("Lionel messi", makeQuestion(0.5), cfg)).toBeNull();
+    expect(await refineClarify("Lionel messi", makeQuestion(0.5), cfg)).toBeNull();
+    expect(called).toBe(1);
+  });
+
+  it("does NOT cache a fail-soft (unparseable) response", async () => {
+    let called = 0;
+    __setClient(stubClient("not json at all", () => (called += 1)));
+    const q = makeQuestion(0.5);
+    expect(await refineClarify("Lionel messi", q, cfg)).toBe(q); // deterministic question kept
+    expect(await refineClarify("Lionel messi", q, cfg)).toBe(q);
+    expect(called).toBe(2); // error path never cached → both retried
+  });
+
+  it("writes the decision through to persistence and rehydrates it on load", async () => {
+    let snapshot: ReturnType<IntentCachePersistence["load"]> = null;
+    const adapter: IntentCachePersistence = {
+      load: () => snapshot,
+      save: (d) => {
+        snapshot = JSON.parse(JSON.stringify(d)) as typeof snapshot;
+      },
+    };
+    __setIntentCachePersistence(adapter);
+    let called = 0;
+    __setClient(stubClient('{"ambiguous":true,"options":[{"n":3,"label":"1+ goals"}]}', () => (called += 1)));
+    await refineClarify("Lionel messi", makeQuestion(0.5), cfg);
+    expect(Object.keys(snapshot!.clarify ?? {}).length).toBe(1);
+
+    __clearClarifyCache();
+    enableIntentCachePersistence(adapter);
+    const hit = await refineClarify("Lionel messi", makeQuestion(0.5), cfg);
+    expect(hit!.options[0]!.result.title).toBe("Lionel Messi 1+ goals");
+    expect(called).toBe(1); // served from the hydrated decision, LLM not called again
+  });
+});

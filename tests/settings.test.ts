@@ -1,0 +1,228 @@
+import { describe, it, expect } from "vitest";
+import {
+  classifySettingCommand,
+  peelSettings,
+  isSettingsQuery,
+  SpaceSettings,
+  confirmChanges,
+  describeSettings,
+  SETTING_KEYS,
+  type SettingsSnapshot,
+  type SettingsPersistence,
+} from "../src/sawa/settings";
+
+describe("classifySettingCommand", () => {
+  it("recognizes quips on across phrasings", () => {
+    for (const m of [
+      "quips on",
+      "turn on the quips",
+      "turn the quips on",
+      "enable quips",
+      "quips please",
+      "more banter",
+      "jokes on",
+      "add some flair",
+    ]) {
+      expect(classifySettingCommand(m)).toEqual({ key: "quips", on: true });
+    }
+  });
+
+  it("recognizes quips off across phrasings", () => {
+    for (const m of [
+      "quips off",
+      "turn off the quips",
+      "turn the quips off",
+      "disable quips",
+      "no quips",
+      "stop the jokes",
+      "mute the banter",
+      "no more jokes",
+    ]) {
+      expect(classifySettingCommand(m)).toEqual({ key: "quips", on: false });
+    }
+  });
+
+  it("recognizes external-markets on/off (incl. sawa-only)", () => {
+    for (const m of ["all venues", "external on", "enable external", "include external markets", "external markets on"]) {
+      expect(classifySettingCommand(m)).toEqual({ key: "external", on: true });
+    }
+    for (const m of ["external off", "disable external", "only sawa", "only sawa markets", "sawa only", "hide external markets", "kalshi off"]) {
+      expect(classifySettingCommand(m)).toEqual({ key: "external", on: false });
+    }
+  });
+
+  it("returns null for non-commands — a subject with no direction, or a real search/venue word", () => {
+    for (const m of ["quips", "world cup", "find cap and trade", "kalshi", "show me kalshi markets", "comedian quips odds", ""]) {
+      expect(classifySettingCommand(m)).toBeNull();
+    }
+  });
+
+  it("handles the natural phrasings the live test exposed (volume metaphor, filler, word order)", () => {
+    // These all fell through to search/nudge before the recognizer rewrite (log lines 49/51/55/67).
+    for (const m of ["turn up the quips", "use more quips", "turn on quips more", "turn up the quips to do more", "crank up the banter", "more jokes please"]) {
+      expect(classifySettingCommand(m)).toEqual({ key: "quips", on: true });
+    }
+    for (const m of ["turn down the quips", "fewer jokes", "less banter", "tone down the quips"]) {
+      expect(classifySettingCommand(m)).toEqual({ key: "quips", on: false });
+    }
+  });
+
+  it("never swallows an explicit search that mentions a subject (search-guard)", () => {
+    for (const m of ["is there a market on quips", "look for quips comedian", "odds on the jokes", "find me a banter market"]) {
+      expect(classifySettingCommand(m)).toBeNull();
+    }
+  });
+});
+
+describe("peelSettings (compound toggle + remainder — the Issue 5 symptom)", () => {
+  it("peels a leading toggle and returns the remaining message to be searched", () => {
+    expect(peelSettings("turn on the quips, look for bitcoin")).toEqual({
+      changes: [{ key: "quips", on: true }],
+      rest: "look for bitcoin",
+    });
+    expect(peelSettings("quips off and find me dogecoin")).toEqual({
+      changes: [{ key: "quips", on: false }],
+      rest: "find me dogecoin",
+    });
+  });
+
+  it("peels multiple leading toggles in order", () => {
+    expect(peelSettings("quips on, sawa only, world cup")).toEqual({
+      changes: [
+        { key: "quips", on: true },
+        { key: "external", on: false },
+      ],
+      rest: "world cup",
+    });
+  });
+
+  it("returns an empty remainder for a standalone toggle", () => {
+    expect(peelSettings("quips off")).toEqual({ changes: [{ key: "quips", on: false }], rest: "" });
+  });
+
+  it("never splits a real search that merely contains 'and' / ','", () => {
+    expect(peelSettings("find cap and trade")).toEqual({ changes: [], rest: "find cap and trade" });
+    expect(peelSettings("Switzerland, India")).toEqual({ changes: [], rest: "Switzerland, India" });
+    expect(peelSettings("look for player props on Raul Jimenez")).toEqual({
+      changes: [],
+      rest: "look for player props on Raul Jimenez",
+    });
+  });
+
+  it("strips a leftover leading conjunction from the remainder", () => {
+    expect(peelSettings("quips on, and look for bitcoin")).toEqual({
+      changes: [{ key: "quips", on: true }],
+      rest: "look for bitcoin",
+    });
+  });
+
+  it("peels a TRAILING toggle ('find X, and turn up the quips')", () => {
+    expect(peelSettings("find shark tank and turn up the quips")).toEqual({
+      changes: [{ key: "quips", on: true }],
+      rest: "find shark tank",
+    });
+    expect(peelSettings("look for the world cup, sawa only")).toEqual({
+      changes: [{ key: "external", on: false }],
+      rest: "look for the world cup",
+    });
+  });
+});
+
+describe("isSettingsQuery", () => {
+  it("matches a settings READ, not a toggle or a search", () => {
+    for (const m of ["settings", "show settings", "what are your settings", "my settings", "settings?"]) {
+      expect(isSettingsQuery(m)).toBe(true);
+    }
+    for (const m of ["quips on", "world cup", "setting a record", "sawa only"]) {
+      expect(isSettingsQuery(m)).toBe(false);
+    }
+  });
+});
+
+describe("SpaceSettings", () => {
+  it("returns the env default until overridden, then sticks across repeated reads", () => {
+    const s = new SpaceSettings({ quips: false, external: true });
+    expect(s.get("A", "quips")).toBe(false);
+    expect(s.get("A", "external")).toBe(true);
+    s.set("A", "quips", true);
+    expect(s.get("A", "quips")).toBe(true);
+    expect(s.get("A", "quips")).toBe(true); // sticky — does NOT revert between reads (persists across searches)
+  });
+
+  it("keys per space (no cross-space leak) and overrides back to off", () => {
+    const s = new SpaceSettings({ quips: false, external: true });
+    s.set("A", "quips", true);
+    expect(s.get("B", "quips")).toBe(false); // independent of A
+    s.set("A", "quips", false);
+    expect(s.get("A", "quips")).toBe(false);
+  });
+
+  it("LRU-evicts the oldest space past the cap (memory hygiene, no TTL revert)", () => {
+    const s = new SpaceSettings({ quips: false, external: true }, { max: 2 });
+    s.set("A", "quips", true);
+    s.set("B", "quips", true);
+    s.set("C", "quips", true); // A is the oldest → evicted
+    expect(s.get("A", "quips")).toBe(false); // reverted to default
+    expect(s.get("C", "quips")).toBe(true);
+  });
+
+  it("resolved() reports every registered setting", () => {
+    const s = new SpaceSettings({ quips: true, external: false });
+    expect(s.resolved("A")).toEqual({ quips: true, external: false });
+    expect(SETTING_KEYS).toEqual(["quips", "external"]);
+  });
+});
+
+describe("SpaceSettings durability (survives 'restart')", () => {
+  /** An in-memory fake of the file persistence adapter. */
+  function fakeDisk(seed: SettingsSnapshot | null = null) {
+    let data: SettingsSnapshot | null = seed;
+    const persist: SettingsPersistence = {
+      load: () => data,
+      save: (d) => {
+        data = JSON.parse(JSON.stringify(d)) as SettingsSnapshot; // copy, like a real write
+      },
+    };
+    return { persist, peek: () => data };
+  }
+
+  it("writes through on set and rehydrates a fresh store from the same backing", () => {
+    const disk = fakeDisk();
+    const a = new SpaceSettings({ quips: false, external: true }, { persist: disk.persist });
+    a.set("G", "quips", true);
+    a.set("G", "external", false);
+    expect(disk.peek()).toEqual({ G: { quips: true, external: false } });
+
+    // A brand-new store (a "restart") reading the same backing sees the saved values, NOT the defaults.
+    const b = new SpaceSettings({ quips: false, external: true }, { persist: disk.persist });
+    expect(b.get("G", "quips")).toBe(true);
+    expect(b.get("G", "external")).toBe(false);
+    expect(b.get("OTHER", "quips")).toBe(false); // a never-set space still falls back to the env default
+  });
+
+  it("ignores unknown/removed keys in the persisted snapshot (forward/backward compatible)", () => {
+    const disk = fakeDisk({ G: { quips: true, legacyFlag: true } as Record<string, boolean> });
+    const s = new SpaceSettings({ quips: false, external: true }, { persist: disk.persist });
+    expect(s.get("G", "quips")).toBe(true);
+    expect(s.resolved("G")).toEqual({ quips: true, external: true }); // legacyFlag dropped; external→default
+  });
+});
+
+describe("reply copy", () => {
+  it("confirmChanges describes each applied toggle", () => {
+    expect(confirmChanges([{ key: "quips", on: true }])).toMatch(/quips on/i);
+    expect(confirmChanges([{ key: "external", on: false }])).toMatch(/sawa only/i);
+    const both = confirmChanges([
+      { key: "quips", on: false },
+      { key: "external", on: true },
+    ]);
+    expect(both).toMatch(/quips off/i);
+    expect(both).toMatch(/external markets on/i);
+  });
+
+  it("describeSettings lists the current per-space values", () => {
+    const reply = describeSettings({ quips: true, external: false });
+    expect(reply).toMatch(/quips: on/i);
+    expect(reply).toMatch(/external markets: off/i);
+  });
+});
